@@ -1,12 +1,15 @@
+from __future__ import annotations
+from functools import partial
+
 import torch
 from torch import nn
-from torch.nn import Module, GRU, Identity
+from torch.nn import Module, GRU, Linear, Identity
 import torch.nn.functional as F
 
 # einops
 
 import einx
-from einops import einsum
+from einops import einsum, rearrange, repeat
 from einops.layers.torch import Rearrange
 
 # external modules
@@ -15,6 +18,12 @@ from x_transformers import Decoder
 from x_mlps_pytorch import Feedforwards
 
 from discrete_continuous_embed_readout import Embed, Readout
+
+from assoc_scan import AssocScan
+
+# constants
+
+LinearNoBias = partial(Linear, bias = False)
 
 # helper functions
 
@@ -36,13 +45,23 @@ class MetaController(Module):
         *,
         decoder_expansion_factor = 2.,
         decoder_depth = 1,
-        hypernetwork_low_rank = 16
+        hypernetwork_low_rank = 16,
+        assoc_scan_kwargs: dict = dict()
     ):
         super().__init__()
 
-        dim_decoder_hidden = int(dim_latent * decoder_expansion_factor)
+        # switching unit
+
+        self.switching_unit = nn.GRU(dim_latent, dim_latent, batch_first = True)
+        self.to_switching_unit_beta = nn.Linear(dim_latent, 1, bias = False)
+
+        self.switch_gating = AssocScan(**assoc_scan_kwargs)
+
+        # decoder
 
         assert hypernetwork_low_rank < dim_latent
+
+        dim_decoder_hidden = int(dim_latent * decoder_expansion_factor)
 
         self.decoder = Feedforwards(
             dim_in = dim_latent,
@@ -58,12 +77,28 @@ class MetaController(Module):
         latent
     ):
 
-        decoder_out = self.decoder(latent)
+        switching_unit_gru_out, switching_unit_gru_hidden = self.switching_unit(latent)
+
+        switch_beta = self.to_switching_unit_beta(switching_unit_gru_out).sigmoid()
+
+        batch, _, dim = latent.shape
+        latent_for_gating = rearrange(latent, 'b n d -> (b d) n')
+        switch_beta = repeat(switch_beta, 'b n 1 -> (b d) n', d = dim)
+
+        gated_latent = self.switch_gating(latent_for_gating, switch_beta)
+
+        gated_latent = rearrange(gated_latent, '(b d) n -> b n d', b = batch)
+
+        # decoder
+
+        decoder_out = self.decoder(gated_latent)
 
         w1, w2 = self.to_hyper_network_weights(decoder_out)
         hypernetwork_weight = einsum(w1, w2, '... i r, ... j r -> ... i j')
 
-        control_signal = einsum(latent, hypernetwork_weight, '... d1, ... d1 d2 -> ... d1')
+        # generating the residual stream controlling signal
+
+        control_signal = einsum(gated_latent, hypernetwork_weight, '... d1, ... d1 d2 -> ... d1')
 
         return latent + control_signal
 
