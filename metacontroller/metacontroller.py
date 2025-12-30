@@ -77,28 +77,32 @@ class MetaController(Module):
         latent
     ):
 
+        intent = latent # todo - the two phases of training with acausal and causal networks
+
         switching_unit_gru_out, switching_unit_gru_hidden = self.switching_unit(latent)
 
         switch_beta = self.to_switching_unit_beta(switching_unit_gru_out).sigmoid()
 
-        batch, _, dim = latent.shape
-        latent_for_gating = rearrange(latent, 'b n d -> (b d) n')
+        batch, _, dim = intent.shape
+
+        intent_for_gating = rearrange(intent, 'b n d -> (b d) n')
         switch_beta = repeat(switch_beta, 'b n 1 -> (b d) n', d = dim)
 
-        gated_latent = self.switch_gating(latent_for_gating, switch_beta)
+        forget = 1. - switch_beta
+        gated_intent = self.switch_gating(intent_for_gating * forget, switch_beta)
 
-        gated_latent = rearrange(gated_latent, '(b d) n -> b n d', b = batch)
+        gated_intent = rearrange(gated_intent, '(b d) n -> b n d', b = batch)
 
         # decoder
 
-        decoder_out = self.decoder(gated_latent)
+        decoder_out = self.decoder(gated_intent)
 
         w1, w2 = self.to_hyper_network_weights(decoder_out)
         hypernetwork_weight = einsum(w1, w2, '... i r, ... j r -> ... i j')
 
         # generating the residual stream controlling signal
 
-        control_signal = einsum(gated_latent, hypernetwork_weight, '... d1, ... d1 d2 -> ... d1')
+        control_signal = einsum(gated_intent, hypernetwork_weight, '... d1, ... d1 d2 -> ... d1')
 
         return latent + control_signal
 
