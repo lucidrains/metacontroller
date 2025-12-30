@@ -2,14 +2,14 @@ from __future__ import annotations
 from functools import partial
 
 import torch
-from torch import nn
+from torch import nn, cat, stack, tensor
 from torch.nn import Module, GRU, Linear, Identity
 import torch.nn.functional as F
 
 # einops
 
 import einx
-from einops import einsum, rearrange, repeat
+from einops import einsum, rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 
 # external modules
@@ -25,6 +25,8 @@ from assoc_scan import AssocScan
 # constants
 
 LinearNoBias = partial(Linear, bias = False)
+
+GRU = partial(GRU, batch_first = True)
 
 # helper functions
 
@@ -54,9 +56,21 @@ class MetaController(Module):
     ):
         super().__init__()
 
+        # there are two phases, the first (discovery ssl phase) uses acausal with some ssm i don't really believe in - let's just use a bidirectional GRU as placeholders
+
+        self.bidirectional_temporal_compressor = GRU(dim_latent, dim_latent, bidirectional = True) # revisit naming
+
+        self.emitter = GRU(dim_latent * 2, dim_latent * 2)
+        self.emitter_to_action_mean_log_var = LinearNoBias(dim_latent * 2, dim_latent * 2)
+
+        # internal rl phase substitutes the acausal + emitter with a causal ssm
+
+        self.action_proposer = GRU(dim_latent, dim_latent)
+        self.action_proposer_mean_log_var = LinearNoBias(dim_latent, dim_latent * 2)
+
         # switching unit
 
-        self.switching_unit = nn.GRU(dim_latent, dim_latent, batch_first = True)
+        self.switching_unit = GRU(dim_latent, dim_latent)
         self.to_switching_unit_beta = nn.Linear(dim_latent, 1, bias = False)
 
         self.switch_gating = AssocScan(**assoc_scan_kwargs)
@@ -76,42 +90,91 @@ class MetaController(Module):
 
         self.to_hyper_network_weights = Rearrange('... (two d r) -> two ... d r', two = 2, r = hypernetwork_low_rank)
 
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
+    def discovery_parameters(self):
+        return [
+            *self.bidirectional_temporal_compressor.parameters(),
+            *self.emitter.parameters(),
+            *self.emitter_to_action_mean_log_var.parameters()
+            *self.decoder.parameters(),
+            *self.switch_gating
+        ]
+
     def internal_rl_parameters(self):
-        return self.parameters()
+        return [
+            *self.action_proposer.parameters(),
+            *self.action_proposer_mean_log_var.parameters(),
+            *self.decoder.parameters(),
+            *self.switch_gating
+        ]
 
     def forward(
         self,
-        latent
+        residual_stream,
+        discovery_phase = False
     ):
 
-        intent = latent # todo - the two phases of training with acausal and causal networks
+        if discovery_phase:
+            temporal_compressed, _ = self.bidirectional_temporal_compressor(residual_stream)
+            temporal_compressed = reduce(temporal_compressed, '... (two d) -> ... d', 'mean', two = 2)
 
-        switching_unit_gru_out, switching_unit_gru_hidden = self.switching_unit(latent)
+            proposed_action_hidden, _ = self.emitter(cat((temporal_compressed, residual_stream), dim = -1))
+            proposed_action = self.emitter_to_action_mean_log_var(proposed_action_hidden)
+
+        else: # else internal rl phase
+            proposed_action_hidden, _ = self.action_proposer(residual_stream)
+            proposed_action = self.action_proposer_mean_log_var(proposed_action_hidden)
+
+        # sample from the gaussian as the action from the meta controller
+
+        mean, log_var = proposed_action.chunk(2, dim = -1)
+
+        std = (0.5 * log_var).exp()
+        sampled_action_intents = mean + torch.randn_like(mean) * std
+
+        # need to encourage normal distribution
+
+        vae_kl_loss = self.zero
+
+        if discovery_phase:
+            vae_kl_loss = (0.5 * (
+                log_var.exp()
+                + mean.square()
+                - log_var
+                - 1.
+            )).sum(dim = -1).mean()
+
+        # switching unit timer
+
+        batch, _, dim = sampled_action_intents.shape
+
+        switching_unit_gru_out, switching_unit_gru_hidden = self.switching_unit(residual_stream)
 
         switch_beta = self.to_switching_unit_beta(switching_unit_gru_out).sigmoid()
 
-        batch, _, dim = intent.shape
-
-        intent_for_gating = rearrange(intent, 'b n d -> (b d) n')
+        action_intent_for_gating = rearrange(sampled_action_intents, 'b n d -> (b d) n')
         switch_beta = repeat(switch_beta, 'b n 1 -> (b d) n', d = dim)
 
         forget = 1. - switch_beta
-        gated_intent = self.switch_gating(intent_for_gating * forget, switch_beta)
+        gated_action_intent = self.switch_gating(action_intent_for_gating * forget, switch_beta)
 
-        gated_intent = rearrange(gated_intent, '(b d) n -> b n d', b = batch)
+        gated_action_intent = rearrange(gated_action_intent, '(b d) n -> b n d', b = batch)
 
         # decoder
 
-        decoder_out = self.decoder(gated_intent)
+        decoder_out = self.decoder(gated_action_intent)
 
         w1, w2 = self.to_hyper_network_weights(decoder_out)
         hypernetwork_weight = einsum(w1, w2, '... i r, ... j r -> ... i j')
 
         # generating the residual stream controlling signal
 
-        control_signal = einsum(gated_intent, hypernetwork_weight, '... d1, ... d1 d2 -> ... d1')
+        control_signal = einsum(gated_action_intent, hypernetwork_weight, '... d1, ... d1 d2 -> ... d1')
 
-        return latent + control_signal
+        modified_residual_stream = residual_stream + control_signal
+
+        return modified_residual_stream, vae_kl_loss
 
 # main transformer, which is subsumed into the environment after behavioral cloning
 
@@ -159,7 +222,7 @@ class Transformer(Module):
         evo_strat = EvoStrategy(
             self,
             environment = environment,
-            params_to_optimize = self.meta_controller.internal_rl.parameters(),
+            params_to_optimize = self.meta_controller.internal_rl_parameters(),
             **kwargs
         )
 
@@ -169,21 +232,22 @@ class Transformer(Module):
         self,
         ids,
         meta_controller: Module | None = None,
+        discovery_phase = False,
         return_latents = False
     ):
         meta_controller = default(meta_controller, self.meta_controller, Identity())
 
         embed = self.embed(ids)
 
-        latents = self.lower_body(embed)
+        residual_stream = self.lower_body(embed)
 
-        # meta controller acts on latents here
+        # meta controller acts on residual stream here
 
-        modified_latents = meta_controller(latents)
+        modified_residual_stream, vae_aux_loss = meta_controller(residual_stream, discovery_phase = discovery_phase)
 
-        # modified latents sent back
+        # modified residual stream sent back
 
-        attended = self.upper_body(latents)
+        attended = self.upper_body(modified_residual_stream)
 
         dist_params = self.readout(attended)
 

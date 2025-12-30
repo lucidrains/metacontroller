@@ -1,8 +1,13 @@
+import pytest
+param = pytest.mark.parametrize
 
 import torch
 from metacontroller.metacontroller import Transformer, MetaController
 
-def test_metacontroller():
+@param('discovery_phase', (False, True))
+def test_metacontroller(
+    discovery_phase
+):
 
     ids = torch.randint(0, 256, (1, 1024))
 
@@ -16,6 +21,6 @@ def test_metacontroller():
 
     meta_controller = MetaController(512)
 
-    logits = model(ids, meta_controller = meta_controller)
+    logits = model(ids, meta_controller = meta_controller, discovery_phase = discovery_phase)
 
     assert logits.shape == (1, 1024, 256)
