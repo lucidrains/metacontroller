@@ -43,6 +43,11 @@ def default(*args):
             return arg
     return None
 
+# tensor helpers
+
+def straight_through(src, tgt):
+    return tgt + src - src.detach()
+
 # meta controller
 
 class MetaController(Module):
@@ -116,7 +121,8 @@ class MetaController(Module):
     def forward(
         self,
         residual_stream,
-        discovery_phase = False
+        discovery_phase = False,
+        hard_switch = False
     ):
 
         if discovery_phase:
@@ -136,6 +142,17 @@ class MetaController(Module):
 
         sampled_action = readout.sample(action_dist)
 
+        # switching unit timer
+
+        batch, _, dim = sampled_action.shape
+
+        switching_unit_gru_out, switching_unit_gru_hidden = self.switching_unit(residual_stream)
+
+        switch_beta = self.to_switching_unit_beta(switching_unit_gru_out).sigmoid()
+
+        action_intent_for_gating = rearrange(sampled_action, 'b n d -> (b d) n')
+        switch_beta = repeat(switch_beta, 'b n d -> (b r d) n', r = dim if not self.switch_per_latent_dim else 1)
+
         # need to encourage normal distribution
 
         vae_kl_loss = self.zero
@@ -148,18 +165,16 @@ class MetaController(Module):
                 + mean.square()
                 - log_var
                 - 1.
-            )).sum(dim = -1).mean()
+            )).sum(dim = -1)
 
-        # switching unit timer
+            vae_kl_loss = vae_kl_loss * switch_beta
+            vae_kl_loss = vae_kl_loss.mean()
 
-        batch, _, dim = sampled_action.shape
+        # maybe hard switch, then use associative scan
 
-        switching_unit_gru_out, switching_unit_gru_hidden = self.switching_unit(residual_stream)
-
-        switch_beta = self.to_switching_unit_beta(switching_unit_gru_out).sigmoid()
-
-        action_intent_for_gating = rearrange(sampled_action, 'b n d -> (b d) n')
-        switch_beta = repeat(switch_beta, 'b n d -> (b r d) n', r = dim if not self.switch_per_latent_dim else 1)
+        if hard_switch:
+            hard_switch = (switch_beta > 0.5).float()
+            switch_beta = straight_through(switch_beta, hard_switch)
 
         forget = 1. - switch_beta
         gated_action_intent = self.switch_gating(action_intent_for_gating * forget, switch_beta)
