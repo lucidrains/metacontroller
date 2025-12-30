@@ -150,9 +150,6 @@ class MetaController(Module):
 
         switch_beta = self.to_switching_unit_beta(switching_unit_gru_out).sigmoid()
 
-        action_intent_for_gating = rearrange(sampled_action, 'b n d -> (b d) n')
-        switch_beta = repeat(switch_beta, 'b n d -> (b r d) n', r = dim if not self.switch_per_latent_dim else 1)
-
         # need to encourage normal distribution
 
         vae_kl_loss = self.zero
@@ -165,10 +162,10 @@ class MetaController(Module):
                 + mean.square()
                 - log_var
                 - 1.
-            )).sum(dim = -1)
+            ))
 
             vae_kl_loss = vae_kl_loss * switch_beta
-            vae_kl_loss = vae_kl_loss.mean()
+            vae_kl_loss = vae_kl_loss.sum(dim = -1).mean()
 
         # maybe hard switch, then use associative scan
 
@@ -177,20 +174,18 @@ class MetaController(Module):
             switch_beta = straight_through(switch_beta, hard_switch)
 
         forget = 1. - switch_beta
-        gated_action_intent = self.switch_gating(action_intent_for_gating * forget, switch_beta)
-
-        gated_action_intent = rearrange(gated_action_intent, '(b d) n -> b n d', b = batch)
+        gated_action = self.switch_gating(switch_beta, sampled_action * forget)
 
         # decoder
 
-        decoder_out = self.decoder(gated_action_intent)
+        decoder_out = self.decoder(gated_action)
 
         w1, w2 = self.to_hyper_network_weights(decoder_out)
         hypernetwork_weight = einsum(w1, w2, '... i r, ... j r -> ... i j')
 
         # generating the residual stream controlling signal
 
-        control_signal = einsum(gated_action_intent, hypernetwork_weight, '... d1, ... d1 d2 -> ... d1')
+        control_signal = einsum(gated_action, hypernetwork_weight, '... d1, ... d1 d2 -> ... d1')
 
         modified_residual_stream = residual_stream + control_signal
 
