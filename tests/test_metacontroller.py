@@ -5,8 +5,10 @@ import torch
 from metacontroller.metacontroller import Transformer, MetaController
 
 @param('discovery_phase', (False, True))
+@param('switch_per_latent_dim', (False, True))
 def test_metacontroller(
-    discovery_phase
+    discovery_phase,
+    switch_per_latent_dim
 ):
 
     ids = torch.randint(0, 256, (1, 1024))
@@ -19,7 +21,10 @@ def test_metacontroller(
         readout = dict(num_discrete = 256)
     )
 
-    meta_controller = MetaController(512)
+    meta_controller = MetaController(
+        512,
+        switch_per_latent_dim = switch_per_latent_dim
+    )
 
     logits = model(ids, meta_controller = meta_controller, discovery_phase = discovery_phase)
 

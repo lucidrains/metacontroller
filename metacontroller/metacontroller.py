@@ -49,6 +49,7 @@ class MetaController(Module):
         self,
         dim_latent,
         *,
+        switch_per_latent_dim = True,
         decoder_expansion_factor = 2.,
         decoder_depth = 1,
         hypernetwork_low_rank = 16,
@@ -70,8 +71,10 @@ class MetaController(Module):
 
         # switching unit
 
+        self.switch_per_latent_dim = switch_per_latent_dim
+
         self.switching_unit = GRU(dim_latent, dim_latent)
-        self.to_switching_unit_beta = nn.Linear(dim_latent, 1, bias = False)
+        self.to_switching_unit_beta = nn.Linear(dim_latent, dim_latent if switch_per_latent_dim else 1, bias = False)
 
         self.switch_gating = AssocScan(**assoc_scan_kwargs)
 
@@ -154,7 +157,7 @@ class MetaController(Module):
         switch_beta = self.to_switching_unit_beta(switching_unit_gru_out).sigmoid()
 
         action_intent_for_gating = rearrange(sampled_action_intents, 'b n d -> (b d) n')
-        switch_beta = repeat(switch_beta, 'b n 1 -> (b d) n', d = dim)
+        switch_beta = repeat(switch_beta, 'b n d -> (b r d) n', r = dim if not self.switch_per_latent_dim else 1)
 
         forget = 1. - switch_beta
         gated_action_intent = self.switch_gating(action_intent_for_gating * forget, switch_beta)
