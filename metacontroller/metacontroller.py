@@ -52,6 +52,13 @@ def straight_through(src, tgt):
 
 # meta controller
 
+MetaControllerOutput = namedtuple('MetaControllerOutput', (
+    'prev_hiddens',
+    'action_dist',
+    'actions',
+    'kl_loss'
+))
+
 class MetaController(Module):
     def __init__(
         self,
@@ -107,9 +114,9 @@ class MetaController(Module):
         return [
             *self.bidirectional_temporal_compressor.parameters(),
             *self.emitter.parameters(),
-            *self.emitter_to_action_mean_log_var.parameters()
+            *self.emitter_to_action_mean_log_var.parameters(),
             *self.decoder.parameters(),
-            *self.switch_gating
+            *self.switch_gating.parameters()
         ]
 
     def internal_rl_parameters(self):
@@ -121,9 +128,18 @@ class MetaController(Module):
     def forward(
         self,
         residual_stream,
+        cache: MetaControllerOutput | None = None,
         discovery_phase = False,
         hard_switch = False
     ):
+
+        # destruct prev cache
+
+        prev_action_proposer_hidden, prev_switching_unit_gru_hidden, prev_switch_gated_hiddens = cache.prev_hiddens if exists(cache) else ((None,) * 3)
+
+        # getting proposed action for the two phases
+
+        next_action_proposer_hidden = None
 
         if discovery_phase:
             temporal_compressed, _ = self.bidirectional_temporal_compressor(residual_stream)
@@ -133,7 +149,8 @@ class MetaController(Module):
             readout = self.emitter_to_action_mean_log_var
 
         else: # else internal rl phase
-            proposed_action_hidden, _ = self.action_proposer(residual_stream)
+
+            proposed_action_hidden, next_action_proposer_hidden = self.action_proposer(residual_stream, prev_action_proposer_hidden)
             readout = self.action_proposer_mean_log_var
 
         # sample from the gaussian as the action from the meta controller
@@ -146,35 +163,37 @@ class MetaController(Module):
 
         batch, _, dim = sampled_action.shape
 
-        switching_unit_gru_out, switching_unit_gru_hidden = self.switching_unit(residual_stream)
+        switching_unit_gru_out, next_switching_unit_gru_hidden = self.switching_unit(residual_stream, prev_switching_unit_gru_hidden)
 
         switch_beta = self.to_switching_unit_beta(switching_unit_gru_out).sigmoid()
 
         # need to encourage normal distribution
 
-        vae_kl_loss = self.zero
+        kl_loss = self.zero
 
         if discovery_phase:
             mean, log_var = action_dist.unbind(dim = -1)
 
-            vae_kl_loss = (0.5 * (
+            kl_loss = (0.5 * (
                 log_var.exp()
                 + mean.square()
                 - log_var
                 - 1.
             ))
 
-            vae_kl_loss = vae_kl_loss * switch_beta
-            vae_kl_loss = vae_kl_loss.sum(dim = -1).mean()
+            kl_loss = kl_loss * switch_beta
+            kl_loss = kl_loss.sum(dim = -1).mean()
 
         # maybe hard switch, then use associative scan
 
         if hard_switch:
-            hard_switch = (switch_beta > 0.5).float()
-            switch_beta = straight_through(switch_beta, hard_switch)
+            hard_switch_beta = (switch_beta > 0.5).float()
+            switch_beta = straight_through(switch_beta, hard_switch_beta)
 
         forget = 1. - switch_beta
-        gated_action = self.switch_gating(switch_beta, sampled_action * forget)
+        gated_action = self.switch_gating(switch_beta, sampled_action * forget, prev = prev_switch_gated_hiddens)
+
+        next_switch_gated_action = gated_action[:, -1]
 
         # decoder
 
@@ -189,9 +208,22 @@ class MetaController(Module):
 
         modified_residual_stream = residual_stream + control_signal
 
-        return modified_residual_stream, action_dist, sampled_action, vae_kl_loss
+        # returning
+
+        next_hiddens = (
+            next_action_proposer_hidden,
+            next_switching_unit_gru_hidden,
+            next_switch_gated_action
+        )
+
+        return modified_residual_stream, MetaControllerOutput(next_hiddens, action_dist, sampled_action, kl_loss)
 
 # main transformer, which is subsumed into the environment after behavioral cloning
+
+TransformerOutput = namedtuple('TransformerOutput', (
+    'residual_stream_latent',
+    'prev_hiddens'
+))
 
 class Transformer(Module):
     def __init__(
@@ -251,10 +283,12 @@ class Transformer(Module):
         self,
         ids,
         meta_controller: Module | None = None,
+        cache: TransformerOutput | None = None,
         discovery_phase = False,
-        return_latents = False,
         no_grad_transformer = None,
-        no_grad_meta_controller = None
+        no_grad_meta_controller = None,
+        return_latents = False,
+        return_cache = False
     ):
         meta_controller = default(meta_controller, self.meta_controller)
 
@@ -268,28 +302,32 @@ class Transformer(Module):
         transformer_context = torch.no_grad if no_grad_transformer else nullcontext
         meta_controller_context = torch.no_grad if no_grad_meta_controller else nullcontext
 
+        # handle cache
+
+        lower_transformer_hiddens, meta_hiddens, upper_transformer_hiddens = cache.prev_hiddens if exists(cache) else ((None,) * 3)
+
         # transformer lower body
 
         with transformer_context():
 
             embed = self.embed(ids)
 
-            residual_stream = self.lower_body(embed)
+            residual_stream, next_lower_hiddens = self.lower_body(embed, cache = lower_transformer_hiddens, return_hiddens = True)
 
         # meta controller acts on residual stream here
 
         with meta_controller_context():
 
             if exists(meta_controller):
-                modified_residual_stream, action_dist, sampled_action, vae_aux_loss = meta_controller(residual_stream, discovery_phase = discovery_phase)
+                modified_residual_stream, next_meta_hiddens = meta_controller(residual_stream, cache = meta_hiddens, discovery_phase = discovery_phase)
             else:
-                modified_residual_stream, action_dist, sampled_action, vae_aux_loss = residual_stream, None, None, self.zero
+                modified_residual_stream, next_meta_hiddens = residual_stream, None
 
         # modified residual stream sent back to transformer upper body
 
         with transformer_context():
 
-            attended = self.upper_body(modified_residual_stream)
+            attended, next_upper_hiddens = self.upper_body(modified_residual_stream, cache = upper_transformer_hiddens, return_hiddens = True)
 
             # head readout
 
@@ -297,7 +335,9 @@ class Transformer(Module):
 
         # returning
 
-        if not return_latents:
+        return_one = not (return_latents or return_cache)
+
+        if return_one:
             return dist_params
 
-        return dist_params, latents
+        return dist_params, TransformerOutput(residual_stream, (next_lower_hiddens, next_meta_hiddens, next_upper_hiddens))

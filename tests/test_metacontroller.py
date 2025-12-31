@@ -26,9 +26,14 @@ def test_metacontroller(
         switch_per_latent_dim = switch_per_latent_dim
     )
 
-    logits = model(ids, meta_controller = meta_controller, discovery_phase = discovery_phase)
+    logits, cache = model(ids, meta_controller = meta_controller, discovery_phase = discovery_phase, return_cache = True)
 
     assert logits.shape == (1, 1024, 256)
+
+    logits, cache = model(ids, meta_controller = meta_controller, discovery_phase = discovery_phase, return_cache = True, cache = cache)
+    logits, cache = model(ids, meta_controller = meta_controller, discovery_phase = discovery_phase, return_cache = True, cache = cache)
+
+    assert logits.shape == (1, 1, 256)
 
     model.meta_controller = meta_controller
     model.evolve(1, lambda _: 1., noise_population_size = 2)
