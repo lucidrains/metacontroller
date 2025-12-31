@@ -22,7 +22,7 @@ from x_transformers import Decoder
 from x_mlps_pytorch import Feedforwards
 from x_evolution import EvoStrategy
 
-from discrete_continuous_embed_readout import Embed, Readout
+from discrete_continuous_embed_readout import Embed, Readout, EmbedAndReadout
 
 from assoc_scan import AssocScan
 
@@ -234,16 +234,13 @@ class Transformer(Module):
         self,
         dim,
         *,
-        embed: Embed | dict,
+        state_embed_readout: dict,
+        action_embed_readout: dict,
         lower_body: Decoder | dict,
         upper_body: Decoder | dict,
-        readout: Readout | dict,
         meta_controller: MetaController | None = None
     ):
         super().__init__()
-
-        if isinstance(embed, dict):
-            embed = Embed(dim = dim, **embed)
 
         if isinstance(lower_body, dict):
             lower_body = Decoder(dim = dim, **lower_body)
@@ -251,13 +248,11 @@ class Transformer(Module):
         if isinstance(upper_body, dict):
             upper_body = Decoder(dim = dim, **upper_body)
 
-        if isinstance(readout, dict):
-            readout = Readout(dim = dim, **readout)
+        self.state_embed, self.state_readout = EmbedAndReadout(dim, **state_embed_readout)
+        self.action_embed, self.action_readout = EmbedAndReadout(dim, **action_embed_readout)
 
-        self.embed = embed
         self.lower_body = lower_body
         self.upper_body = upper_body
-        self.readout = readout
 
         # meta controller
 
@@ -285,11 +280,13 @@ class Transformer(Module):
 
     def forward(
         self,
-        ids,
+        state,
+        action_ids,
         meta_controller: Module | None = None,
         cache: TransformerOutput | None = None,
         discovery_phase = False,
         meta_controller_temperature = 1.,
+        return_raw_action_dist = False,
         return_latents = False,
         return_cache = False,
     ):
@@ -297,21 +294,32 @@ class Transformer(Module):
 
         meta_controlling = exists(meta_controller)
 
+        behavioral_cloning = not meta_controlling and not return_raw_action_dist
+
         # by default, if meta controller is passed in, transformer is no grad
 
         lower_transformer_context = nullcontext if not meta_controlling else torch.no_grad
         meta_controller_context = nullcontext if meta_controlling else torch.no_grad
-        upper_transformer_context = nullcontext if meta_controlling and discovery_phase else torch.no_grad
+        upper_transformer_context = nullcontext if (not meta_controlling or discovery_phase) else torch.no_grad
 
         # handle cache
 
         lower_transformer_hiddens, meta_hiddens, upper_transformer_hiddens = cache.prev_hiddens if exists(cache) else ((None,) * 3)
 
+        # handle maybe behavioral cloning
+
+        if behavioral_cloning:
+            state, target_state = state[:, :-1], state[:, 1:]
+            action_ids, target_action_ids = action_ids[:, :-1], action_ids[:, 1:]
+
         # transformer lower body
 
         with lower_transformer_context():
 
-            embed = self.embed(ids)
+            state_embed = self.state_embed(state)
+            action_embed = self.action_embed(action_ids)
+
+            embed = state_embed + action_embed
 
             residual_stream, next_lower_hiddens = self.lower_body(embed, cache = lower_transformer_hiddens, return_hiddens = True)
 
@@ -332,7 +340,17 @@ class Transformer(Module):
 
             # head readout
 
-            dist_params = self.readout(attended)
+            dist_params = self.action_readout(attended)
+
+        # maybe return behavior cloning loss
+
+        if behavioral_cloning:
+            state_dist_params = self.state_readout(attended)
+            state_clone_loss = self.state_readout.calculate_loss(state_dist_params, target_state)
+
+            action_clone_loss = self.action_readout.calculate_loss(dist_params, target_action_ids)
+
+            return state_clone_loss, action_clone_loss
 
         # returning
 
