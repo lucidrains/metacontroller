@@ -6,7 +6,7 @@ from collections import namedtuple
 from loguru import logger
 
 import torch
-from torch import nn, cat, stack, tensor
+from torch import nn, cat, stack, tensor, Tensor
 from torch.nn import Module, GRU, Linear, Identity
 import torch.nn.functional as F
 
@@ -26,7 +26,7 @@ from discrete_continuous_embed_readout import Embed, Readout, EmbedAndReadout
 
 from assoc_scan import AssocScan
 
-from torch_einops_utils import pad_at_dim, lens_to_mask
+from torch_einops_utils import maybe, pad_at_dim, lens_to_mask
 from torch_einops_utils.save_load import save_load
 
 # constants
@@ -151,7 +151,8 @@ class MetaController(Module):
         cache: MetaControllerOutput | None = None,
         discovery_phase = False,
         hard_switch = False,
-        temperature = 1.
+        temperature = 1.,
+        episode_lens: Tensor | None = None
     ):
         device = residual_stream.device
 
@@ -168,7 +169,9 @@ class MetaController(Module):
         if discovery_phase:
             logger.warning('meta controller cache being passed back in for discovery phase, which does not make sense given bidirectional encoder')
 
-            encoded_temporal = self.bidirectional_temporal_encoder(meta_embed)
+            mask = maybe(lens_to_mask)(episode_lens, meta_embed.shape[1])
+
+            encoded_temporal = self.bidirectional_temporal_encoder(meta_embed, mask = mask)
 
             proposed_action_hidden, _ = self.emitter(cat((encoded_temporal, meta_embed), dim = -1))
             readout = self.emitter_to_action_mean_log_var
@@ -391,7 +394,7 @@ class Transformer(Module):
         with meta_controller_context():
 
             if exists(meta_controller):
-                control_signal, next_meta_hiddens = meta_controller(residual_stream, cache = meta_hiddens, discovery_phase = discovery_phase, temperature = meta_controller_temperature)
+                control_signal, next_meta_hiddens = meta_controller(residual_stream, cache = meta_hiddens, discovery_phase = discovery_phase, temperature = meta_controller_temperature, episode_lens = episode_lens)
             else:
                 control_signal, next_meta_hiddens = self.zero, None
 
