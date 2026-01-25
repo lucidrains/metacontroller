@@ -1,6 +1,8 @@
 import pytest
 param = pytest.mark.parametrize
 
+from pathlib import Path
+
 import torch
 from metacontroller.metacontroller import Transformer, MetaController
 
@@ -68,3 +70,16 @@ def test_metacontroller(
 
     model.meta_controller = meta_controller
     model.evolve(1, lambda _: 1., noise_population_size = 2)
+
+    # saving and loading
+
+    meta_controller.save('./meta_controller.pt')
+
+    rehydrated_meta_controller = MetaController.init_and_load('./meta_controller.pt')
+
+    model.save('./trained.pt')
+
+    rehydrated_model = Transformer.init_and_load('./trained.pt', strict = False)
+
+    Path('./meta_controller.pt').unlink()
+    Path('./trained.pt').unlink()

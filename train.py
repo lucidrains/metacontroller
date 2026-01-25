@@ -3,7 +3,7 @@
 #   "fire",
 #   "gymnasium",
 #   "gymnasium[other]",
-#   "memmap-replay-buffer>=0.0.10",
+#   "memmap-replay-buffer>=0.0.12",
 #   "metacontroller-pytorch",
 #   "minigrid",
 #   "tqdm"

@@ -27,6 +27,7 @@ from discrete_continuous_embed_readout import Embed, Readout, EmbedAndReadout
 from assoc_scan import AssocScan
 
 from torch_einops_utils import pad_at_dim
+from torch_einops_utils.save_load import save_load
 
 # constants
 
@@ -63,6 +64,7 @@ MetaControllerOutput = namedtuple('MetaControllerOutput', (
     'switch_loss'
 ))
 
+@save_load()
 class MetaController(Module):
     def __init__(
         self,
@@ -272,6 +274,7 @@ TransformerOutput = namedtuple('TransformerOutput', (
     'prev_hiddens'
 ))
 
+@save_load()
 class Transformer(Module):
     def __init__(
         self,
