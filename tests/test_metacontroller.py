@@ -5,27 +5,30 @@ from pathlib import Path
 
 import torch
 from metacontroller.metacontroller import Transformer, MetaController
+from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
 
 from einops import rearrange
 
+@param('use_binary_mapper_variant', (False, True))
 @param('action_discrete', (False, True))
 @param('switch_per_latent_dim', (False, True))
 @param('variable_length', (False, True))
 def test_metacontroller(
+    use_binary_mapper_variant,
     action_discrete,
     switch_per_latent_dim,
     variable_length
 ):
 
-    state = torch.randn(1, 1024, 384)
-    episode_lens = torch.tensor([512]) if variable_length else None
+    state = torch.randn(2, 128, 384)
+    episode_lens = torch.tensor([64, 64]) if variable_length else None
 
     if action_discrete:
-        actions = torch.randint(0, 4, (1, 1024))
+        actions = torch.randint(0, 4, (2, 128))
         action_embed_readout = dict(num_discrete = 4)
         assert_shape = (4,)
     else:
-        actions = torch.randn(1, 1024, 8)
+        actions = torch.randn(2, 128, 8)
         action_embed_readout = dict(num_continuous = 8)
         assert_shape = (8, 2)
 
@@ -44,12 +47,20 @@ def test_metacontroller(
 
     # discovery and internal rl phase with meta controller
 
-    meta_controller = MetaController(
-        dim_model = 512,
-        dim_meta_controller = 256,
-        dim_latent = 128,
-        switch_per_latent_dim = switch_per_latent_dim
-    )
+    if not use_binary_mapper_variant:
+        meta_controller = MetaController(
+            dim_model = 512,
+            dim_meta_controller = 256,
+            dim_latent = 128,
+            switch_per_latent_dim = switch_per_latent_dim
+        )
+    else:
+        meta_controller = MetaControllerWithBinaryMapper(
+            dim_model = 512,
+            dim_meta_controller = 256,
+            switch_per_code = switch_per_latent_dim,
+            dim_code_bits = 8, # 2**8 = 256 codes
+        )
 
     # discovery phase
 
@@ -66,7 +77,7 @@ def test_metacontroller(
 
         logits, cache = model(one_state, past_action_id, meta_controller = meta_controller, return_cache = True)
 
-        assert logits.shape == (1, 1, *assert_shape)
+        assert logits.shape == (2, 1, *assert_shape)
         past_action_id = model.action_readout.sample(logits)
 
     # evolutionary strategies over grpo
@@ -78,7 +89,8 @@ def test_metacontroller(
 
     meta_controller.save('./meta_controller.pt')
 
-    rehydrated_meta_controller = MetaController.init_and_load('./meta_controller.pt')
+    meta_controller_klass = meta_controller.__class__
+    rehydrated_meta_controller = meta_controller_klass.init_and_load('./meta_controller.pt')
 
     model.save('./trained.pt')
 
