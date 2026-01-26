@@ -26,6 +26,7 @@ from memmap_replay_buffer import ReplayBuffer
 from einops import rearrange
 
 from metacontroller.metacontroller import Transformer
+from metacontroller.metacontroller_with_resnet import TransformerWithResnetEncoder
 
 import minigrid
 import gymnasium as gym
@@ -33,7 +34,8 @@ import gymnasium as gym
 def train(
     input_dir: str = "babyai-minibosslevel-trajectories",
     env_id: str = "BabyAI-MiniBossLevel-v0",
-    epochs: int = 10,
+    cloning_epochs: int = 10,
+    discovery_epochs: int = 10,
     batch_size: int = 32,
     lr: float = 1e-4,
     dim: int = 512,
@@ -44,7 +46,8 @@ def train(
     wandb_project: str = "metacontroller-babyai-bc",
     checkpoint_path: str = "transformer_bc.pt",
     state_loss_weight: float = 1.,
-    action_loss_weight: float = 1.
+    action_loss_weight: float = 1.,
+    use_resnet: bool = False
 ):
     # accelerator
 
@@ -54,7 +57,8 @@ def train(
         accelerator.init_trackers(
             wandb_project,
             config = {
-                "epochs": epochs,
+                "cloning_epochs": cloning_epochs,
+                "discovery_epochs": discovery_epochs,
                 "batch_size": batch_size,
                 "lr": lr,
                 "dim": dim,
@@ -78,12 +82,8 @@ def train(
     # state shape and action dimension
     # state: (B, T, H, W, C) or (B, T, D)
     state_shape = replay_buffer.shapes['state']
-    state_dim = int(torch.tensor(state_shape).prod().item())
-
-    # state shape and action dimension
-    # state: (B, T, H, W, C) or (B, T, D)
-    state_shape = replay_buffer.shapes['state']
-    state_dim = int(torch.tensor(state_shape).prod().item())
+    if use_resnet: state_dim = 256
+    else: state_dim = int(torch.tensor(state_shape).prod().item())
 
     # deduce num_actions from the environment
     minigrid.register_minigrid_envs()
@@ -94,8 +94,9 @@ def train(
     accelerator.print(f"Detected state_dim: {state_dim}, num_actions: {num_actions} from env: {env_id}")
 
     # transformer
-
-    model = Transformer(
+    
+    transformer_class = TransformerWithResnetEncoder if use_resnet else Transformer
+    model = transformer_class(
         dim = dim,
         state_embed_readout = dict(num_continuous = state_dim),
         action_embed_readout = dict(num_discrete = num_actions),
@@ -112,13 +113,13 @@ def train(
     model, optim, dataloader = accelerator.prepare(model, optim, dataloader)
 
     # training
-
-    for epoch in range(epochs):
+    for epoch in range(cloning_epochs + discovery_epochs):
         model.train()
         total_state_loss = 0.
         total_action_loss = 0.
 
         progress_bar = tqdm(dataloader, desc = f"Epoch {epoch}", disable = not accelerator.is_local_main_process)
+        is_discovering = (epoch >= cloning_epochs) # discovery phase is BC with metacontroller tuning
 
         for batch in progress_bar:
             # batch is a NamedTuple (e.g. MemoryMappedBatch)
@@ -128,15 +129,20 @@ def train(
             actions = batch['action'].long()
             episode_lens = batch.get('_lens')
 
-            # flatten state: (B, T, 7, 7, 3) -> (B, T, 147)
-
-            states = rearrange(states, 'b t ... -> b t (...)')
+            # use resnet18 to embed visual observations
+            if use_resnet: 
+                states = model.visual_encode(states)
+            else: # flatten state: (B, T, 7, 7, 3) -> (B, T, 147)
+                states = rearrange(states, 'b t ... -> b t (...)')
 
             with accelerator.accumulate(model):
-                state_loss, action_loss = model(states, actions, episode_lens = episode_lens)
+                state_loss, action_loss = model(states, actions, episode_lens = episode_lens, discovery_phase=is_discovering)
                 loss = state_loss * state_loss_weight + action_loss * action_loss_weight
 
                 accelerator.backward(loss)
+
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
                 optim.step()
                 optim.zero_grad()
 
@@ -148,7 +154,8 @@ def train(
             accelerator.log({
                 "state_loss": state_loss.item(),
                 "action_loss": action_loss.item(),
-                "total_loss": loss.item()
+                "total_loss": loss.item(),
+                "grad_norm": grad_norm.item()
             })
 
             progress_bar.set_postfix(

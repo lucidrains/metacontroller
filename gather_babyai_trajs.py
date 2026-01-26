@@ -31,7 +31,12 @@ import gymnasium as gym
 from minigrid.utils.baby_ai_bot import BabyAIBot
 from minigrid.wrappers import FullyObsWrapper, SymbolicObsWrapper
 
+from gymnasium import spaces
+from gymnasium.core import ObservationWrapper
+from minigrid.core.constants import OBJECT_TO_IDX
+
 from memmap_replay_buffer import ReplayBuffer
+
 
 # helpers
 
@@ -40,6 +45,40 @@ def exists(val):
 
 def sample(prob):
     return random.random() < prob
+
+# wrapper, necessarily modified to allow for both rgb obs (policy) and symbolic obs (bot)
+
+class RGBImgPartialObsWrapper(ObservationWrapper):
+    """
+    Wrapper to use partially observable RGB image as observation.
+    This can be used to have the agent to solve the gridworld in pixel space.
+    """
+    def __init__(self, env, tile_size=1):
+        super().__init__(env)
+
+        # Rendering attributes for observations
+        self.tile_size = tile_size
+
+        symbolic_image_space = self.observation_space["image"]
+
+        obs_shape = env.observation_space.spaces["image"].shape
+        new_image_space = spaces.Box(
+            low=0,
+            high=255,
+            shape=(obs_shape[0] * tile_size, obs_shape[1] * tile_size, 3),
+            dtype="uint8",
+        )
+
+        self.observation_space = spaces.Dict(
+            {**self.observation_space.spaces, "image": symbolic_image_space, "rgb_image": new_image_space}
+        )
+
+    def observation(self, obs):
+        rgb_img_partial = self.unwrapped.get_frame(
+            tile_size=self.tile_size, agent_pov=True
+        )
+
+        return {**obs, "rgb_image": rgb_img_partial}
 
 # agent
 
@@ -72,6 +111,7 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
     env = gym.make(env_id, render_mode="rgb_array", highlight=False)
     env = FullyObsWrapper(env.unwrapped)
     env = SymbolicObsWrapper(env.unwrapped)
+    env = RGBImgPartialObsWrapper(env.unwrapped)
 
     try:
         state_obs, _ = env.reset(seed=seed)
@@ -88,7 +128,7 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
                 env.close()
                 return None, None, False, 0
 
-            episode_state[_step] = state_obs["image"]
+            episode_state[_step] = state_obs["rgb_image"]
             episode_action[_step] = action
 
             state_obs, reward, terminated, truncated, info = env.step(action)
@@ -127,7 +167,8 @@ def collect_demonstrations(
     temp_env = gym.make(env_id)
     temp_env = FullyObsWrapper(temp_env.unwrapped)
     temp_env = SymbolicObsWrapper(temp_env.unwrapped)
-    state_shape = temp_env.observation_space['image'].shape
+    temp_env = RGBImgPartialObsWrapper(temp_env.unwrapped)
+    state_shape = temp_env.observation_space['rgb_image'].shape
     temp_env.close()
 
     logger.info(f"Detected state shape: {state_shape} for env {env_id}")
