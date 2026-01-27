@@ -296,4 +296,9 @@ class MetaControllerWithBinaryMapper(Module):
             sampled_codes[:, -1:]
         )
 
+        # squeeze out the last dimension of switch_beta if single gate for all codes
+
+        if not self.switch_per_code:
+            switch_beta = rearrange(switch_beta, '... 1 -> ...')
+
         return control_signal, MetaControllerOutput(next_hiddens, residual_stream, binary_logits, sampled_codes, switch_beta, kl_loss, switch_loss)

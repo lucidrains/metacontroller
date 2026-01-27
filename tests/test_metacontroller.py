@@ -2,6 +2,7 @@ import pytest
 param = pytest.mark.parametrize
 
 from pathlib import Path
+from functools import partial
 
 import torch
 from torch import cat
@@ -116,11 +117,11 @@ def test_metacontroller(
 
         # accumulate across time for the episode data
 
-        all_episodes.append(dict(
-            states = cat(states, dim = 1),
-            log_probs = cat(log_probs, dim = 1),
-            switch_betas = cat(switch_betas, dim = 1),
-            latent_actions = cat(latent_actions, dim = 1)
+        all_episodes.append((
+            cat(states, dim = 1),
+            cat(log_probs, dim = 1),
+            cat(switch_betas, dim = 1),
+            cat(latent_actions, dim = 1)
         ))
 
         all_rewards.append(torch.randn(1))
@@ -134,23 +135,19 @@ def test_metacontroller(
 
     # simulate a policy loss update over the entire group
 
-    group_states = cat([e['states'] for e in all_episodes], dim = 0)
-    group_log_probs = cat([e['log_probs'] for e in all_episodes], dim = 0)
-    group_latent_actions = cat([e['latent_actions'] for e in all_episodes], dim = 0)
-    group_switch_betas = cat([e['switch_betas'] for e in all_episodes], dim = 0)
+    group_states, group_log_probs, group_switch_betas, group_latent_actions = map(partial(cat, dim = 0), zip(*all_episodes))
 
-    if not use_binary_mapper_variant:
-        loss = policy_loss(
-            meta_controller,
-            group_states,
-            group_log_probs,
-            group_latent_actions,
-            advantages,
-            group_switch_betas == 1.,
-            episode_lens = episode_lens[:1].repeat(3) if exists(episode_lens) else None
-        )
+    loss = policy_loss(
+        meta_controller,
+        group_states,
+        group_log_probs,
+        group_latent_actions,
+        advantages,
+        group_switch_betas == 1.,
+        episode_lens = episode_lens[:1].repeat(3) if exists(episode_lens) else None
+    )
 
-        loss.backward()
+    loss.backward()
 
     # evolutionary strategies over grpo
 

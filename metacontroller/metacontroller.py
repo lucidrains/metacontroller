@@ -329,6 +329,11 @@ class MetaController(Module):
             sampled_latent_action[:, -1:]
         )
 
+        # squeeze out the last dimension of switch_beta if single gate for all latent dimensions
+
+        if not self.switch_per_latent_dim:
+            switch_beta = rearrange(switch_beta, '... 1 -> ...')
+
         return control_signal, MetaControllerOutput(next_hiddens, residual_stream, action_dist, sampled_latent_action, switch_beta, kl_loss, switch_loss)
 
 # main transformer, which is subsumed into the environment after behavioral cloning
