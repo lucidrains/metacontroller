@@ -143,22 +143,34 @@ class MetaControllerWithBinaryMapper(Module):
             *self.proposer_to_binary_logits.parameters()
         ]
 
+    def get_action_dist_for_internal_rl(
+        self,
+        residual_stream
+    ):
+        meta_embed = self.model_to_meta(residual_stream)
+
+        proposed_action_hidden, _ = self.action_proposer(meta_embed)
+
+        return self.proposer_to_binary_logits(proposed_action_hidden)
+
     def log_prob(
         self,
         action_dist,
         sampled_latent_action
     ):
-        action_prob = action_dist.sigmoid()
-        probs = stack((action_prob, 1. - action_prob), dim = -1)
-        log_probs = log(probs)
+        log_probs = stack((
+            F.logsigmoid(action_dist),
+            F.logsigmoid(-action_dist)
+        ), dim = -1)
 
         indices = sampled_latent_action.argmax(dim = -1)
         codes = self.binary_mapper.codes[indices].long()
 
         codes = rearrange(codes, '... -> ... 1')
         action_log_probs = log_probs.gather(-1, codes)
+        action_log_probs = rearrange(action_log_probs, '... 1 -> ...')
 
-        return rearrange(action_log_probs, '... 1 -> ...')
+        return action_log_probs.sum(dim = -1)
 
     def forward(
         self,
