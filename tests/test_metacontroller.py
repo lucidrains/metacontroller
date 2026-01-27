@@ -4,19 +4,30 @@ param = pytest.mark.parametrize
 from pathlib import Path
 
 import torch
-from metacontroller.metacontroller import Transformer, MetaController
+from torch import cat
+from metacontroller.metacontroller import Transformer, MetaController, policy_loss, z_score
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
 
 from einops import rearrange
 
-@param('use_binary_mapper_variant', (False, True))
+# functions
+
+def exists(v):
+    return v is not None
+
+# test
+
+@param('use_binary_mapper_variant, switch_per_latent_dim', [
+    (False, False),
+    (False, True),
+    (True, False)
+])
 @param('action_discrete', (False, True))
-@param('switch_per_latent_dim', (False, True))
 @param('variable_length', (False, True))
 def test_metacontroller(
     use_binary_mapper_variant,
-    action_discrete,
     switch_per_latent_dim,
+    action_discrete,
     variable_length
 ):
 
@@ -69,22 +80,77 @@ def test_metacontroller(
 
     # internal rl - done iteratively
 
-    cache = None
-    past_action_id = None
+    # simulate grpo
 
-    for one_state in state.unbind(dim = 1):
-        one_state = rearrange(one_state, 'b d -> b 1 d')
+    all_episodes = []
+    all_rewards = []
 
-        logits, cache = model(one_state, past_action_id, meta_controller = meta_controller, return_cache = True)
+    for _ in range(3): # group of 3
+        subset_state = state[:1]
 
-        assert logits.shape == (2, 1, *assert_shape)
-        past_action_id = model.action_readout.sample(logits)
+        cache = None
+        past_action_id = None
 
-        # get log prob from meta controller latent actions
+        states = []
+        log_probs = []
+        switch_betas = []
+        latent_actions = []
 
-        meta_controller_hidden = cache.prev_hiddens.meta_controller
+        for one_state in subset_state.unbind(dim = 1):
+            one_state = rearrange(one_state, 'b d -> b 1 d')
 
-        old_log_probs = meta_controller.log_prob(meta_controller_hidden.action_dist, meta_controller_hidden.actions)
+            logits, cache = model(one_state, past_action_id, meta_controller = meta_controller, return_cache = True)
+
+            past_action_id = model.action_readout.sample(logits)
+
+            # get log prob from meta controller latent actions
+
+            meta_output = cache.prev_hiddens.meta_controller
+
+            old_log_probs = meta_controller.log_prob(meta_output.action_dist, meta_output.actions)
+
+            states.append(meta_output.input_residual_stream)
+            log_probs.append(old_log_probs)
+            switch_betas.append(meta_output.switch_beta)
+            latent_actions.append(meta_output.actions)
+
+        # accumulate across time for the episode data
+
+        all_episodes.append(dict(
+            states = cat(states, dim = 1),
+            log_probs = cat(log_probs, dim = 1),
+            switch_betas = cat(switch_betas, dim = 1),
+            latent_actions = cat(latent_actions, dim = 1)
+        ))
+
+        all_rewards.append(torch.randn(1))
+
+    # calculate advantages using z-score
+
+    rewards = cat(all_rewards)
+    advantages = z_score(rewards)
+
+    assert advantages.shape == (3,)
+
+    # simulate a policy loss update over the entire group
+
+    group_states = cat([e['states'] for e in all_episodes], dim = 0)
+    group_log_probs = cat([e['log_probs'] for e in all_episodes], dim = 0)
+    group_latent_actions = cat([e['latent_actions'] for e in all_episodes], dim = 0)
+    group_switch_betas = cat([e['switch_betas'] for e in all_episodes], dim = 0)
+
+    if not use_binary_mapper_variant:
+        loss = policy_loss(
+            meta_controller,
+            group_states,
+            group_log_probs,
+            group_latent_actions,
+            advantages,
+            group_switch_betas == 1.,
+            episode_lens = episode_lens[:1].repeat(3) if exists(episode_lens) else None
+        )
+
+        loss.backward()
 
     # evolutionary strategies over grpo
 

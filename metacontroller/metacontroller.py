@@ -26,7 +26,7 @@ from discrete_continuous_embed_readout import Embed, Readout, EmbedAndReadout
 
 from assoc_scan import AssocScan
 
-from torch_einops_utils import maybe, pad_at_dim, lens_to_mask
+from torch_einops_utils import maybe, pad_at_dim, lens_to_mask, masked_mean, align_dims_left, pad_right_ndim_to
 from torch_einops_utils.save_load import save_load
 
 # constants
@@ -65,6 +65,47 @@ MetaControllerOutput = namedtuple('MetaControllerOutput', (
     'kl_loss',
     'switch_loss'
 ))
+
+def z_score(t, eps = 1e-8):
+    return (t - t.mean()) / (t.std() + eps)
+
+def policy_loss(
+    meta_controller,
+    state,
+    old_log_probs,
+    actions,
+    advantages,
+    mask,
+    episode_lens = None,
+    eps_clip = 0.2
+):
+    # get new log probs
+
+    action_dist = meta_controller.get_action_dist_for_internal_rl(state)
+    new_log_probs = meta_controller.log_prob(action_dist, actions)
+
+    # calculate ratio
+
+    ratio = (new_log_probs - old_log_probs).exp()
+
+    # align ratio and advantages
+
+    ratio, advantages = align_dims_left((ratio, advantages))
+
+    # ppo surrogate loss
+
+    surr1 = ratio * advantages
+    surr2 = ratio.clamp(1 - eps_clip, 1 + eps_clip) * advantages
+
+    losses = -torch.min(surr1, surr2)
+
+    # masking
+
+    if exists(episode_lens):
+        mask, episode_mask = align_dims_left((mask, lens_to_mask(episode_lens, losses.shape[1])))
+        mask = mask & episode_mask
+
+    return masked_mean(losses, mask)
 
 @save_load()
 class MetaController(Module):
@@ -145,6 +186,16 @@ class MetaController(Module):
             *self.action_proposer.parameters(),
             *self.action_proposer_mean_log_var.parameters()
         ]
+
+    def get_action_dist_for_internal_rl(
+        self,
+        residual_stream
+    ):
+        meta_embed = self.model_to_meta(residual_stream)
+
+        proposed_action_hidden, _ = self.action_proposer(meta_embed)
+
+        return self.action_proposer_mean_log_var(proposed_action_hidden)
 
     def log_prob(
         self,
