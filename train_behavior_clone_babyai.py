@@ -92,8 +92,8 @@ def train(
     else: state_dim = int(torch.tensor(state_shape).prod().item())
 
     # deduce num_actions from the environment
-    minigrid.register_minigrid_envs()
-    temp_env = gym.make(env_id)
+    from babyai_env import create_env
+    temp_env = create_env(env_id)
     num_actions = int(temp_env.action_space.n)
     temp_env.close()
 
