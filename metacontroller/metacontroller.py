@@ -291,7 +291,7 @@ class MetaController(Module):
         else:
             # else during inference, use the previous sampled latent action
 
-            assert seq_len == 1, f'inference RL phase must be done one token at a time'
+            assert seq_len == 1, 'inference RL phase must be done one token at a time - if replaying for policy optimization, please use `get_action_dist_for_internal_rl`'
             z_prev = prev_sampled_latent_action
 
         # switch input is previous latent action and the embedding

@@ -241,7 +241,7 @@ class MetaControllerWithBinaryMapper(Module):
         if discovery_phase:
             z_prev = cat((prev_sampled_code, sampled_codes[:, :-1]), dim = 1)
         else:
-            assert seq_len == 1, f'inference RL phase must be done one token at a time'
+            assert seq_len == 1, 'inference RL phase must be done one token at a time - if replaying for policy optimization, please use `get_action_dist_for_internal_rl`'
             z_prev = prev_sampled_code
 
         switch_input = torch.cat((meta_embed, z_prev), dim=-1)
