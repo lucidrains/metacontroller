@@ -19,6 +19,8 @@ from einops.layers.torch import Rearrange
 # external modules
 
 from x_transformers import Encoder, Decoder
+from x_transformers.x_transformers import PolarEmbedding
+
 from x_mlps_pytorch import Feedforwards
 from x_evolution import EvoStrategy
 
@@ -434,7 +436,8 @@ Hiddens = namedtuple('Hiddens', (
 
 TransformerOutput = namedtuple('TransformerOutput', (
     'residual_stream_latent',
-    'prev_hiddens'
+    'prev_hiddens',
+    'cache_steps'
 ))
 
 @save_load()
@@ -455,11 +458,15 @@ class Transformer(Module):
         if exists(dim_condition):
             transformer_kwargs = dict(
                 dim_condition = dim_condition,
-                use_adaptive_rmsnorm = True
+                use_adaptive_rmsnorm = True,
+                disable_abs_pos_emb = True,
+                polar_pos_emb = True
             )
         else:
             transformer_kwargs = dict(
-                use_rmsnorm = True
+                use_rmsnorm = True,
+                disable_abs_pos_emb = True,
+                polar_pos_emb = True
             )
 
         if isinstance(lower_body, dict):
@@ -473,6 +480,19 @@ class Transformer(Module):
 
         self.lower_body = lower_body
         self.upper_body = upper_body
+
+        # polar positional embedding
+
+        lower_attn_dim_head = lower_body.attn_dim_head
+        lower_heads = lower_body.attn_heads
+
+        upper_attn_dim_head = upper_body.attn_dim_head
+        upper_heads = upper_body.attn_heads
+
+        assert lower_attn_dim_head == upper_attn_dim_head
+        assert lower_heads == upper_heads
+
+        self.polar_pos_emb = PolarEmbedding(lower_attn_dim_head, heads = lower_heads)
 
         # meta controller
 
@@ -551,6 +571,8 @@ class Transformer(Module):
 
         lower_transformer_hiddens, meta_hiddens, upper_transformer_hiddens = cache.prev_hiddens if exists(cache) else ((None,) * 3)
 
+        cache_steps = cache.cache_steps if exists(cache) else 0
+
         # handle maybe behavioral cloning
 
         if behavioral_cloning or discovery_phase: # during behavior cloning and discovery phase, the network is predicting / reconstructing the next token
@@ -562,6 +584,11 @@ class Transformer(Module):
 
             if exists(episode_lens):
                 episode_lens = (episode_lens - 1).clamp(min = 0)
+
+        # positional embedding
+
+        seq_len = state.shape[1]
+        pos = torch.arange(seq_len, device = device) + cache_steps
 
         # transformer lower body
 
@@ -581,7 +608,16 @@ class Transformer(Module):
 
             embed = state_embed + action_embed
 
-            residual_stream, next_lower_hiddens = self.lower_body(embed, condition = condition, cache = lower_transformer_hiddens, return_hiddens = True)
+            polar_pos_emb = self.polar_pos_emb(pos) if pos.numel() > 0 else None
+
+            residual_stream, next_lower_hiddens = self.lower_body(
+                embed,
+                condition = condition,
+                cache = lower_transformer_hiddens,
+                polar_pos_emb = polar_pos_emb,
+                seq_pos_offset = cache_steps,
+                return_hiddens = True
+            )
 
         # meta controller acts on residual stream here
 
@@ -598,7 +634,13 @@ class Transformer(Module):
 
         with upper_transformer_context():
 
-            attended, next_upper_hiddens = self.upper_body(modified_residual_stream, condition = condition, cache = upper_transformer_hiddens, return_hiddens = True)
+            attended, next_upper_hiddens = self.upper_body(
+                modified_residual_stream,
+                condition = condition,
+                cache = upper_transformer_hiddens,
+                polar_pos_emb = polar_pos_emb,
+                return_hiddens = True
+            )
 
             # head readout
 
@@ -637,7 +679,11 @@ class Transformer(Module):
 
         return_one = not (return_latents or return_cache)
 
+        if return_cache:
+            next_cache_steps = cache_steps + seq_len
+            return_cache_value = TransformerOutput(residual_stream, Hiddens(next_lower_hiddens, next_meta_hiddens, next_upper_hiddens), next_cache_steps)
+
         if return_one:
             return dist_params
 
-        return dist_params, TransformerOutput(residual_stream, Hiddens(next_lower_hiddens, next_meta_hiddens, next_upper_hiddens))
+        return dist_params, return_cache_value
