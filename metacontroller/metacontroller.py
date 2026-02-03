@@ -182,7 +182,8 @@ class MetaController(Module):
         assoc_scan_kwargs: dict = dict(),
         bidirectional_temporal_encoder_kwargs: dict = dict(
             attn_dim_head = 32,
-            heads = 8
+            heads = 8,
+            polar_pos_emb = True
         ),
         action_proposer: Module | dict = dict(
             depth = 1,
@@ -448,7 +449,10 @@ class Transformer(Module):
         lower_body: Decoder | dict,
         upper_body: Decoder | dict,
         meta_controller: MetaController | None = None,
-        dim_condition = None
+        dim_condition = None,
+        default_transformer_kwargs = dict(
+            polar_pos_emb = True
+        )
     ):
         super().__init__()
 
@@ -463,10 +467,10 @@ class Transformer(Module):
             )
 
         if isinstance(lower_body, dict):
-            lower_body = Decoder(dim = dim, pre_norm_has_final_norm = False, **transformer_kwargs, **lower_body)
+            lower_body = Decoder(dim = dim, pre_norm_has_final_norm = False, **transformer_kwargs, **default_transformer_kwargs, **lower_body)
 
         if isinstance(upper_body, dict):
-            upper_body = Decoder(dim = dim, **transformer_kwargs, **upper_body)
+            upper_body = Decoder(dim = dim, **transformer_kwargs, **default_transformer_kwargs, **upper_body)
 
         self.state_embed, self.state_readout = EmbedAndReadout(dim, **state_embed_readout)
         self.action_embed, self.action_readout = EmbedAndReadout(dim, **action_embed_readout)
