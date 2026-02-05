@@ -26,9 +26,16 @@ from torch_einops_utils import pad_sequence
 
 from accelerate import Accelerator
 
-from babyai_env import create_env, get_mission_embedding
+from babyai_env import (
+    create_env,
+    get_missions_embeddings,
+    transform_to_symbolic
+)
+import gymnasium as gym
+from gymnasium.vector import AsyncVectorEnv
 from metacontroller.metacontroller import Transformer, MetaController, z_score, extract_grpo_data
 from metacontroller.transformer_with_resnet import TransformerWithResnet
+from functools import partial
 
 # research entry point
 
@@ -120,12 +127,18 @@ def main(
 
     # environment
 
-    env = create_env(
+    # environment
+
+    env_make_fn = partial(
+        create_env,
         env_name,
         render_mode = 'rgb_array',
         video_folder = video_folder,
-        render_every_eps = render_every_eps
+        render_every_eps = render_every_eps,
+        use_symbolic = False
     )
+
+    env = AsyncVectorEnv([env_make_fn], shared_memory = False, context = 'spawn')
 
     # load models
 
@@ -135,7 +148,9 @@ def main(
         assert weights_path.exists(), f"transformer weights not found at {weights_path}"
         
         transformer_klass = TransformerWithResnet if use_resnet else Transformer
+
         model = transformer_klass.init_and_load(str(weights_path), strict = False)
+        
         model.eval()
 
     meta_controller = None
@@ -181,14 +196,13 @@ def main(
 
         for i in range(num_groups):
 
-            state, *_ = env.reset(seed = group_seed)
+            state, _ = env.reset(seed = group_seed)
+            state['image'] = transform_to_symbolic(state['image'])
 
             if condition_on_mission_embed:
-                mission = env.unwrapped.mission
-                mission_embed = get_mission_embedding(mission)
+                missions = env.get_attr('mission')
+                mission_embed = get_missions_embeddings(missions)
                 mission_embed = mission_embed.to(accelerator.device)
-                if mission_embed.ndim == 1:
-                    mission_embed = mission_embed.unsqueeze(0)
 
             cache = None
             past_action_id = None
@@ -210,10 +224,10 @@ def main(
                 image_tensor = torch.from_numpy(image).float().to(accelerator.device)
 
                 if use_resnet:
-                    image_tensor = rearrange(image_tensor, 'h w c -> 1 1 h w c')
+                    image_tensor = rearrange(image_tensor, 'b h w c -> b 1 h w c')
                     image_tensor = unwrapped_model.visual_encode(image_tensor)
                 else:
-                    image_tensor = rearrange(image_tensor, 'h w c -> 1 1 (h w c)')
+                    image_tensor = rearrange(image_tensor, 'b h w c -> b 1 (h w c)')
 
                 if torch.is_tensor(past_action_id):
                     past_action_id = past_action_id.long()
@@ -231,7 +245,6 @@ def main(
 
                 action = unwrapped_model.action_readout.sample(logits)
                 past_action_id = action
-                action = action.squeeze()
 
                 # GRPO collection
 
@@ -242,11 +255,12 @@ def main(
                 switch_betas.append(grpo_data.switch_beta)
                 latent_actions.append(grpo_data.action)
 
-                next_state, reward, terminated, truncated, *_ = env.step(action.cpu().numpy())
+                next_state, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
+                next_state['image'] = transform_to_symbolic(next_state['image'])
 
-                total_reward += reward
-                step_rewards.append(reward)
-                done = terminated or truncated
+                total_reward += reward[0]
+                step_rewards.append(reward[0])
+                done = terminated[0] or truncated[0]
 
                 if done:
                     episode_len = step + 1
@@ -271,8 +285,6 @@ def main(
         cumulative_rewards = stack(all_cumulative_rewards)
         episode_lens = tensor(all_episode_lens)
 
-        max_len = max(all_episode_lens)
-
         # pad step rewards for reward shaping hook
 
         padded_step_rewards = pad_sequence(all_step_rewards, dim = 0)
@@ -290,7 +302,7 @@ def main(
             accelerator.print(f'group rejected - variance of {cumulative_rewards.var().item():.4f} is lower than threshold of {reject_threshold_cumulative_reward_variance}')
             continue
 
-        group_advantages = z_score(shaped_rewards)
+        group_advantages = z_score(shaped_rewards).float()
 
         # pad episodes to same length for batching
 

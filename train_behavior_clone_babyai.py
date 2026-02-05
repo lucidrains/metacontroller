@@ -69,7 +69,6 @@ def train(
     discovery_switch_loss_weight = 1.,
     max_grad_norm = 1.,
     use_resnet = False,
-    is_channel_last = False,
     condition_on_mission_embed = False,
     mission_embed_dim = 384
 ):
@@ -157,8 +156,7 @@ def train(
         dim_condition = mission_embed_dim if condition_on_mission_embed else None
     )
 
-    if use_resnet:
-        transformer_kwargs.update(is_channel_last = is_channel_last)
+    transformer_kwargs.update(is_channel_last = True)
 
     model = transformer_class(**transformer_kwargs)
 

@@ -9,6 +9,7 @@ from einops.layers.torch import Rearrange, Reduce
 from metacontroller.metacontroller import Transformer, Encoder
 
 from torch_einops_utils import pack_with_inverse
+from torch_einops_utils.save_load import save_load
 
 # resnet components
 
@@ -171,12 +172,13 @@ def resnet50(num_classes = 1000):
 
 # transformer with resnet
 
+@save_load()
 class TransformerWithResnet(Transformer):
     def __init__(
         self,
         *,
         resnet_type = 'resnet18',
-        is_channel_last = False,
+        is_channel_last = True,
         encoder_kwargs: dict | None = None,
         **kwargs
     ):

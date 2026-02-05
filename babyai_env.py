@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from functools import lru_cache
 from pathlib import Path
 from shutil import rmtree
@@ -50,13 +51,46 @@ def get_missions_embeddings(missions: list[str], sbert: object = None, batch_siz
 def divisible_by(num, den):
     return (num % den) == 0
 
+def transform_to_symbolic(images):
+    # images: (..., W, H, 3) - assume last channel is (type, color, state)
+    # as returned by FullyObsWrapper (which includes the agent)
+    
+    # We want (..., W, H, 3) where:
+    # ch 0: x coord
+    # ch 1: y coord
+    # ch 2: object type
+    
+    *batch_dims, w, h, c = images.shape
+    
+    grid_x, grid_y = np.mgrid[:w, :h]
+    
+    # broadcast grid_x, grid_y to batch dims
+    
+    for _ in range(len(batch_dims)):
+        grid_x = np.expand_dims(grid_x, axis = 0)
+        grid_y = np.expand_dims(grid_y, axis = 0)
+
+    grid_x = np.broadcast_to(grid_x, (*batch_dims, w, h))
+    grid_y = np.broadcast_to(grid_y, (*batch_dims, w, h))
+
+    images = images.astype(np.int64)
+
+    # Output array
+    symbolic = np.zeros(images.shape, dtype = np.int64)
+    symbolic[..., 0] = grid_x
+    symbolic[..., 1] = grid_y
+    symbolic[..., 2] = np.where(images[..., 0] == 1, -1, images[..., 0]) # map empty (1) to -1
+    
+    return symbolic
+
 # env creation
 
 def create_env(
     env_id,
     render_mode = 'rgb_array',
     video_folder = None,
-    render_every_eps = 1000
+    render_every_eps = 1000,
+    use_symbolic = True
 ):
     # register minigrid environments if needed
     minigrid.register_minigrid_envs()
@@ -64,7 +98,9 @@ def create_env(
     # environment
     env = gym.make(env_id, render_mode = render_mode)
     env = FullyObsWrapper(env)
-    env = SymbolicObsWrapper(env)
+
+    if use_symbolic:
+        env = SymbolicObsWrapper(env)
 
     if video_folder is not None:
         video_folder = Path(video_folder)
