@@ -170,7 +170,7 @@ def train(
     action_loss_weight = 1.,
     discovery_action_recon_loss_weight = 1.,
     discovery_kl_loss_weight = 1.,
-    discovery_switch_loss_weight = 1.,
+    discovery_switch_loss_weight = 2e-2, # it is low
     target_switch_rate = 0.15,
     max_grad_norm = 1.,
 ):
