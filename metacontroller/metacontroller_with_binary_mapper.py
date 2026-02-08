@@ -188,6 +188,13 @@ class MetaControllerWithBinaryMapper(Module):
             *self.proposer_to_binary_logits.parameters()
         ]
 
+    def train_internal_rl(self, eval_rest = False):
+        if eval_rest:
+            self.eval()
+
+        self.action_proposer.train()
+        self.proposer_to_binary_logits.train()
+
     def get_action_dist_for_internal_rl(
         self,
         residual_stream

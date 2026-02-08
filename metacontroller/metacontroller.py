@@ -347,6 +347,13 @@ class MetaController(Module):
             *self.action_proposer_mean_log_var.parameters()
         ]
 
+    def train_internal_rl(self, eval_rest = False):
+        if eval_rest:
+            self.eval()
+
+        self.action_proposer.train()
+        self.action_proposer_mean_log_var.train()
+
     def get_action_dist_for_internal_rl(
         self,
         residual_stream
@@ -596,6 +603,22 @@ class Transformer(Module):
         self.model_device = module_device(self)
         if module_device(network) != self.model_device:
             network.to(self.model_device)
+
+    def train_discovery(self, eval_rest = False):
+        assert exists(self.meta_controller)
+
+        if eval_rest:
+            self.eval()
+
+        self.meta_controller.train()
+
+    def train_internal_rl(self, eval_rest = False):
+        assert exists(self.meta_controller)
+
+        if eval_rest:
+            self.eval()
+
+        self.meta_controller.train_internal_rl()
 
     def evolve(
         self,
