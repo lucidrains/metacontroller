@@ -154,7 +154,7 @@ def train(
     discovery_kl_loss_weight = 0.1,
     discovery_entropy_loss_weight = 0.75,
     discovery_negative_entropy_loss_weight = 0.,
-    ratio_loss_weight = 1.,
+    ratio_loss_weight = 1.0,
     validate_every = 100,
     generate_every = 250,
     prime_length = 128,
@@ -234,7 +234,8 @@ Checkpoint Path:    {checkpoint_path}
         dim_meta_controller = dim_meta_controller,
         dim_latent = dim_latent,
         target_temporal_segment_len = target_temporal_segment_len,
-        ratio_loss_weight = ratio_loss_weight
+        ratio_loss_weight = ratio_loss_weight,
+        ratio_loss_chunk_size = 8 * target_temporal_segment_len
     )
 
     model = Transformer(

@@ -186,15 +186,26 @@ def ratio_loss(
     switch_beta,                # float[b n]
     hard_switch_beta = None,    # bool[b n]
     episode_lens = None,        # int[b]
+    chunk_size = None
 ):
     # Hwang et al. https://arxiv.org/abs/2507.07955 eq (10)
 
+    seq_len = switch_beta.shape[-1]
+    mask = maybe(lens_to_mask)(episode_lens, seq_len)
+
+    if exists(chunk_size):
+        num_chunks = seq_len // chunk_size
+
+        if num_chunks > 1:
+            chunk_limit = num_chunks * chunk_size
+            chunk_fn = lambda t: rearrange(t[:, :chunk_limit], 'b (k n) -> (b k) n', n = chunk_size)
+
+            switch_beta = chunk_fn(switch_beta)
+            hard_switch_beta = maybe(chunk_fn)(hard_switch_beta)
+            mask = maybe(chunk_fn)(mask)
+
     if not exists(hard_switch_beta):
         hard_switch_beta = switch_beta > 0.5
-
-    seq_len = switch_beta.shape[-1]
-
-    mask = maybe(lens_to_mask)(episode_lens, seq_len)
 
     N = target_segment_len
     G = masked_mean(switch_beta, mask, dim = -1)
@@ -243,6 +254,7 @@ class MetaController(Module):
         switch_temperature = 1.,
         target_temporal_segment_len = 4, # set to target segment length driven by ratio loss
         ratio_loss_weight = 1.,
+        ratio_loss_chunk_size = None,
         hard_switch = None
     ):
         super().__init__()
@@ -298,6 +310,7 @@ class MetaController(Module):
         self.has_ratio_loss = ratio_loss_weight > 0.
 
         self.ratio_loss_weight = ratio_loss_weight
+        self.ratio_loss_chunk_size = ratio_loss_chunk_size
         self.target_temporal_segment_len = target_temporal_segment_len
 
         # decoder
@@ -567,7 +580,8 @@ class MetaController(Module):
             aux_ratio_loss = self.ratio_loss(
                 self.target_temporal_segment_len,
                 switch_beta,
-                episode_lens = episode_lens
+                episode_lens = episode_lens,
+                chunk_size = self.ratio_loss_chunk_size
             )
 
             aux_ratio_loss = aux_ratio_loss * self.ratio_loss_weight
