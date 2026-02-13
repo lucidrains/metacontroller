@@ -107,6 +107,49 @@ DiscoveryLosses = namedtuple('DiscoveryLosses', (
     'ratio'
 ))
 
+class LossNormalizer(Module):
+    def __init__(
+        self,
+        num_losses = 1,
+        beta = 0.999,
+        eps = 1e-6
+    ):
+        super().__init__()
+        self.register_buffer('exp_avg_sq', torch.ones(num_losses))
+        self.beta = beta
+        self.eps = eps
+
+    @property
+    def loss_scale(self):
+        return self.exp_avg_sq.sqrt()
+
+    def forward(
+        self,
+        losses: Tensor,
+        update_ema = None
+    ):
+        exp_avg_sq, beta = self.exp_avg_sq, self.beta
+        update_ema = default(update_ema, self.training)
+
+        # get the rms value - as mentioned at the end of section 3 in the paper
+
+        rms = exp_avg_sq.sqrt()
+
+        if update_ema:
+            decay = 1. - beta
+
+            # update the ema
+
+            exp_avg_sq.lerp_(losses.detach().square(), decay)
+
+        # then normalize
+
+        assert losses.numel() == rms.numel()
+
+        normed_losses = losses / rms.clamp(min = self.eps)
+
+        return normed_losses
+
 # meta controller classes
 
 @save_load()
@@ -665,9 +708,19 @@ class Transformer(Module):
         meta_controller: MetaController | None = None,
         dim_condition = None,
         state_loss_detach_target_state = True,
-        embed_past_actions = True
+        embed_past_actions = True,
+        normalize_state_action_losses = False,
+        loss_normalizer_beta = 0.999
     ):
         super().__init__()
+
+        self.normalize_state_action_losses = normalize_state_action_losses
+        self.state_loss_normalizer = None
+        self.action_loss_normalizer = None
+
+        if normalize_state_action_losses:
+            self.state_loss_normalizer = LossNormalizer(num_losses = 1, beta = loss_normalizer_beta)
+            self.action_loss_normalizer = LossNormalizer(num_losses = 1, beta = loss_normalizer_beta)
 
         if exists(dim_condition):
             transformer_kwargs = dict(
@@ -723,6 +776,20 @@ class Transformer(Module):
         # ensure devices match
         
         if exists(self.meta_controller): self._ensure_consistent_device(self.meta_controller)
+
+    @property
+    def running_state_loss(self):
+        if not self.normalize_state_action_losses:
+            return None
+
+        return self.state_loss_normalizer.loss_scale
+
+    @property
+    def running_action_loss(self):
+        if not self.normalize_state_action_losses:
+            return None
+
+        return self.action_loss_normalizer.loss_scale
 
     def _ensure_consistent_device(self, network):
         self.model_device = module_device(self)
@@ -792,7 +859,8 @@ class Transformer(Module):
         return_action_logits = False,
         condition = None,
         return_embed = False,
-        control_signal_multiplier = 1.
+        control_signal_multiplier = 1.,
+        update_loss_ema: bool | None = None
     ):
         device = state.device
 
@@ -946,6 +1014,12 @@ class Transformer(Module):
 
             action_clone_loss = self.action_readout.calculate_loss(dist_params, target_actions, mask = action_loss_mask)
 
+            # loss normalization
+
+            if self.normalize_state_action_losses:
+                state_clone_loss = self.state_loss_normalizer(state_clone_loss, update_ema = update_loss_ema)
+                action_clone_loss = self.action_loss_normalizer(action_clone_loss, update_ema = update_loss_ema)
+
             losses = BehavioralCloningLosses(state_clone_loss, action_clone_loss)
 
             if return_action_logits:
@@ -976,6 +1050,12 @@ class Transformer(Module):
             # action
 
             action_recon_loss = self.action_readout.calculate_loss(dist_params, target_actions, mask = action_loss_mask)
+
+            # loss normalization
+
+            if self.normalize_state_action_losses:
+                state_clone_loss = self.state_loss_normalizer(state_clone_loss, update_ema = update_loss_ema)
+                action_recon_loss = self.action_loss_normalizer(action_recon_loss, update_ema = update_loss_ema)
 
             losses = DiscoveryLosses(state_clone_loss, action_recon_loss, next_meta_hiddens.kl_loss, next_meta_hiddens.ratio_loss)
 
