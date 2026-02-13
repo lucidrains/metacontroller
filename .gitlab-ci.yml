@@ -1,0 +1,15 @@
+image: python:3.10
+
+stages:
+  - test
+
+test:
+  stage: test
+  before_script:
+    - python -m pip install --upgrade pip
+    - python -m pip install -e .[test]
+  script:
+    - python -m pytest tests/
+  only:
+    - pushes
+    - merge_requests
