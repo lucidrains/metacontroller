@@ -84,8 +84,10 @@ def test_metacontroller(
         **condition_kwargs
     )
 
-    assert exists(model.running_state_loss) == normalize_state_action_losses
-    assert exists(model.running_action_loss) == normalize_state_action_losses
+    assert exists(model.running_bc_state_loss) == normalize_state_action_losses
+    assert exists(model.running_bc_action_loss) == normalize_state_action_losses
+    assert exists(model.running_discovery_state_loss) == normalize_state_action_losses
+    assert exists(model.running_discovery_action_loss) == normalize_state_action_losses
 
     state_clone_loss, action_clone_loss = model(state, actions, condition = condition, episode_lens = episode_lens)
     (state_clone_loss + 0.5 * action_clone_loss).backward()

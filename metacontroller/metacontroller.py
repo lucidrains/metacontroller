@@ -715,12 +715,16 @@ class Transformer(Module):
         super().__init__()
 
         self.normalize_state_action_losses = normalize_state_action_losses
-        self.state_loss_normalizer = None
-        self.action_loss_normalizer = None
+        self.bc_state_loss_normalizer = None
+        self.bc_action_loss_normalizer = None
+        self.discovery_state_loss_normalizer = None
+        self.discovery_action_loss_normalizer = None
 
         if normalize_state_action_losses:
-            self.state_loss_normalizer = LossNormalizer(num_losses = 1, beta = loss_normalizer_beta)
-            self.action_loss_normalizer = LossNormalizer(num_losses = 1, beta = loss_normalizer_beta)
+            self.bc_state_loss_normalizer = LossNormalizer(num_losses = 1, beta = loss_normalizer_beta)
+            self.bc_action_loss_normalizer = LossNormalizer(num_losses = 1, beta = loss_normalizer_beta)
+            self.discovery_state_loss_normalizer = LossNormalizer(num_losses = 1, beta = loss_normalizer_beta)
+            self.discovery_action_loss_normalizer = LossNormalizer(num_losses = 1, beta = loss_normalizer_beta)
 
         if exists(dim_condition):
             transformer_kwargs = dict(
@@ -778,18 +782,32 @@ class Transformer(Module):
         if exists(self.meta_controller): self._ensure_consistent_device(self.meta_controller)
 
     @property
-    def running_state_loss(self):
+    def running_bc_state_loss(self):
         if not self.normalize_state_action_losses:
             return None
 
-        return self.state_loss_normalizer.loss_scale
+        return self.bc_state_loss_normalizer.loss_scale
 
     @property
-    def running_action_loss(self):
+    def running_bc_action_loss(self):
         if not self.normalize_state_action_losses:
             return None
 
-        return self.action_loss_normalizer.loss_scale
+        return self.bc_action_loss_normalizer.loss_scale
+
+    @property
+    def running_discovery_state_loss(self):
+        if not self.normalize_state_action_losses:
+            return None
+
+        return self.discovery_state_loss_normalizer.loss_scale
+
+    @property
+    def running_discovery_action_loss(self):
+        if not self.normalize_state_action_losses:
+            return None
+
+        return self.discovery_action_loss_normalizer.loss_scale
 
     def _ensure_consistent_device(self, network):
         self.model_device = module_device(self)
@@ -1017,8 +1035,8 @@ class Transformer(Module):
             # loss normalization
 
             if self.normalize_state_action_losses:
-                state_clone_loss = self.state_loss_normalizer(state_clone_loss, update_ema = update_loss_ema)
-                action_clone_loss = self.action_loss_normalizer(action_clone_loss, update_ema = update_loss_ema)
+                state_clone_loss = self.bc_state_loss_normalizer(state_clone_loss, update_ema = update_loss_ema)
+                action_clone_loss = self.bc_action_loss_normalizer(action_clone_loss, update_ema = update_loss_ema)
 
             losses = BehavioralCloningLosses(state_clone_loss, action_clone_loss)
 
@@ -1054,8 +1072,8 @@ class Transformer(Module):
             # loss normalization
 
             if self.normalize_state_action_losses:
-                state_clone_loss = self.state_loss_normalizer(state_clone_loss, update_ema = update_loss_ema)
-                action_recon_loss = self.action_loss_normalizer(action_recon_loss, update_ema = update_loss_ema)
+                state_clone_loss = self.discovery_state_loss_normalizer(state_clone_loss, update_ema = update_loss_ema)
+                action_recon_loss = self.discovery_action_loss_normalizer(action_recon_loss, update_ema = update_loss_ema)
 
             losses = DiscoveryLosses(state_clone_loss, action_recon_loss, next_meta_hiddens.kl_loss, next_meta_hiddens.ratio_loss)
 
