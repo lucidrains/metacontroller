@@ -2,6 +2,7 @@ image: python:3.10
 
 stages:
   - test
+  - publish
 
 test:
   stage: test
@@ -13,3 +14,14 @@ test:
   only:
     - pushes
     - merge_requests
+
+pypi:
+  stage: publish
+  before_script:
+    - python -m pip install --upgrade pip
+    - pip install build twine
+  script:
+    - python -m build
+    - TWINE_PASSWORD=$PYPI_API_TOKEN TWINE_USERNAME=__token__ python -m twine upload dist/*
+  only:
+    - tags
