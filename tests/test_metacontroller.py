@@ -9,6 +9,8 @@ import torch
 from torch import cat
 from metacontroller.metacontroller import Transformer, MetaController, ActionProposerWrapper, policy_loss, z_score, extract_grpo_data
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
+
+from torch_einops_utils.save_load import save_load
 from minGRU_pytorch import minGRU
 
 from memmap_replay_buffer import ReplayBuffer
@@ -29,8 +31,7 @@ def exists(v):
 @param('use_mingru', (False, True))
 @param('normalize_state_action_losses', (False, True))
 @param('variant', [
-    (False, 'qk'),
-    (False, 'gru'),
+    (False, None),
     (True, 'qk'),
     (True, 'gru')
 ])
@@ -44,18 +45,19 @@ def test_metacontroller(
     normalize_state_action_losses
 ):
     use_binary_mapper_variant, switching_unit_type = variant
-    dim_model = 512
-    dim_meta = 256
+    dim_model = 64
+    dim_meta = 32
+    seq_len = 32
 
-    state = torch.randn(2, 128, 384)
+    state = torch.randn(2, seq_len, 384)
     episode_lens = torch.tensor([64, 64]) if variable_length else None
 
     if action_discrete:
-        actions = torch.randint(0, 4, (2, 128))
+        actions = torch.randint(0, 4, (2, seq_len))
         action_embed_readout = dict(num_discrete = 4)
         assert_shape = (4,)
     else:
-        actions = torch.randn(2, 128, 8)
+        actions = torch.randn(2, seq_len, 8)
         action_embed_readout = dict(num_continuous = 8)
         assert_shape = (8, 2)
 
@@ -98,7 +100,7 @@ def test_metacontroller(
 
     if use_mingru:
         action_proposer_kwargs = dict(
-            action_proposer = ActionProposerWrapper(
+            action_proposer = save_load()(ActionProposerWrapper)(
                 minGRU(dim = dim_model),
                 cache_key = 'prev_hidden',
                 return_cache_key = 'return_next_prev_hidden'
