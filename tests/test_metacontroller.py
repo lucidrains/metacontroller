@@ -393,3 +393,64 @@ def test_discovery_vs_bc_ablation_parity():
 
     assert torch.allclose(bc_losses.state, discovery_losses.state_pred, atol = 1e-6)
     assert torch.allclose(bc_losses.action, discovery_losses.action_recon, atol = 1e-6)
+
+def test_switch_ablation():
+    dim = 64
+    batch = 2
+    seq_len = 8
+    frequency = 4
+
+    meta_controller = MetaController(
+        dim_model = dim,
+        dim_meta_controller = 32,
+        dim_latent = 32
+    )
+
+    transformer = Transformer(
+        dim = dim,
+        state_embed_readout = dict(num_continuous = dim),
+        action_embed_readout = dict(num_continuous = dim),
+        lower_body = dict(depth = 1),
+        upper_body = dict(depth = 1),
+        meta_controller = meta_controller
+    )
+
+    # test helper
+    ablate_switch_beta = MetaController.create_regular_switch_beta(batch, seq_len, frequency)
+    expected = torch.zeros(batch, seq_len)
+    expected[:, 3] = 1.
+    expected[:, 7] = 1.
+    assert torch.allclose(ablate_switch_beta, expected)
+
+    # test transformer discovery ablation
+    state = torch.randn(batch, seq_len, dim)
+    actions = torch.randn(batch, seq_len, dim)
+    
+    losses, meta_output = transformer(
+        state,
+        actions = actions,
+        discovery_phase = True,
+        ablate_switch_beta = ablate_switch_beta,
+        return_meta_controller_output = True
+    )
+    assert torch.allclose(meta_output.switch_beta, ablate_switch_beta)
+
+    # test transformer frequency ablation
+    losses, meta_output = transformer(
+        state,
+        actions = actions,
+        discovery_phase = True,
+        switch_beta_frequency = frequency,
+        return_meta_controller_output = True
+    )
+    assert torch.allclose(meta_output.switch_beta, ablate_switch_beta)
+
+    # test with cache
+    out1, cache1 = transformer(torch.randn(batch, 1, dim), switch_beta_frequency = frequency, return_cache = True)
+    assert torch.all(cache1.prev_hiddens.meta_controller.switch_beta == 0.)
+
+    for _ in range(2):
+        _, cache1 = transformer(torch.randn(batch, 1, dim), switch_beta_frequency = frequency, cache = cache1, return_cache = True)
+
+    _, cache1 = transformer(torch.randn(batch, 1, dim), switch_beta_frequency = frequency, cache = cache1, return_cache = True)
+    assert torch.all(cache1.prev_hiddens.meta_controller.switch_beta == 1.)

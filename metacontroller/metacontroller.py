@@ -218,10 +218,15 @@ def policy_loss(
     old_log_probs,
     actions,
     advantages,
-    mask,
+    mask = None,
     episode_lens = None,
-    eps_clip = 0.2
+    eps_clip = 0.2,
+    switch_beta_frequency: int | None = None
 ):
+    if exists(switch_beta_frequency):
+        batch, seq_len = state.shape[:2]
+        mask = meta_controller.create_regular_switch_beta(batch, seq_len, switch_beta_frequency, device = state.device) > 0.5
+
     # if switch betas sent as mask without converting to bool, just take care of it
 
     if mask.dtype == torch.float:
@@ -416,6 +421,12 @@ class MetaController(Module):
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
+    @staticmethod
+    def create_regular_switch_beta(batch, seq_len, frequency, offset = 0, device = None):
+        steps = torch.arange(seq_len, device = device) + offset
+        switch_beta = ((steps + 1) % frequency == 0).float()
+        return repeat(switch_beta, 'n -> b n', b = batch)
+
     @property
     def replay_buffer_field_dict(self):
         return dict(
@@ -492,6 +503,9 @@ class MetaController(Module):
         cache: MetaControllerOutput | None = None,
         discovery_phase = False,
         hard_switch: bool | None = None,
+        ablate_switch_beta: Tensor | None = None,
+        switch_beta_frequency: int | None = None,
+        ablate_offset = 0,
         temperature = 1.,
         episode_lens: Tensor | None = None
     ):
@@ -594,15 +608,26 @@ class MetaController(Module):
             z_prev
         ), dim = -1)
 
-        switching_unit_gru_out, next_switching_unit_gru_hidden = self.switching_unit(
-            switch_input, 
-            prev_switching_unit_gru_hidden
-        )
+        if exists(switch_beta_frequency):
+            ablate_switch_beta = self.create_regular_switch_beta(batch, seq_len, switch_beta_frequency, offset = ablate_offset, device = device)
 
-        switch_beta_logit = self.to_switching_unit_beta(switching_unit_gru_out)
+        if exists(ablate_switch_beta):
+            switch_beta = ablate_switch_beta
 
-        switch_beta = (switch_beta_logit / self.switch_temperature).sigmoid()
-        switch_beta = rearrange(switch_beta, '... 1 -> ...')
+            if switch_beta.ndim == 1:
+                switch_beta = rearrange(switch_beta, 'b -> b 1')
+
+            next_switching_unit_gru_hidden = prev_switching_unit_gru_hidden
+        else:
+            switching_unit_gru_out, next_switching_unit_gru_hidden = self.switching_unit(
+                switch_input, 
+                prev_switching_unit_gru_hidden
+            )
+
+            switch_beta_logit = self.to_switching_unit_beta(switching_unit_gru_out)
+
+            switch_beta = (switch_beta_logit / self.switch_temperature).sigmoid()
+            switch_beta = rearrange(switch_beta, '... 1 -> ...')
 
         # need to encourage normal distribution
 
@@ -878,6 +903,8 @@ class Transformer(Module):
         condition = None,
         return_embed = False,
         control_signal_multiplier = 1.,
+        ablate_switch_beta: Tensor | None = None,
+        switch_beta_frequency: int | None = None,
         update_loss_ema: bool | None = None
     ):
         device = state.device
@@ -980,7 +1007,16 @@ class Transformer(Module):
 
             if exists(meta_controller) and not behavioral_cloning:
                 meta_cache = None if discovery_phase else meta_hiddens
-                control_signal, next_meta_hiddens = meta_controller(residual_stream, cache = meta_cache, discovery_phase = discovery_phase, temperature = meta_controller_temperature, episode_lens = episode_lens)
+                control_signal, next_meta_hiddens = meta_controller(
+                    residual_stream,
+                    cache = meta_cache,
+                    discovery_phase = discovery_phase,
+                    temperature = meta_controller_temperature,
+                    episode_lens = episode_lens,
+                    ablate_switch_beta = ablate_switch_beta,
+                    switch_beta_frequency = switch_beta_frequency,
+                    ablate_offset = cache_steps
+                )
             else:
                 control_signal, next_meta_hiddens = self.zero, None
 
