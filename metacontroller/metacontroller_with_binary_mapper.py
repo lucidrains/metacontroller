@@ -282,6 +282,12 @@ class MetaControllerWithBinaryMapper(Module):
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
+    @staticmethod
+    def create_regular_switch_beta(batch, seq_len, frequency, offset = 0, device = None):
+        steps = torch.arange(seq_len, device = device) + offset
+        switch_beta = ((steps + 1) % frequency == 0).float()
+        return repeat(switch_beta, 'n -> b n', b = batch)
+
     @property
     def replay_buffer_field_dict(self):
         return dict(
@@ -351,6 +357,9 @@ class MetaControllerWithBinaryMapper(Module):
         cache: MetaControllerOutput | None = None,
         discovery_phase = False,
         hard_switch = None,
+        ablate_switch_beta: Tensor | None = None,
+        switch_beta_frequency: int | None = None,
+        ablate_offset = 0,
         temperature = 1.,
         episode_lens: Tensor | None = None
     ):
@@ -359,7 +368,7 @@ class MetaControllerWithBinaryMapper(Module):
 
         # destruct prev cache
 
-        prev_summarized, prev_action_proposer_hidden, prev_key, prev_switch_gated_hiddens, prev_sampled_code = cache.prev_hiddens if exists(cache) else ((None,) * 5)
+        prev_summarized, prev_action_proposer_hidden, prev_switching_unit_hidden, prev_switch_gated_hiddens, prev_sampled_code = cache.prev_hiddens if exists(cache) else ((None,) * 5)
 
         # getting proposed action for the two phases
 
@@ -430,14 +439,24 @@ class MetaControllerWithBinaryMapper(Module):
 
         # switching unit timer
 
-        if self.switching_unit_type == 'qk':
+        batch, seq_len, _ = sampled_codes.shape
+
+        if exists(switch_beta_frequency):
+            ablate_switch_beta = self.create_regular_switch_beta(batch, seq_len, switch_beta_frequency, offset = ablate_offset, device = device)
+
+        if exists(ablate_switch_beta):
+            switch_beta = ablate_switch_beta
+
+            if switch_beta.ndim == 1:
+                switch_beta = rearrange(switch_beta, 'b -> b 1')
+
+            next_switching_unit_hidden = prev_switching_unit_hidden
+        elif self.switching_unit_type == 'qk':
             switch_beta, next_switching_unit_hidden = self.switching_unit(
                 residual_stream,
-                prev_key
+                prev_switching_unit_hidden
             )
         else:
-            batch, seq_len, _ = sampled_codes.shape
-
             if not exists(prev_sampled_code):
                 prev_sampled_code = torch.zeros(batch, 1, self.num_codes, device = device)
 
@@ -451,7 +470,7 @@ class MetaControllerWithBinaryMapper(Module):
                 residual_stream,
                 meta_embed_prev,
                 z_prev,
-                prev_key # overloading prev_key as gru hidden for the sake of the tuple
+                prev_switching_unit_hidden
             )
 
         # losses

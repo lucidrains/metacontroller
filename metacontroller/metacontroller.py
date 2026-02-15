@@ -67,6 +67,7 @@ def straight_through(src, tgt):
 # action proposer wrapper
 # normalizes any action proposer to a standard interface for MetaController
 
+@save_load()
 class ActionProposerWrapper(Module):
     def __init__(
         self,
