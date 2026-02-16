@@ -31,7 +31,7 @@ from torch_einops_utils.save_load import save_load
 
 from vector_quantize_pytorch import BinaryMapper
 
-from metacontroller.metacontroller import MetaControllerOutput, policy_loss, ratio_loss, BidirectionalSequenceEmbedder, CausalSequenceEmbedder
+from metacontroller.metacontroller import MetaControllerOutput, policy_loss, ratio_loss, BidirectionalSequenceEmbedder, CausalSequenceEmbedder, perform_sequential_selection
 
 # constants
 
@@ -189,7 +189,8 @@ class MetaControllerWithBinaryMapper(Module):
         hard_switch = None,
         kl_loss_weight = 1.,
         kl_loss_warmup_steps = 0,
-        apply_kl_loss_weight = True
+        apply_kl_loss_weight = True,
+        sequential_latent_action_selection = False
     ):
         super().__init__()
         self.dim_model = dim_model
@@ -200,6 +201,10 @@ class MetaControllerWithBinaryMapper(Module):
         self.register_buffer('kl_loss_step_count', tensor(0.))
 
         self.apply_kl_loss_weight = apply_kl_loss_weight
+        self.sequential_latent_action_selection = sequential_latent_action_selection
+
+        if sequential_latent_action_selection:
+            assert switching_unit_type == 'gru', 'sequential latent action selection currently only supported for gru switching unit'
 
         dim_meta = default(dim_meta_controller, dim_model)
 
@@ -471,31 +476,62 @@ class MetaControllerWithBinaryMapper(Module):
 
         batch, seq_len, _ = sampled_codes.shape
 
-        if exists(switch_beta_frequency):
-            ablate_switch_beta = self.create_regular_switch_beta(batch, seq_len, switch_beta_frequency, offset = ablate_offset, device = device)
+        if not exists(prev_sampled_code):
+            prev_sampled_code = torch.zeros(batch, 1, self.num_codes, device = device)
 
-        if exists(ablate_switch_beta):
+        if not exists(prev_switch_gated_hiddens):
+            prev_switch_gated_hiddens = torch.zeros(batch, 1, self.num_codes, device = device)
+
+        z_prev_initial = prev_switch_gated_hiddens
+
+        if self.sequential_latent_action_selection and seq_len > 1:
+            z_prev = z_prev_initial
+        elif discovery_phase or seq_len > 1:
+            z_prev = cat((z_prev_initial, sampled_codes[:, :-1]), dim = 1)
+        else:
+            z_prev = z_prev_initial
+
+        if self.sequential_latent_action_selection and seq_len > 1:
+            assert self.switching_unit_type == 'gru', 'sequential latent action selection currently only supported for gru switching unit'
+
+            # resolve hard switch
+            
+            resolved_hard_switch = default(hard_switch, self.hard_switch, not discovery_phase)
+
+            # call jax
+            
+            sequential_selection_output = perform_sequential_selection(
+                self.switching_unit.gru,
+                self.switching_unit.to_beta,
+                residual_stream,
+                meta_embed_prev,
+                sampled_codes,
+                prev_switching_unit_hidden,
+                z_prev_initial,
+                self.switch_temperature,
+                resolved_hard_switch
+            )
+            
+            switch_beta = sequential_selection_output.switch_beta
+            gated_codes = sequential_selection_output.gated_action
+            next_switching_unit_hidden = sequential_selection_output.next_switching_unit_gru_hidden
+
+            next_switch_gated_codes = gated_codes[:, -1:]
+
+        elif exists(ablate_switch_beta):
             switch_beta = ablate_switch_beta
 
             if switch_beta.ndim == 1:
                 switch_beta = rearrange(switch_beta, 'b -> b 1')
 
             next_switching_unit_hidden = prev_switching_unit_hidden
+
         elif self.switching_unit_type == 'qk':
             switch_beta, next_switching_unit_hidden = self.switching_unit(
                 residual_stream,
                 prev_switching_unit_hidden
             )
         else:
-            if not exists(prev_sampled_code):
-                prev_sampled_code = torch.zeros(batch, 1, self.num_codes, device = device)
-
-            if discovery_phase:
-                z_prev = cat((prev_sampled_code, sampled_codes[:, :-1]), dim = 1)
-            else:
-                assert seq_len == 1
-                z_prev = prev_sampled_code
-
             switch_beta, next_switching_unit_hidden = self.switching_unit(
                 residual_stream,
                 meta_embed_prev,
@@ -518,19 +554,24 @@ class MetaControllerWithBinaryMapper(Module):
 
         switch_beta_for_gate = switch_beta
 
-        if hard_switch:
-            hard_switch_beta = (switch_beta_for_gate > 0.5).float()
-            switch_beta_for_gate = straight_through(switch_beta_for_gate, hard_switch_beta)
+        if not (self.sequential_latent_action_selection and seq_len > 1):
+            # maybe hard switch, then use associative scan
 
-        forget_gate = 1. - switch_beta_for_gate
+            switch_beta_for_gate = switch_beta
 
-        # gated codes (or soft distribution)
+            if hard_switch:
+                hard_switch_beta = (switch_beta_for_gate > 0.5).float()
+                switch_beta_for_gate = straight_through(switch_beta_for_gate, hard_switch_beta)
 
-        gated_sampled_codes = einx.multiply('b n d, b n', sampled_codes, switch_beta_for_gate)
+            forget_gate = 1. - switch_beta_for_gate
 
-        gated_codes = self.switch_gating(forget_gate, gated_sampled_codes, prev = prev_switch_gated_hiddens)
+            # gated codes (or soft distribution)
 
-        next_switch_gated_codes = gated_codes[:, -1]
+            gated_sampled_codes = einx.multiply('b n d, b n', sampled_codes, switch_beta_for_gate)
+
+            gated_codes = self.switch_gating(forget_gate, gated_sampled_codes, prev = prev_switch_gated_hiddens)
+
+            next_switch_gated_codes = gated_codes[:, -1:]
 
         # decoder
 

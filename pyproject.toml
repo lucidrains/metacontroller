@@ -1,6 +1,6 @@
 [project]
 name = "metacontroller-pytorch"
-version = "0.2.14"
+version = "0.2.15"
 description = "Transformer Metacontroller"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -35,7 +35,10 @@ dependencies = [
     "vector-quantize-pytorch>=1.27.20",
     "x-evolution>=0.1.23",
     "x-mlps-pytorch",
-    "x-transformers>=2.16.0"
+    "x-transformers>=2.16.0",
+    "jax",
+    "jaxlib",
+    "jax2torch"
 ]
 
 [project.urls]
