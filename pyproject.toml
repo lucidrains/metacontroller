@@ -1,6 +1,6 @@
 [project]
 name = "metacontroller-pytorch"
-version = "0.2.10"
+version = "0.2.12"
 description = "Transformer Metacontroller"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -70,8 +70,8 @@ packages = ["metacontroller"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "/metacontroller",
-    "/README.md",
-    "/LICENSE",
-    "/pyproject.toml",
+    "metacontroller",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
 ]

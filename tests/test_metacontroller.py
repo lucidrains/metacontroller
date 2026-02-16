@@ -101,7 +101,7 @@ def test_metacontroller(
     if use_mingru:
         action_proposer_kwargs = dict(
             action_proposer = save_load()(ActionProposerWrapper)(
-                minGRU(dim = dim_model),
+                save_load()(minGRU)(dim = dim_model),
                 cache_key = 'prev_hidden',
                 return_cache_key = 'return_next_prev_hidden'
             )
@@ -247,6 +247,88 @@ def test_metacontroller(
     Path('./trained.pt').unlink()
 
     rmtree(test_folder, ignore_errors = True)
+
+def test_kl_loss_warmup_e2e():
+    dim_model = 64
+    kl_loss_weight = 0.2
+    kl_loss_warmup_steps = 10
+    
+    mc = MetaController(
+        dim_model = dim_model,
+        kl_loss_weight = kl_loss_weight,
+        kl_loss_warmup_steps = kl_loss_warmup_steps
+    )
+    
+    transformer = Transformer(
+        dim = dim_model,
+        state_embed_readout = dict(num_continuous = dim_model),
+        action_embed_readout = dict(num_continuous = dim_model),
+        lower_body = dict(depth = 1),
+        upper_body = dict(depth = 1),
+        meta_controller = mc
+    )
+    
+    # Step 0
+    state = torch.randn(1, 2, dim_model)
+    actions = torch.randn(1, 2, dim_model)
+    
+    _, output = transformer(state, actions, discovery_phase = True, return_meta_controller_output = True)
+    assert output.kl_loss_weight == 0.0
+    assert output.kl_loss == 0.0
+    
+    # Step 5
+    for _ in range(5):
+        transformer.meta_controller_maybe_increment_kl_loss_step()
+        
+    assert transformer.meta_controller_current_kl_loss_weight == 0.1
+    
+    _, output5 = transformer(state, actions, discovery_phase = True, return_meta_controller_output = True)
+    assert output5.kl_loss_weight == 0.1
+    
+    # Step 10
+    for _ in range(5):
+        transformer.meta_controller_maybe_increment_kl_loss_step()
+
+    assert transformer.meta_controller_current_kl_loss_weight == 0.2
+
+    _, output10 = transformer(state, actions, discovery_phase = True, return_meta_controller_output = True)
+    assert output10.kl_loss_weight == 0.2
+
+    # verify scaling (kl_loss should be doubled if weight is doubled)
+    if output5.kl_loss > 0:
+        assert torch.isclose(output10.kl_loss / output5.kl_loss, torch.tensor(2.0), atol = 1e-4)
+
+    # test reset
+    transformer.meta_controller_reset_kl_loss_warmup()
+    assert transformer.meta_controller_current_kl_loss_weight == 0.0
+    _, output_reset = transformer(state, actions, discovery_phase = True, return_meta_controller_output = True)
+    assert output_reset.kl_loss_weight == 0.0
+    assert output_reset.kl_loss == 0.0
+
+    # test transformer accessor
+    assert transformer.meta_controller_kl_loss_weight == 0.2
+
+    # test apply_kl_loss_weight = False
+    mc_no_weight = MetaController(
+        dim_model = dim_model,
+        kl_loss_weight = 0.2,
+        kl_loss_warmup_steps = 10,
+        apply_kl_loss_weight = False
+    )
+    
+    transformer_no_weight = Transformer(
+        dim = dim_model,
+        state_embed_readout = dict(num_continuous = dim_model),
+        action_embed_readout = dict(num_continuous = dim_model),
+        lower_body = dict(depth = 1),
+        upper_body = dict(depth = 1),
+        meta_controller = mc_no_weight
+    )
+
+    _, output_no_weight = transformer_no_weight(state, actions, discovery_phase = True, return_meta_controller_output = True)
+    # weight shouldn't be applied despite step 0 (which would be weight 0)
+    assert output_no_weight.kl_loss_weight == 1.0
+    assert output_no_weight.kl_loss > 0.0
 
 def test_transformer_embed_parity():
     dim_model = 512

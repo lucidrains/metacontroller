@@ -148,6 +148,7 @@ def train(
     discovery_entropy_loss_weight = 0.1,
     discovery_negative_entropy_loss_weight = 0.75,
     discovery_ratio_loss_weight = 1.0,
+    discovery_kl_loss_warmup_steps = 0,
     discovery_switch_warmup_steps = 1,
     discovery_switch_lr_scale = 0.1,
     max_grad_norm = 1.,
@@ -234,7 +235,14 @@ def train(
 
     # meta controller
 
-    meta_controller = MetaController(dim, switch_temperature = switch_temperature, ratio_loss_weight = discovery_ratio_loss_weight)
+    meta_controller = MetaController(
+        dim,
+        switch_temperature = switch_temperature,
+        ratio_loss_weight = discovery_ratio_loss_weight,
+        kl_loss_weight = discovery_kl_loss_weight,
+        kl_loss_warmup_steps = discovery_kl_loss_warmup_steps,
+        apply_kl_loss_weight = False
+    )
 
     # transformer
     
@@ -364,7 +372,8 @@ def train(
                     loss = (
                         obs_loss * discovery_obs_loss_weight + 
                         action_recon_loss * discovery_action_recon_loss_weight +
-                        kl_loss * discovery_kl_loss_weight +
+                        # manually multiply kl loss by the warmup weight, since researcher set apply_kl_loss_weight = False in the MetaController init
+                        kl_loss * meta_controller_output.kl_loss_weight +
                         entropy_loss * entropy_weight +
                         ratio_loss * discovery_ratio_loss_weight
                     )
@@ -378,6 +387,7 @@ def train(
                         obs_loss = obs_loss.item(),
                         action_recon_loss = action_recon_loss.item(),
                         kl_loss = kl_loss.item(),
+                        kl_loss_weight = meta_controller_output.kl_loss_weight,
                         entropy_loss = entropy_loss.item(),
                         ratio_loss = ratio_loss.item(),
                         hard_switch_density = last_hard_switch_density,
@@ -409,6 +419,9 @@ def train(
                 if gradient_accumulation_steps is None or gradient_step % gradient_accumulation_steps == 0:
                     optim.step()
                     optim.zero_grad()
+
+                    if is_discovering:
+                        model.meta_controller_maybe_increment_kl_loss_step()
 
             # log on backprop
 

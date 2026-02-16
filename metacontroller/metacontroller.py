@@ -198,6 +198,7 @@ MetaControllerOutput = namedtuple('MetaControllerOutput', (
     'actions',
     'switch_beta',
     'kl_loss',
+    'kl_loss_weight',
     'ratio_loss'
 ))
 
@@ -343,11 +344,20 @@ class MetaController(Module):
         target_temporal_segment_len = 4, # set to target segment length driven by ratio loss
         ratio_loss_weight = 1.,
         ratio_loss_chunk_size = None,
-        hard_switch = None
+        hard_switch = None,
+        kl_loss_weight = 1.,
+        kl_loss_warmup_steps = 0,
+        apply_kl_loss_weight = True
     ):
         super().__init__()
         self.dim_model = dim_model
         self.hard_switch = hard_switch
+
+        self.kl_loss_weight = kl_loss_weight
+        self.kl_loss_warmup_steps = kl_loss_warmup_steps
+        self.register_buffer('kl_loss_step_count', tensor(0.))
+
+        self.apply_kl_loss_weight = apply_kl_loss_weight
         
         dim_meta = default(dim_meta_controller, dim_model)
 
@@ -436,6 +446,22 @@ class MetaController(Module):
             switch_betas = 'float',
             latent_actions = ('float', self.dim_latent)
         )
+
+    def maybe_increment_kl_loss_step(self):
+        if self.kl_loss_warmup_steps > 0:
+            self.kl_loss_step_count.add_(1)
+
+    def reset_kl_loss_warmup(self):
+        self.kl_loss_step_count.zero_()
+
+    @property
+    def current_kl_loss_weight(self):
+        if self.kl_loss_warmup_steps == 0:
+            return self.kl_loss_weight
+
+        step = self.kl_loss_step_count.item()
+        warmup_factor = min(1.0, step / self.kl_loss_warmup_steps)
+        return self.kl_loss_weight * warmup_factor
 
     def discovery_parameters(self):
         return [
@@ -647,6 +673,9 @@ class MetaController(Module):
             kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
             kl_loss = masked_mean(kl_loss, mask)
 
+            kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.
+            kl_loss = kl_loss * kl_loss_weight
+
         # maybe hard switch
 
         hard_switch = default(hard_switch, self.hard_switch, not discovery_phase)
@@ -702,7 +731,7 @@ class MetaController(Module):
             sampled_latent_action[:, -1:]
         )
 
-        return control_signal, MetaControllerOutput(next_hiddens, residual_stream, action_dist, sampled_latent_action, switch_beta, kl_loss, aux_ratio_loss)
+        return control_signal, MetaControllerOutput(next_hiddens, residual_stream, action_dist, sampled_latent_action, switch_beta, kl_loss, kl_loss_weight if discovery_phase else self.zero, aux_ratio_loss)
 
 MetaController.policy_loss = policy_loss
 MetaController.ratio_loss = ratio_loss
@@ -806,6 +835,32 @@ class Transformer(Module):
         # ensure devices match
         
         if exists(self.meta_controller): self._ensure_consistent_device(self.meta_controller)
+
+    def meta_controller_maybe_increment_kl_loss_step(self):
+        if not exists(self.meta_controller):
+            return
+
+        self.meta_controller.maybe_increment_kl_loss_step()
+
+    def meta_controller_reset_kl_loss_warmup(self):
+        if not exists(self.meta_controller):
+            return
+
+        self.meta_controller.reset_kl_loss_warmup()
+
+    @property
+    def meta_controller_kl_loss_weight(self):
+        if not exists(self.meta_controller):
+            return None
+
+        return self.meta_controller.kl_loss_weight
+
+    @property
+    def meta_controller_current_kl_loss_weight(self):
+        if not exists(self.meta_controller):
+            return 0.
+
+        return self.meta_controller.current_kl_loss_weight
 
     @property
     def running_bc_state_loss(self):
