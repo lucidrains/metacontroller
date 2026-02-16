@@ -158,9 +158,11 @@ class BidirectionalSequenceEmbedder(Module):
     def __init__(
         self,
         dim,
+        pool = True,
         **kwargs
     ):
         super().__init__()
+        self.pool = pool
         self.encoder = Encoder(dim = dim, **kwargs)
 
     def forward(
@@ -169,6 +171,10 @@ class BidirectionalSequenceEmbedder(Module):
         mask = None
     ):
         encoded = self.encoder(x, mask = mask)
+
+        if not self.pool:
+            return encoded
+
         mean_pooled = masked_mean(encoded, mask, dim = 1)
         return repeat(mean_pooled, 'b d -> b n d', n = x.shape[1])
 
@@ -333,6 +339,7 @@ class MetaController(Module):
             polar_pos_emb = True
         ),
         bidirectional = True,
+        pool_embedded_sequence = True,
         dim_sequence_summary_embed = 32, # the summary embedding from the bidirectional network needs to be bottlenecked
         action_proposer: Module | dict = dict(
             depth = 2,
@@ -371,6 +378,10 @@ class MetaController(Module):
 
         if isinstance(internal_sequence_embedder, dict):
             embedder_klass = BidirectionalSequenceEmbedder if bidirectional else CausalSequenceEmbedder
+            
+            if bidirectional:
+                internal_sequence_embedder['pool'] = pool_embedded_sequence
+
             internal_sequence_embedder = embedder_klass(dim = dim_model, **internal_sequence_embedder)
 
         self.internal_sequence_embedder = internal_sequence_embedder

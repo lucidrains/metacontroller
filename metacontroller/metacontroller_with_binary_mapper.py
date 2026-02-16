@@ -184,6 +184,7 @@ class MetaControllerWithBinaryMapper(Module):
         switch_temperature = 0.1,
         target_temporal_segment_len = 4, # set to target segment length driven by ratio loss
         ratio_loss_weight = 1.,
+        pool_embedded_sequence = True,
         dim_sequence_summary_embed = 32,
         hard_switch = None,
         kl_loss_weight = 1.,
@@ -208,6 +209,10 @@ class MetaControllerWithBinaryMapper(Module):
 
         if isinstance(internal_sequence_embedder, dict):
             embedder_klass = BidirectionalSequenceEmbedder if bidirectional else CausalSequenceEmbedder
+
+            if bidirectional:
+                internal_sequence_embedder['pool'] = pool_embedded_sequence
+
             internal_sequence_embedder = embedder_klass(dim = dim_model, **internal_sequence_embedder)
 
         self.internal_sequence_embedder = internal_sequence_embedder
