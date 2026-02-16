@@ -27,6 +27,7 @@ def exists(v):
 @param('embed_past_actions', (False, True))
 @param('variable_length', (False, True))
 @param('use_mingru', (False, True))
+@param('normalize_state_action_losses', (False, True))
 @param('variant', [
     (False, 'qk'),
     (False, 'gru'),
@@ -40,6 +41,7 @@ def test_metacontroller(
     variable_length,
     use_mingru,
     accept_condition,
+    normalize_state_action_losses
 ):
     use_binary_mapper_variant, switching_unit_type = variant
     dim_model = 512
@@ -78,8 +80,14 @@ def test_metacontroller(
         lower_body = dict(depth = 2,),
         upper_body = dict(depth = 2,),
         embed_past_actions = embed_past_actions,
+        normalize_state_action_losses = normalize_state_action_losses,
         **condition_kwargs
     )
+
+    assert exists(model.running_bc_state_loss) == normalize_state_action_losses
+    assert exists(model.running_bc_action_loss) == normalize_state_action_losses
+    assert exists(model.running_discovery_state_loss) == normalize_state_action_losses
+    assert exists(model.running_discovery_action_loss) == normalize_state_action_losses
 
     state_clone_loss, action_clone_loss = model(state, actions, condition = condition, episode_lens = episode_lens)
     (state_clone_loss + 0.5 * action_clone_loss).backward()

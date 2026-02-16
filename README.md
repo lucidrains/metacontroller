@@ -166,4 +166,16 @@ model.evolve(
 }
 ```
 
+```bibtex
+@misc{hafner2025trainingagentsinsidescalable,
+    title   = {Training Agents Inside of Scalable World Models}, 
+    author  = {Danijar Hafner and Wilson Yan and Timothy Lillicrap},
+    year    = {2025},
+    eprint  = {2509.24527},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.AI},
+    url     = {https://arxiv.org/abs/2509.24527}, 
+}
+```
+
 *Life can only be understood backwards; but it must be lived forwards* - Søren Kierkegaard

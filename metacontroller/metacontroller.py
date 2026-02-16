@@ -107,6 +107,49 @@ DiscoveryLosses = namedtuple('DiscoveryLosses', (
     'ratio'
 ))
 
+class LossNormalizer(Module):
+    def __init__(
+        self,
+        num_losses = 1,
+        beta = 0.999,
+        eps = 1e-6
+    ):
+        super().__init__()
+        self.register_buffer('exp_avg_sq', torch.ones(num_losses))
+        self.beta = beta
+        self.eps = eps
+
+    @property
+    def loss_scale(self):
+        return self.exp_avg_sq.sqrt()
+
+    def forward(
+        self,
+        losses: Tensor,
+        update_ema = None
+    ):
+        exp_avg_sq, beta = self.exp_avg_sq, self.beta
+        update_ema = default(update_ema, self.training)
+
+        # get the rms value - as mentioned at the end of section 3 in the paper
+
+        rms = exp_avg_sq.sqrt()
+
+        if update_ema:
+            decay = 1. - beta
+
+            # update the ema
+
+            exp_avg_sq.lerp_(losses.detach().square(), decay)
+
+        # then normalize
+
+        assert losses.numel() == rms.numel()
+
+        normed_losses = losses / rms.clamp(min = self.eps)
+
+        return normed_losses
+
 # meta controller classes
 
 @save_load()
@@ -314,7 +357,8 @@ class MetaController(Module):
             embedder_klass = BidirectionalSequenceEmbedder if bidirectional else CausalSequenceEmbedder
             internal_sequence_embedder = embedder_klass(dim = dim_model, **internal_sequence_embedder)
 
-        self.internal_sequence_embedder = internal_sequence_embedder
+        # self.internal_sequence_embedder = internal_sequence_embedder
+        self.internal_sequence_embedder = GRU(dim_model, dim_model) # bidirectional -> pollution from padding
 
         self.to_sequence_summary_embed = Linear(dim_model, dim_sequence_summary_embed)
 
@@ -482,7 +526,7 @@ class MetaController(Module):
         next_action_proposer_hidden = None
 
         # eq (12) - summarizing the input residual stream, then projecting it to meta controller dimension
-
+        # h_t
         summarized, next_summarized = self.summary_gru(residual_stream, prev_summarized)
 
         meta_embed = self.model_to_meta(summarized)
@@ -497,6 +541,7 @@ class MetaController(Module):
 
         # their h_(t-1)
 
+        # B, L, D
         meta_embed_prev = cat((
             self.model_to_meta(prev_summarized),
             meta_embed[:, :-1]
@@ -510,13 +555,20 @@ class MetaController(Module):
                 logger.warning('meta controller cache being passed back in for discovery phase, which does not make sense given bidirectional encoder')
 
             mask = maybe(lens_to_mask)(episode_lens, meta_embed.shape[1])
+            seq_mask = maybe(lens_to_mask)(episode_lens, residual_stream.shape[1])
+            seq_mask = seq_mask.unsqueeze(-1).repeat(1, 1, residual_stream.shape[2])
 
-            encoded_residual_stream = self.internal_sequence_embedder(residual_stream, mask = mask)
+            # f_emb
+            _, summarized_sequence = self.internal_sequence_embedder(residual_stream * seq_mask) # B, L, D -> layer, B, D
+            summarized_sequence = summarized_sequence[-1] # B, D
 
-            summarized_sequence_embed = self.to_sequence_summary_embed(encoded_residual_stream)
+            # channel-mixing projection
+            summarized_sequence_embed = self.to_sequence_summary_embed(summarized_sequence) # B, 32
+            summarized_sequence_embed = summarized_sequence_embed.unsqueeze(1).repeat(1, residual_stream.shape[1], 1) # B, L, 32
 
             # eq 15
 
+            # residual_stream
             emitter_input = cat((
                 residual_stream,
                 meta_embed_prev,
@@ -686,9 +738,23 @@ class Transformer(Module):
         meta_controller: MetaController | None = None,
         dim_condition = None,
         state_loss_detach_target_state = True,
-        embed_past_actions = True
+        embed_past_actions = True,
+        normalize_state_action_losses = False,
+        loss_normalizer_beta = 0.999
     ):
         super().__init__()
+
+        self.normalize_state_action_losses = normalize_state_action_losses
+        self.bc_state_loss_normalizer = None
+        self.bc_action_loss_normalizer = None
+        self.discovery_state_loss_normalizer = None
+        self.discovery_action_loss_normalizer = None
+
+        if normalize_state_action_losses:
+            self.bc_state_loss_normalizer = LossNormalizer(num_losses = 1, beta = loss_normalizer_beta)
+            self.bc_action_loss_normalizer = LossNormalizer(num_losses = 1, beta = loss_normalizer_beta)
+            self.discovery_state_loss_normalizer = LossNormalizer(num_losses = 1, beta = loss_normalizer_beta)
+            self.discovery_action_loss_normalizer = LossNormalizer(num_losses = 1, beta = loss_normalizer_beta)
 
         if exists(dim_condition):
             transformer_kwargs = dict(
@@ -744,6 +810,34 @@ class Transformer(Module):
         # ensure devices match
         
         if exists(self.meta_controller): self._ensure_consistent_device(self.meta_controller)
+
+    @property
+    def running_bc_state_loss(self):
+        if not self.normalize_state_action_losses:
+            return None
+
+        return self.bc_state_loss_normalizer.loss_scale
+
+    @property
+    def running_bc_action_loss(self):
+        if not self.normalize_state_action_losses:
+            return None
+
+        return self.bc_action_loss_normalizer.loss_scale
+
+    @property
+    def running_discovery_state_loss(self):
+        if not self.normalize_state_action_losses:
+            return None
+
+        return self.discovery_state_loss_normalizer.loss_scale
+
+    @property
+    def running_discovery_action_loss(self):
+        if not self.normalize_state_action_losses:
+            return None
+
+        return self.discovery_action_loss_normalizer.loss_scale
 
     def _ensure_consistent_device(self, network):
         self.model_device = module_device(self)
@@ -814,6 +908,7 @@ class Transformer(Module):
         condition = None,
         return_embed = False,
         control_signal_multiplier = 1.,
+        update_loss_ema: bool | None = None,
         use_hard_switch = False
     ):
         device = state.device
@@ -975,6 +1070,12 @@ class Transformer(Module):
 
             action_clone_loss = self.action_readout.calculate_loss(dist_params, target_actions, mask = action_loss_mask)
 
+            # loss normalization
+
+            if self.normalize_state_action_losses:
+                state_clone_loss = self.bc_state_loss_normalizer(state_clone_loss, update_ema = update_loss_ema)
+                action_clone_loss = self.bc_action_loss_normalizer(action_clone_loss, update_ema = update_loss_ema)
+
             losses = BehavioralCloningLosses(state_clone_loss, action_clone_loss)
 
             if return_action_logits:
@@ -1005,6 +1106,12 @@ class Transformer(Module):
             # action
 
             action_recon_loss = self.action_readout.calculate_loss(dist_params, target_actions, mask = action_loss_mask)
+
+            # loss normalization
+
+            if self.normalize_state_action_losses:
+                state_clone_loss = self.discovery_state_loss_normalizer(state_clone_loss, update_ema = update_loss_ema)
+                action_recon_loss = self.discovery_action_loss_normalizer(action_recon_loss, update_ema = update_loss_ema)
 
             losses = DiscoveryLosses(state_clone_loss, action_recon_loss, next_meta_hiddens.kl_loss, next_meta_hiddens.ratio_loss)
 

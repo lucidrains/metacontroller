@@ -152,7 +152,6 @@ def train(
     meta_controller_checkpoint_path = "meta_controller_discovery.pt",
     load_transformer_weights_path = None,
     load_meta_controller_weights_path = None,
-    use_hard_switch = False,
     save_steps = 1000,
     eval_steps = 1000,
     state_loss_weight = 1.,
@@ -423,8 +422,7 @@ def train(
                     discovery_phase = is_discovering,
                     force_behavior_cloning = not is_discovering,
                     return_meta_controller_output = True,
-                    condition = mission_embeddings,
-                    use_hard_switch = use_hard_switch
+                    condition = mission_embeddings
                 )
 
                 if is_discovering:
