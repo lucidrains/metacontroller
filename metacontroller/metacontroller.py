@@ -67,6 +67,7 @@ def straight_through(src, tgt):
 # action proposer wrapper
 # normalizes any action proposer to a standard interface for MetaController
 
+@save_load()
 class ActionProposerWrapper(Module):
     def __init__(
         self,
@@ -197,6 +198,7 @@ MetaControllerOutput = namedtuple('MetaControllerOutput', (
     'actions',
     'switch_beta',
     'kl_loss',
+    'kl_loss_weight',
     'ratio_loss'
 ))
 
@@ -218,10 +220,15 @@ def policy_loss(
     old_log_probs,
     actions,
     advantages,
-    mask,
+    mask = None,
     episode_lens = None,
-    eps_clip = 0.2
+    eps_clip = 0.2,
+    switch_beta_frequency: int | None = None
 ):
+    if exists(switch_beta_frequency):
+        batch, seq_len = state.shape[:2]
+        mask = meta_controller.create_regular_switch_beta(batch, seq_len, switch_beta_frequency, device = state.device) > 0.5
+
     # if switch betas sent as mask without converting to bool, just take care of it
 
     if mask.dtype == torch.float:
@@ -337,11 +344,20 @@ class MetaController(Module):
         target_temporal_segment_len = 4, # set to target segment length driven by ratio loss
         ratio_loss_weight = 1.,
         ratio_loss_chunk_size = None,
-        hard_switch = None
+        hard_switch = None,
+        kl_loss_weight = 1.,
+        kl_loss_warmup_steps = 0,
+        apply_kl_loss_weight = True
     ):
         super().__init__()
         self.dim_model = dim_model
         self.hard_switch = hard_switch
+
+        self.kl_loss_weight = kl_loss_weight
+        self.kl_loss_warmup_steps = kl_loss_warmup_steps
+        self.register_buffer('kl_loss_step_count', tensor(0.))
+
+        self.apply_kl_loss_weight = apply_kl_loss_weight
         
         dim_meta = default(dim_meta_controller, dim_model)
 
@@ -417,6 +433,12 @@ class MetaController(Module):
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
+    @staticmethod
+    def create_regular_switch_beta(batch, seq_len, frequency, offset = 0, device = None):
+        steps = torch.arange(seq_len, device = device) + offset
+        switch_beta = ((steps + 1) % frequency == 0).float()
+        return repeat(switch_beta, 'n -> b n', b = batch)
+
     @property
     def replay_buffer_field_dict(self):
         return dict(
@@ -425,6 +447,22 @@ class MetaController(Module):
             switch_betas = 'float',
             latent_actions = ('float', self.dim_latent)
         )
+
+    def maybe_increment_kl_loss_step(self):
+        if self.kl_loss_warmup_steps > 0:
+            self.kl_loss_step_count.add_(1)
+
+    def reset_kl_loss_warmup(self):
+        self.kl_loss_step_count.zero_()
+
+    @property
+    def current_kl_loss_weight(self):
+        if self.kl_loss_warmup_steps == 0:
+            return self.kl_loss_weight
+
+        step = self.kl_loss_step_count.item()
+        warmup_factor = min(1.0, step / self.kl_loss_warmup_steps)
+        return self.kl_loss_weight * warmup_factor
 
     def discovery_parameters(self):
         return [
@@ -511,6 +549,9 @@ class MetaController(Module):
         cache: MetaControllerOutput | None = None,
         discovery_phase = False,
         hard_switch: bool | None = None,
+        ablate_switch_beta: Tensor | None = None,
+        switch_beta_frequency: int | None = None,
+        ablate_offset = 0,
         temperature = 1.,
         episode_lens: Tensor | None = None
     ):
@@ -624,15 +665,26 @@ class MetaController(Module):
             z_prev
         ), dim = -1)
 
-        switching_unit_gru_out, next_switching_unit_gru_hidden = self.switching_unit(
-            switch_input, 
-            prev_switching_unit_gru_hidden
-        )
+        if exists(switch_beta_frequency):
+            ablate_switch_beta = self.create_regular_switch_beta(batch, seq_len, switch_beta_frequency, offset = ablate_offset, device = device)
 
-        switch_beta_logit = self.to_switching_unit_beta(switching_unit_gru_out)
+        if exists(ablate_switch_beta):
+            switch_beta = ablate_switch_beta
 
-        switch_beta = (switch_beta_logit / self.switch_temperature).sigmoid()
-        switch_beta = rearrange(switch_beta, '... 1 -> ...')
+            if switch_beta.ndim == 1:
+                switch_beta = rearrange(switch_beta, 'b -> b 1')
+
+            next_switching_unit_gru_hidden = prev_switching_unit_gru_hidden
+        else:
+            switching_unit_gru_out, next_switching_unit_gru_hidden = self.switching_unit(
+                switch_input, 
+                prev_switching_unit_gru_hidden
+            )
+
+            switch_beta_logit = self.to_switching_unit_beta(switching_unit_gru_out)
+
+            switch_beta = (switch_beta_logit / self.switch_temperature).sigmoid()
+            switch_beta = rearrange(switch_beta, '... 1 -> ...')
 
         # need to encourage normal distribution
 
@@ -650,6 +702,9 @@ class MetaController(Module):
 
             kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
             kl_loss = masked_mean(kl_loss, mask)
+
+            kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.
+            kl_loss = kl_loss * kl_loss_weight
 
         # maybe hard switch
 
@@ -706,7 +761,7 @@ class MetaController(Module):
             sampled_latent_action[:, -1:]
         )
 
-        return control_signal, MetaControllerOutput(next_hiddens, residual_stream, action_dist, sampled_latent_action, switch_beta, kl_loss, aux_ratio_loss)
+        return control_signal, MetaControllerOutput(next_hiddens, residual_stream, action_dist, sampled_latent_action, switch_beta, kl_loss, kl_loss_weight if discovery_phase else self.zero, aux_ratio_loss)
 
 MetaController.policy_loss = policy_loss
 MetaController.ratio_loss = ratio_loss
@@ -811,6 +866,32 @@ class Transformer(Module):
         
         if exists(self.meta_controller): self._ensure_consistent_device(self.meta_controller)
 
+    def meta_controller_maybe_increment_kl_loss_step(self):
+        if not exists(self.meta_controller):
+            return
+
+        self.meta_controller.maybe_increment_kl_loss_step()
+
+    def meta_controller_reset_kl_loss_warmup(self):
+        if not exists(self.meta_controller):
+            return
+
+        self.meta_controller.reset_kl_loss_warmup()
+
+    @property
+    def meta_controller_kl_loss_weight(self):
+        if not exists(self.meta_controller):
+            return None
+
+        return self.meta_controller.kl_loss_weight
+
+    @property
+    def meta_controller_current_kl_loss_weight(self):
+        if not exists(self.meta_controller):
+            return 0.
+
+        return self.meta_controller.current_kl_loss_weight
+
     @property
     def running_bc_state_loss(self):
         if not self.normalize_state_action_losses:
@@ -908,8 +989,9 @@ class Transformer(Module):
         condition = None,
         return_embed = False,
         control_signal_multiplier = 1.,
-        update_loss_ema: bool | None = None,
-        use_hard_switch = False
+        ablate_switch_beta: Tensor | None = None,
+        switch_beta_frequency: int | None = None,
+        update_loss_ema: bool | None = None
     ):
         device = state.device
 
@@ -1012,12 +1094,14 @@ class Transformer(Module):
             if exists(meta_controller) and not behavioral_cloning:
                 meta_cache = None if discovery_phase else meta_hiddens
                 control_signal, next_meta_hiddens = meta_controller(
-                    residual_stream, 
-                    cache = meta_cache, 
-                    discovery_phase = discovery_phase, 
-                    temperature = meta_controller_temperature, 
+                    residual_stream,
+                    cache = meta_cache,
+                    discovery_phase = discovery_phase,
+                    temperature = meta_controller_temperature,
                     episode_lens = episode_lens,
-                    hard_switch = use_hard_switch
+                    ablate_switch_beta = ablate_switch_beta,
+                    switch_beta_frequency = switch_beta_frequency,
+                    ablate_offset = cache_steps
                 )
             else:
                 control_signal, next_meta_hiddens = self.zero, None

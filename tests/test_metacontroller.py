@@ -9,6 +9,8 @@ import torch
 from torch import cat
 from metacontroller.metacontroller import Transformer, MetaController, ActionProposerWrapper, policy_loss, z_score, extract_grpo_data
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
+
+from torch_einops_utils.save_load import save_load
 from minGRU_pytorch import minGRU
 
 from memmap_replay_buffer import ReplayBuffer
@@ -29,8 +31,7 @@ def exists(v):
 @param('use_mingru', (False, True))
 @param('normalize_state_action_losses', (False, True))
 @param('variant', [
-    (False, 'qk'),
-    (False, 'gru'),
+    (False, None),
     (True, 'qk'),
     (True, 'gru')
 ])
@@ -44,18 +45,19 @@ def test_metacontroller(
     normalize_state_action_losses
 ):
     use_binary_mapper_variant, switching_unit_type = variant
-    dim_model = 512
-    dim_meta = 256
+    dim_model = 64
+    dim_meta = 32
+    seq_len = 32
 
-    state = torch.randn(2, 128, 384)
+    state = torch.randn(2, seq_len, 384)
     episode_lens = torch.tensor([64, 64]) if variable_length else None
 
     if action_discrete:
-        actions = torch.randint(0, 4, (2, 128))
+        actions = torch.randint(0, 4, (2, seq_len))
         action_embed_readout = dict(num_discrete = 4)
         assert_shape = (4,)
     else:
-        actions = torch.randn(2, 128, 8)
+        actions = torch.randn(2, seq_len, 8)
         action_embed_readout = dict(num_continuous = 8)
         assert_shape = (8, 2)
 
@@ -98,8 +100,8 @@ def test_metacontroller(
 
     if use_mingru:
         action_proposer_kwargs = dict(
-            action_proposer = ActionProposerWrapper(
-                minGRU(dim = dim_model),
+            action_proposer = save_load()(ActionProposerWrapper)(
+                save_load()(minGRU)(dim = dim_model),
                 cache_key = 'prev_hidden',
                 return_cache_key = 'return_next_prev_hidden'
             )
@@ -245,6 +247,88 @@ def test_metacontroller(
     Path('./trained.pt').unlink()
 
     rmtree(test_folder, ignore_errors = True)
+
+def test_kl_loss_warmup_e2e():
+    dim_model = 64
+    kl_loss_weight = 0.2
+    kl_loss_warmup_steps = 10
+    
+    mc = MetaController(
+        dim_model = dim_model,
+        kl_loss_weight = kl_loss_weight,
+        kl_loss_warmup_steps = kl_loss_warmup_steps
+    )
+    
+    transformer = Transformer(
+        dim = dim_model,
+        state_embed_readout = dict(num_continuous = dim_model),
+        action_embed_readout = dict(num_continuous = dim_model),
+        lower_body = dict(depth = 1),
+        upper_body = dict(depth = 1),
+        meta_controller = mc
+    )
+    
+    # Step 0
+    state = torch.randn(1, 2, dim_model)
+    actions = torch.randn(1, 2, dim_model)
+    
+    _, output = transformer(state, actions, discovery_phase = True, return_meta_controller_output = True)
+    assert output.kl_loss_weight == 0.0
+    assert output.kl_loss == 0.0
+    
+    # Step 5
+    for _ in range(5):
+        transformer.meta_controller_maybe_increment_kl_loss_step()
+        
+    assert transformer.meta_controller_current_kl_loss_weight == 0.1
+    
+    _, output5 = transformer(state, actions, discovery_phase = True, return_meta_controller_output = True)
+    assert output5.kl_loss_weight == 0.1
+    
+    # Step 10
+    for _ in range(5):
+        transformer.meta_controller_maybe_increment_kl_loss_step()
+
+    assert transformer.meta_controller_current_kl_loss_weight == 0.2
+
+    _, output10 = transformer(state, actions, discovery_phase = True, return_meta_controller_output = True)
+    assert output10.kl_loss_weight == 0.2
+
+    # verify scaling (kl_loss should be doubled if weight is doubled)
+    if output5.kl_loss > 0:
+        assert torch.isclose(output10.kl_loss / output5.kl_loss, torch.tensor(2.0), atol = 1e-4)
+
+    # test reset
+    transformer.meta_controller_reset_kl_loss_warmup()
+    assert transformer.meta_controller_current_kl_loss_weight == 0.0
+    _, output_reset = transformer(state, actions, discovery_phase = True, return_meta_controller_output = True)
+    assert output_reset.kl_loss_weight == 0.0
+    assert output_reset.kl_loss == 0.0
+
+    # test transformer accessor
+    assert transformer.meta_controller_kl_loss_weight == 0.2
+
+    # test apply_kl_loss_weight = False
+    mc_no_weight = MetaController(
+        dim_model = dim_model,
+        kl_loss_weight = 0.2,
+        kl_loss_warmup_steps = 10,
+        apply_kl_loss_weight = False
+    )
+    
+    transformer_no_weight = Transformer(
+        dim = dim_model,
+        state_embed_readout = dict(num_continuous = dim_model),
+        action_embed_readout = dict(num_continuous = dim_model),
+        lower_body = dict(depth = 1),
+        upper_body = dict(depth = 1),
+        meta_controller = mc_no_weight
+    )
+
+    _, output_no_weight = transformer_no_weight(state, actions, discovery_phase = True, return_meta_controller_output = True)
+    # weight shouldn't be applied despite step 0 (which would be weight 0)
+    assert output_no_weight.kl_loss_weight == 1.0
+    assert output_no_weight.kl_loss > 0.0
 
 def test_transformer_embed_parity():
     dim_model = 512
@@ -393,3 +477,64 @@ def test_discovery_vs_bc_ablation_parity():
 
     assert torch.allclose(bc_losses.state, discovery_losses.state_pred, atol = 1e-6)
     assert torch.allclose(bc_losses.action, discovery_losses.action_recon, atol = 1e-6)
+
+def test_switch_ablation():
+    dim = 64
+    batch = 2
+    seq_len = 8
+    frequency = 4
+
+    meta_controller = MetaController(
+        dim_model = dim,
+        dim_meta_controller = 32,
+        dim_latent = 32
+    )
+
+    transformer = Transformer(
+        dim = dim,
+        state_embed_readout = dict(num_continuous = dim),
+        action_embed_readout = dict(num_continuous = dim),
+        lower_body = dict(depth = 1),
+        upper_body = dict(depth = 1),
+        meta_controller = meta_controller
+    )
+
+    # test helper
+    ablate_switch_beta = MetaController.create_regular_switch_beta(batch, seq_len, frequency)
+    expected = torch.zeros(batch, seq_len)
+    expected[:, 3] = 1.
+    expected[:, 7] = 1.
+    assert torch.allclose(ablate_switch_beta, expected)
+
+    # test transformer discovery ablation
+    state = torch.randn(batch, seq_len, dim)
+    actions = torch.randn(batch, seq_len, dim)
+    
+    losses, meta_output = transformer(
+        state,
+        actions = actions,
+        discovery_phase = True,
+        ablate_switch_beta = ablate_switch_beta,
+        return_meta_controller_output = True
+    )
+    assert torch.allclose(meta_output.switch_beta, ablate_switch_beta)
+
+    # test transformer frequency ablation
+    losses, meta_output = transformer(
+        state,
+        actions = actions,
+        discovery_phase = True,
+        switch_beta_frequency = frequency,
+        return_meta_controller_output = True
+    )
+    assert torch.allclose(meta_output.switch_beta, ablate_switch_beta)
+
+    # test with cache
+    out1, cache1 = transformer(torch.randn(batch, 1, dim), switch_beta_frequency = frequency, return_cache = True)
+    assert torch.all(cache1.prev_hiddens.meta_controller.switch_beta == 0.)
+
+    for _ in range(2):
+        _, cache1 = transformer(torch.randn(batch, 1, dim), switch_beta_frequency = frequency, cache = cache1, return_cache = True)
+
+    _, cache1 = transformer(torch.randn(batch, 1, dim), switch_beta_frequency = frequency, cache = cache1, return_cache = True)
+    assert torch.all(cache1.prev_hiddens.meta_controller.switch_beta == 1.)

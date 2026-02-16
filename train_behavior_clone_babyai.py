@@ -162,6 +162,8 @@ def train(
     discovery_entropy_loss_weight = 0.1,
     discovery_negative_entropy_loss_weight = 0.75,
     discovery_ratio_loss_weight = 1.0,
+    discovery_kl_loss_warmup_steps = 0,
+    normalize_state_action_losses = False,
     max_grad_norm = 1.,
     use_resnet = False,
     condition_on_mission_embed = False,
@@ -266,9 +268,15 @@ def train(
     accelerator.print(f"Detected state_dim: {state_dim}, num_actions: {num_actions} from env: {env_id}")
 
     # meta controller
-
     if not use_binary_mapper:
-        meta_controller = MetaController(dim, switch_temperature = switch_temperature, ratio_loss_weight = discovery_ratio_loss_weight)
+        meta_controller = MetaController(
+            dim,
+            switch_temperature = switch_temperature,
+            ratio_loss_weight = discovery_ratio_loss_weight,
+            kl_loss_weight = discovery_kl_loss_weight,
+            kl_loss_warmup_steps = discovery_kl_loss_warmup_steps,
+            apply_kl_loss_weight = True
+        )
     else:
         meta_controller = MetaControllerWithBinaryMapper(
             dim_model = dim,
@@ -300,7 +308,8 @@ def train(
         lower_body = dict(depth = depth, heads = heads, attn_dim_head = dim_head),
         upper_body = dict(depth = depth, heads = heads, attn_dim_head = dim_head),
         meta_controller = meta_controller,
-        dim_condition = mission_embed_dim if condition_on_mission_embed else None
+        dim_condition = mission_embed_dim if condition_on_mission_embed else None,
+        normalize_state_action_losses = normalize_state_action_losses
     )
     if use_resnet: transformer_kwargs["use_layernorm"] = True # resnet won't suffer from grad. accum.
     
@@ -353,11 +362,17 @@ def train(
     old_discovery_action_recon_loss_weight = discovery_action_recon_loss_weight 
 
     gradient_step = 0
+    is_discovering = False
     for epoch in range(cloning_epochs + discovery_epochs):
 
         total_losses = defaultdict(float)
 
         progress_bar = tqdm(dataloader, desc = f"Epoch {epoch}", disable = not accelerator.is_local_main_process)
+
+        # store checkpoint on switching
+        if cloning_epochs > 0 and not is_discovering and epoch >= cloning_epochs:
+            accelerator.wait_for_everyone()
+            store_checkpoint(gradient_step, False)
 
         is_discovering = (epoch >= cloning_epochs) # discovery phase is BC with metacontroller tuning
 
@@ -462,7 +477,8 @@ def train(
                     loss = (
                         obs_loss * discovery_obs_loss_weight + 
                         action_recon_loss * discovery_action_recon_loss_weight +
-                        kl_loss * discovery_kl_loss_weight +
+                        # manually multiply kl loss by the warmup weight, since researcher set apply_kl_loss_weight = False in the MetaController init
+                        kl_loss * meta_controller_output.kl_loss_weight +
                         entropy_loss * entropy_weight +
                         ratio_loss * discovery_ratio_loss_weight
                     )
@@ -471,6 +487,7 @@ def train(
                         obs_loss = obs_loss.item(),
                         action_recon_loss = action_recon_loss.item(),
                         kl_loss = kl_loss.item(),
+                        kl_loss_weight = meta_controller_output.kl_loss_weight,
                         entropy_loss = entropy_loss.item(),
                         ratio_loss = ratio_loss.item(),
                         hard_switch_density = last_hard_switch_density,
@@ -502,6 +519,12 @@ def train(
                 if gradient_accumulation_steps is None or gradient_step % gradient_accumulation_steps == 0:
                     optim.step()
                     optim.zero_grad()
+
+                    if is_discovering:
+                        if isinstance(model, DistributedDataParallel):
+                            model.module.meta_controller_maybe_increment_kl_loss_step()
+                        else:
+                            model.meta_controller_maybe_increment_kl_loss_step()
 
             # log on backprop
 

@@ -1,0 +1,40 @@
+image: python:3.10
+
+variables:
+  UV_CACHE_DIR: .uv-cache
+
+cache:
+  paths:
+    - .uv-cache
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_TAG
+
+stages:
+  - test
+  - publish
+
+test:
+  stage: test
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  before_script:
+    - pip install uv
+    - uv pip install --system -e .[test]
+  script:
+    - pytest tests/
+
+pypi:
+  stage: publish
+  rules:
+    - if: $CI_COMMIT_TAG
+  before_script:
+    - pip install uv
+    - uv pip install --system build twine
+  script:
+    - uv build
+    - TWINE_PASSWORD=$PYPI_API_TOKEN TWINE_USERNAME=__token__ twine upload dist/*

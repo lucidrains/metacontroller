@@ -185,11 +185,20 @@ class MetaControllerWithBinaryMapper(Module):
         target_temporal_segment_len = 4, # set to target segment length driven by ratio loss
         ratio_loss_weight = 1.,
         dim_sequence_summary_embed = 32,
-        hard_switch = None
+        hard_switch = None,
+        kl_loss_weight = 1.,
+        kl_loss_warmup_steps = 0,
+        apply_kl_loss_weight = True
     ):
         super().__init__()
         self.dim_model = dim_model
         self.hard_switch = hard_switch
+
+        self.kl_loss_weight = kl_loss_weight
+        self.kl_loss_warmup_steps = kl_loss_warmup_steps
+        self.register_buffer('kl_loss_step_count', tensor(0.))
+
+        self.apply_kl_loss_weight = apply_kl_loss_weight
 
         dim_meta = default(dim_meta_controller, dim_model)
 
@@ -282,6 +291,12 @@ class MetaControllerWithBinaryMapper(Module):
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
+    @staticmethod
+    def create_regular_switch_beta(batch, seq_len, frequency, offset = 0, device = None):
+        steps = torch.arange(seq_len, device = device) + offset
+        switch_beta = ((steps + 1) % frequency == 0).float()
+        return repeat(switch_beta, 'n -> b n', b = batch)
+
     @property
     def replay_buffer_field_dict(self):
         return dict(
@@ -290,6 +305,22 @@ class MetaControllerWithBinaryMapper(Module):
             switch_betas = 'float',
             latent_actions = ('float', self.num_codes)
         )
+
+    def maybe_increment_kl_loss_step(self):
+        if self.kl_loss_warmup_steps > 0:
+            self.kl_loss_step_count.add_(1)
+
+    def reset_kl_loss_warmup(self):
+        self.kl_loss_step_count.zero_()
+
+    @property
+    def current_kl_loss_weight(self):
+        if self.kl_loss_warmup_steps == 0:
+            return self.kl_loss_weight
+
+        step = self.kl_loss_step_count.item()
+        warmup_factor = min(1.0, step / self.kl_loss_warmup_steps)
+        return self.kl_loss_weight * warmup_factor
 
     def discovery_parameters(self):
         return [
@@ -351,6 +382,9 @@ class MetaControllerWithBinaryMapper(Module):
         cache: MetaControllerOutput | None = None,
         discovery_phase = False,
         hard_switch = None,
+        ablate_switch_beta: Tensor | None = None,
+        switch_beta_frequency: int | None = None,
+        ablate_offset = 0,
         temperature = 1.,
         episode_lens: Tensor | None = None
     ):
@@ -359,7 +393,7 @@ class MetaControllerWithBinaryMapper(Module):
 
         # destruct prev cache
 
-        prev_summarized, prev_action_proposer_hidden, prev_key, prev_switch_gated_hiddens, prev_sampled_code = cache.prev_hiddens if exists(cache) else ((None,) * 5)
+        prev_summarized, prev_action_proposer_hidden, prev_switching_unit_hidden, prev_switch_gated_hiddens, prev_sampled_code = cache.prev_hiddens if exists(cache) else ((None,) * 5)
 
         # getting proposed action for the two phases
 
@@ -430,14 +464,24 @@ class MetaControllerWithBinaryMapper(Module):
 
         # switching unit timer
 
-        if self.switching_unit_type == 'qk':
+        batch, seq_len, _ = sampled_codes.shape
+
+        if exists(switch_beta_frequency):
+            ablate_switch_beta = self.create_regular_switch_beta(batch, seq_len, switch_beta_frequency, offset = ablate_offset, device = device)
+
+        if exists(ablate_switch_beta):
+            switch_beta = ablate_switch_beta
+
+            if switch_beta.ndim == 1:
+                switch_beta = rearrange(switch_beta, 'b -> b 1')
+
+            next_switching_unit_hidden = prev_switching_unit_hidden
+        elif self.switching_unit_type == 'qk':
             switch_beta, next_switching_unit_hidden = self.switching_unit(
                 residual_stream,
-                prev_key
+                prev_switching_unit_hidden
             )
         else:
-            batch, seq_len, _ = sampled_codes.shape
-
             if not exists(prev_sampled_code):
                 prev_sampled_code = torch.zeros(batch, 1, self.num_codes, device = device)
 
@@ -451,15 +495,16 @@ class MetaControllerWithBinaryMapper(Module):
                 residual_stream,
                 meta_embed_prev,
                 z_prev,
-                prev_key # overloading prev_key as gru hidden for the sake of the tuple
+                prev_switching_unit_hidden
             )
 
         # losses
 
         if discovery_phase:
-            # weight unreduced kl loss by switch gates
-
             kl_loss = masked_mean(kl_loss, mask)
+
+            kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.
+            kl_loss = kl_loss * kl_loss_weight
 
         else:
             kl_loss = self.zero
@@ -517,7 +562,7 @@ class MetaControllerWithBinaryMapper(Module):
             sampled_codes[:, -1:]
         )
 
-        return control_signal, MetaControllerOutput(next_hiddens, residual_stream, binary_logits, sampled_codes, switch_beta, kl_loss, aux_ratio_loss)
+        return control_signal, MetaControllerOutput(next_hiddens, residual_stream, binary_logits, sampled_codes, switch_beta, kl_loss, kl_loss_weight if discovery_phase else self.zero, aux_ratio_loss)
 
 MetaControllerWithBinaryMapper.policy_loss = policy_loss
 MetaControllerWithBinaryMapper.ratio_loss = ratio_loss
