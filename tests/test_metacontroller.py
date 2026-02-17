@@ -6,7 +6,7 @@ from pathlib import Path
 from functools import partial
 
 import torch
-from torch import cat
+from torch import nn, cat
 from metacontroller.metacontroller import Transformer, MetaController, ActionProposerWrapper, policy_loss, z_score, extract_grpo_data
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
 
@@ -30,13 +30,15 @@ def exists(v):
 @param('variable_length', (False, True))
 @param('use_mingru', (False, True))
 @param('normalize_state_action_losses', (False, True))
-@param('variant', [
-    (False, None),
-    (True, 'qk'),
-    (True, 'gru')
+@param('variant_and_sequential_selection', [
+    ((False, None), False),
+    ((False, None), True),
+    ((True, 'qk'), False),
+    ((True, 'gru'), False),
+    ((True, 'gru'), True)
 ])
 def test_metacontroller(
-    variant,
+    variant_and_sequential_selection,
     action_discrete,
     embed_past_actions,
     variable_length,
@@ -44,10 +46,12 @@ def test_metacontroller(
     accept_condition,
     normalize_state_action_losses
 ):
+    variant, sequential_latent_action_selection = variant_and_sequential_selection
     use_binary_mapper_variant, switching_unit_type = variant
-    dim_model = 64
-    dim_meta = 32
-    seq_len = 32
+
+    dim_model = 32
+    dim_meta = 16
+    seq_len = 16
 
     state = torch.randn(2, seq_len, 384)
     episode_lens = torch.tensor([64, 64]) if variable_length else None
@@ -79,8 +83,8 @@ def test_metacontroller(
         dim = dim_model,
         action_embed_readout = action_embed_readout,
         state_embed_readout = dict(num_continuous = 384),
-        lower_body = dict(depth = 2,),
-        upper_body = dict(depth = 2,),
+        lower_body = dict(depth = 1, attn_dim_head = 16, heads = 2),
+        upper_body = dict(depth = 1, attn_dim_head = 16, heads = 2),
         embed_past_actions = embed_past_actions,
         normalize_state_action_losses = normalize_state_action_losses,
         **condition_kwargs
@@ -106,12 +110,16 @@ def test_metacontroller(
                 return_cache_key = 'return_next_prev_hidden'
             )
         )
+    else:
+        action_proposer_kwargs['action_proposer'] = dict(depth = 1, attn_dim_head = 16, heads = 2)
 
     if not use_binary_mapper_variant:
         meta_controller = MetaController(
             dim_model = dim_model,
             dim_meta_controller = dim_meta,
-            dim_latent = 128,
+            dim_latent = 64,
+            internal_sequence_embedder = dict(attn_dim_head = 16, heads = 2, depth = 1),
+            sequential_latent_action_selection = sequential_latent_action_selection,
             **action_proposer_kwargs
         )
     else:
@@ -120,6 +128,8 @@ def test_metacontroller(
             dim_meta_controller = dim_meta,
             dim_code_bits = 8,
             switching_unit_type = switching_unit_type,
+            internal_sequence_embedder = dict(attn_dim_head = 16, heads = 2, depth = 1),
+            sequential_latent_action_selection = sequential_latent_action_selection,
             **action_proposer_kwargs
         )
 
@@ -538,3 +548,75 @@ def test_switch_ablation():
 
     _, cache1 = transformer(torch.randn(batch, 1, dim), switch_beta_frequency = frequency, cache = cache1, return_cache = True)
     assert torch.all(cache1.prev_hiddens.meta_controller.switch_beta == 1.)
+
+def test_lax_scan_parity():
+    # parity test for jax.lax.scan (via jax2torch) vs iterative pytorch
+    
+    dim = 64
+    seq_len = 5
+    batch = 1
+    dim_latent = 32
+    dim_meta = 256
+    
+    mc = MetaController(
+        dim_model = dim,
+        dim_meta_controller = dim_meta,
+        dim_latent = dim_latent,
+        sequential_latent_action_selection = True
+    )
+
+    # force components to be context-free for bit-perfect parity
+
+    class IdentityEmbedder(nn.Module):
+        def forward(self, x, mask = None):
+            return x
+
+    class LinearEmitter(nn.Module):
+        def __init__(self, dim_in, dim_out):
+            super().__init__()
+            self.linear = nn.Linear(dim_in, dim_out)
+        def forward(self, x, h = None):
+            return self.linear(x), None
+
+    mc.internal_sequence_embedder = IdentityEmbedder()
+    
+    dim_emitter_in = dim_meta + dim + 32
+    mc.emitter = LinearEmitter(dim_emitter_in, dim_meta * 2)
+    
+    mc.eval()
+    
+    # pre-computed inputs
+    
+    residual_stream = torch.randn(batch, seq_len, dim)
+    
+    # 1. Whole sequence sequential discovery (using JAX)
+    
+    torch.manual_seed(42)
+    with torch.no_grad():
+        _, mc_out_seq = mc(
+            residual_stream,
+            discovery_phase = True
+        )
+        
+    # 2. Iterative (PyTorch loop)
+    
+    iter_switch_betas = []
+    cache = None
+    torch.manual_seed(42)
+    
+    for t in range(seq_len):
+        x_t = residual_stream[:, t:t+1]
+        
+        _, out_t = mc(
+            x_t,
+            cache = cache,
+            discovery_phase = True
+        )
+        cache = out_t
+        iter_switch_betas.append(out_t.switch_beta)
+        
+    iter_switch_beta = torch.cat(iter_switch_betas, dim = 1)
+    
+    # compare
+    
+    assert torch.allclose(mc_out_seq.switch_beta, iter_switch_beta, atol = 1e-5)

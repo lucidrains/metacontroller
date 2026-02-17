@@ -10,6 +10,9 @@ from torch import nn, cat, stack, tensor, is_tensor, Tensor
 from torch.nn import Module, GRU, Linear, Identity
 
 import torch.nn.functional as F
+import jax
+import jax.numpy as jnp
+from jax2torch import jax2torch
 
 # einops
 
@@ -21,6 +24,80 @@ from einops.layers.torch import Rearrange
 
 from x_transformers import Encoder, Decoder
 from x_transformers.x_transformers import PolarEmbedding, Identity
+
+# jax sequential selection
+
+def jax_gru_cell(W_ih, W_hh, b_ih, b_hh, h_prev, x):
+    ih = jnp.dot(x, W_ih.T) + b_ih
+    hh = jnp.dot(h_prev, W_hh.T) + b_hh
+    
+    r_ih, z_ih, n_ih = jnp.split(ih, 3, axis = -1)
+    r_hh, z_hh, n_hh = jnp.split(hh, 3, axis = -1)
+    
+    r = jax.nn.sigmoid(r_ih + r_hh)
+    z = jax.nn.sigmoid(z_ih + z_hh)
+    n = jnp.tanh(n_ih + r * n_hh)
+    
+    h_next = (1 - z) * n + z * h_prev
+    return h_next
+
+def jax_sequential_selection_scan(
+    W_ih, W_hh, b_ih, b_hh, W_beta,
+    residual_stream, meta_embed_prev, sampled_latent_action,
+    gru_hidden, z_t_prev,
+    switch_temperature, hard_switch
+):
+    def scan_fn(carry, inputs):
+        h_prev, z_prev_inner = carry
+        x_t, meta_prev_t, sampled_z_t = inputs
+        
+        switch_input_t = jnp.concatenate([x_t, meta_prev_t, z_prev_inner], axis = -1)
+        
+        h_next = jax_gru_cell(W_ih, W_hh, b_ih, b_hh, h_prev, switch_input_t)
+        
+        logit = jnp.dot(h_next, W_beta.T)
+        beta = jax.nn.sigmoid(logit / switch_temperature)
+        
+        if hard_switch:
+            hard_beta = jnp.where(beta > 0.5, 1.0, 0.0)
+            beta = jax.lax.stop_gradient(hard_beta - beta) + beta
+
+        forget_gate = 1. - beta
+        z_t = z_prev_inner * forget_gate + sampled_z_t * beta
+        
+        return (h_next, z_t), (beta, z_t)
+
+    # transpose inputs to have time as first dimension for lax.scan
+
+    residual_stream, meta_embed_prev, sampled_latent_action = [rearrange(t, 'b n d -> n b d') for t in (residual_stream, meta_embed_prev, sampled_latent_action)]
+
+    # vmap over batch dimension (dimension 1 after transpose)
+
+    def scan_over_batch(carry, inputs):
+        h_prev, z_prev_inner = carry
+        x_t, meta_prev_t, sampled_z_t = inputs
+        
+        # vmap the scan_fn's logic for one step
+        def step(h, z, x, m, s):
+            return scan_fn((h, z), (x, m, s))
+            
+        (h_next, z_next), (beta, z_next_out) = jax.vmap(step)(h_prev, z_prev_inner, x_t, meta_prev_t, sampled_z_t)
+        return (h_next, z_next), (beta, z_next_out)
+
+    initial_carry = (gru_hidden, z_t_prev)
+    inputs = (residual_stream, meta_embed_prev, sampled_latent_action)
+    
+    final_carry, (betas, gated_actions) = jax.lax.scan(scan_over_batch, initial_carry, inputs)
+    
+    # transpose back to (batch, time, ...)
+    betas = rearrange(betas, 'n b d -> b n d')
+    gated_actions = rearrange(gated_actions, 'n b d -> b n d')
+    
+    return betas, gated_actions, final_carry[0]
+
+# wrap for pytorch
+
+torch_sequential_selection = jax2torch(jax_sequential_selection_scan)
 
 from x_mlps_pytorch import Feedforwards
 from x_evolution import EvoStrategy
@@ -108,6 +185,57 @@ DiscoveryLosses = namedtuple('DiscoveryLosses', (
     'ratio'
 ))
 
+SequentialSelectionOutput = namedtuple('SequentialSelectionOutput', (
+    'switch_beta',
+    'gated_action',
+    'next_switching_unit_gru_hidden'
+))
+
+def perform_sequential_selection(
+    gru: GRU,
+    to_beta: Linear,
+    residual_stream: Tensor,
+    meta_embed_prev: Tensor,
+    sampled_latent_action: Tensor,
+    prev_switching_unit_gru_hidden: Tensor,
+    z_prev_initial: Tensor,
+    switch_temperature: float,
+    hard_switch: bool
+):
+    device = residual_stream.device
+    batch = residual_stream.shape[0]
+
+    if not exists(prev_switching_unit_gru_hidden):
+        prev_switching_unit_gru_hidden = torch.zeros(1, batch, gru.hidden_size, device = device)
+
+    # getting weights for jax
+    
+    W_ih = gru.weight_ih_l0
+    W_hh = gru.weight_hh_l0
+    b_ih = gru.bias_ih_l0
+    b_hh = gru.bias_hh_l0
+    W_beta = to_beta.weight
+    
+    # initial states
+    
+    gru_h0 = rearrange(prev_switching_unit_gru_hidden, '1 b h -> b h')
+    z_initial = rearrange(z_prev_initial, 'b 1 l -> b l')
+    
+    # call jax
+    
+    switch_beta, gated_action, next_gru_h0 = torch_sequential_selection(
+        W_ih, W_hh, b_ih, b_hh, W_beta,
+        residual_stream, meta_embed_prev, sampled_latent_action,
+        gru_h0, z_initial,
+        tensor(switch_temperature, device = device),
+        tensor(hard_switch, device = device)
+    )
+    
+    switch_beta = rearrange(switch_beta, '... 1 -> ...')
+    next_switching_unit_gru_hidden = next_gru_h0.unsqueeze(0)
+
+    return SequentialSelectionOutput(switch_beta, gated_action, next_switching_unit_gru_hidden)
+
 class LossNormalizer(Module):
     def __init__(
         self,
@@ -158,9 +286,11 @@ class BidirectionalSequenceEmbedder(Module):
     def __init__(
         self,
         dim,
+        pool = True,
         **kwargs
     ):
         super().__init__()
+        self.pool = pool
         self.encoder = Encoder(dim = dim, **kwargs)
 
     def forward(
@@ -169,6 +299,10 @@ class BidirectionalSequenceEmbedder(Module):
         mask = None
     ):
         encoded = self.encoder(x, mask = mask)
+
+        if not self.pool:
+            return encoded
+
         mean_pooled = masked_mean(encoded, mask, dim = 1)
         return repeat(mean_pooled, 'b d -> b n d', n = x.shape[1])
 
@@ -332,7 +466,9 @@ class MetaController(Module):
             depth = 2,
             polar_pos_emb = True
         ),
+        compact_sequence_embedding = False,
         bidirectional = True,
+        pool_embedded_sequence = True,
         dim_sequence_summary_embed = 32, # the summary embedding from the bidirectional network needs to be bottlenecked
         action_proposer: Module | dict = dict(
             depth = 2,
@@ -347,7 +483,9 @@ class MetaController(Module):
         hard_switch = None,
         kl_loss_weight = 1.,
         kl_loss_warmup_steps = 0,
-        apply_kl_loss_weight = True
+        apply_kl_loss_weight = True,
+        sequential_latent_action_selection = False,
+
     ):
         super().__init__()
         self.dim_model = dim_model
@@ -358,6 +496,9 @@ class MetaController(Module):
         self.register_buffer('kl_loss_step_count', tensor(0.))
 
         self.apply_kl_loss_weight = apply_kl_loss_weight
+        self.sequential_latent_action_selection = sequential_latent_action_selection
+
+        self.compact_sequence_embedding = compact_sequence_embedding
         
         dim_meta = default(dim_meta_controller, dim_model)
 
@@ -369,12 +510,21 @@ class MetaController(Module):
 
         # there are two phases, the first (discovery ssl phase) uses acausal with some ssm i don't really believe in - let's just use bidirectional attention as placeholder
 
-        if isinstance(internal_sequence_embedder, dict):
-            embedder_klass = BidirectionalSequenceEmbedder if bidirectional else CausalSequenceEmbedder
-            internal_sequence_embedder = embedder_klass(dim = dim_model, **internal_sequence_embedder)
+        # use transformer encoder and map the input to a self-attnded sequence
 
-        # self.internal_sequence_embedder = internal_sequence_embedder
-        self.internal_sequence_embedder = GRU(dim_model, dim_model) # bidirectional -> pollution from padding
+        if not self.compact_sequence_embedding and isinstance(internal_sequence_embedder, dict):
+            embedder_klass = BidirectionalSequenceEmbedder if bidirectional else CausalSequenceEmbedder
+            
+            if bidirectional:
+                internal_sequence_embedder['pool'] = pool_embedded_sequence
+
+            internal_sequence_embedder = embedder_klass(dim = dim_model, **internal_sequence_embedder)
+            self.internal_sequence_embedder = internal_sequence_embedder
+
+        # compact sequence embedder -> use GRU last hidden state
+
+        else:
+            self.internal_sequence_embedder = GRU(dim_model, dim_model)
 
         self.to_sequence_summary_embed = Linear(dim_model, dim_sequence_summary_embed)
 
@@ -504,28 +654,12 @@ class MetaController(Module):
 
     def train_internal_rl(self, eval_rest = False):
 
-        # ensure RNNs and the module as a whole are in training mode
-        self.train()
+        if isinstance(self.action_proposer, ActionProposerWrapper):
+            self.action_proposer.module.train()
+        else:
+            self.action_proposer.train()
 
-        # if eval_rest:
-        #     # freeze non-RL parts while keeping RNNs trainable for backward
-        #     # (summary_gru is used for RL, so we leave it in train mode)
-        #     for module_name in [
-        #         "internal_sequence_embedder",
-        #         "emitter",
-        #         "emitter_to_action_mean_log_var",
-        #         "switching_unit",
-        #         "to_switching_unit_beta",
-        #         "decoder",
-        #         "switch_gating",
-        #     ]:
-        #         module = getattr(self, module_name, None)
-        #         if module is not None:
-        #             module.eval()
-
-        # # RL-optimized components must always be in train mode
-        # self.action_proposer.train()
-        # self.action_proposer_mean_log_var.train()
+        self.action_proposer_mean_log_var.train()
 
     def get_action_dist_for_internal_rl(
         self,
@@ -596,16 +730,26 @@ class MetaController(Module):
                 logger.warning('meta controller cache being passed back in for discovery phase, which does not make sense given bidirectional encoder')
 
             mask = maybe(lens_to_mask)(episode_lens, meta_embed.shape[1])
-            seq_mask = maybe(lens_to_mask)(episode_lens, residual_stream.shape[1])
-            seq_mask = seq_mask.unsqueeze(-1).repeat(1, 1, residual_stream.shape[2])
 
-            # f_emb
-            _, summarized_sequence = self.internal_sequence_embedder(residual_stream * seq_mask) # B, L, D -> layer, B, D
-            summarized_sequence = summarized_sequence[-1] # B, D
+            # s(e_1:T) is a single compact embedding
 
-            # channel-mixing projection
-            summarized_sequence_embed = self.to_sequence_summary_embed(summarized_sequence) # B, 32
-            summarized_sequence_embed = summarized_sequence_embed.unsqueeze(1).repeat(1, residual_stream.shape[1], 1) # B, L, 32
+            if self.compact_sequence_embedding:
+                seq_mask = maybe(lens_to_mask)(episode_lens, residual_stream.shape[1])
+                seq_mask = seq_mask.unsqueeze(-1).repeat(1, 1, residual_stream.shape[2])
+
+                # f_emb
+                _, summarized_sequence = self.internal_sequence_embedder(residual_stream * seq_mask) # B, L, D -> layer, B, D
+                summarized_sequence = summarized_sequence[-1] # B, D
+
+                # channel-mixing projection
+                summarized_sequence_embed = self.to_sequence_summary_embed(summarized_sequence) # B, 32
+                summarized_sequence_embed = summarized_sequence_embed.unsqueeze(1).repeat(1, residual_stream.shape[1], 1) # B, L, 32
+
+            # otherwise treat it as an encoder output sequence (if it's the same)
+
+            else:
+                encoded_residual_stream = self.internal_sequence_embedder(residual_stream, mask = mask)
+                summarized_sequence_embed = self.to_sequence_summary_embed(encoded_residual_stream)
 
             # eq 15
 
@@ -639,52 +783,102 @@ class MetaController(Module):
 
         batch, seq_len, dim = sampled_latent_action.shape
 
-        # initialize prev sampled latent action to be zeros if not available (for first timestep and for discovery phase)
+        # initialize prev sampled latent action / gated action to be zeros if not available (for first timestep and for discovery phase)
 
         if not exists(prev_sampled_latent_action):
             prev_sampled_latent_action = torch.zeros(batch, 1, self.dim_latent, device = device)
 
-        if discovery_phase:
-            z_prev = cat((prev_sampled_latent_action, sampled_latent_action[:, :-1]), dim = 1)
+        if not exists(prev_switch_gated_hiddens):
+            prev_switch_gated_hiddens = torch.zeros(batch, 1, self.dim_latent, device = device)
 
+        z_prev_initial = prev_switch_gated_hiddens
+
+        if self.sequential_latent_action_selection and seq_len > 1:
+            z_prev = z_prev_initial
+        elif discovery_phase or seq_len > 1:
+            z_prev = cat((z_prev_initial, sampled_latent_action[:, :-1]), dim = 1)
         else:
-            # else during inference, use the previous sampled latent action
+            z_prev = z_prev_initial
+        
+        # maybe sequential selection (the lax.scan way)
+        # as requested, to fix the issue where f_switch needs the code actually in use (z_{t-1})
+        # rather than a parallel approximation
 
-            assert seq_len == 1, 'inference RL phase must be done one token at a time - if replaying for policy optimization, please use `get_action_dist_for_internal_rl`'
-            z_prev = prev_sampled_latent_action
+        if self.sequential_latent_action_selection and seq_len > 1:
 
-        # eq (16): β_t = f_switch(e_t, h_{t-1}, z_{t-1}) ∈ [0, 1]
-        # switch_input = [e_t, h_{t-1}, z_{t-1}]:
-        #   e_t       = residual_stream (current observation/embedding)
-        #   h_{t-1}  = meta_embed_prev (summary GRU output at t-1; switching unit GRU also gets prev_switching_unit_gru_hidden)
-        #   z_{t-1}  = z_prev (previous latent code)
+            # resolve hard switch
 
-        switch_input = cat((
-            residual_stream,
-            meta_embed_prev,
-            z_prev
-        ), dim = -1)
+            resolved_hard_switch = default(hard_switch, self.hard_switch, not discovery_phase)
 
-        if exists(switch_beta_frequency):
-            ablate_switch_beta = self.create_regular_switch_beta(batch, seq_len, switch_beta_frequency, offset = ablate_offset, device = device)
-
-        if exists(ablate_switch_beta):
-            switch_beta = ablate_switch_beta
-
-            if switch_beta.ndim == 1:
-                switch_beta = rearrange(switch_beta, 'b -> b 1')
-
-            next_switching_unit_gru_hidden = prev_switching_unit_gru_hidden
-        else:
-            switching_unit_gru_out, next_switching_unit_gru_hidden = self.switching_unit(
-                switch_input, 
-                prev_switching_unit_gru_hidden
+            # call jax
+            
+            sequential_selection_output = perform_sequential_selection(
+                self.switching_unit,
+                self.to_switching_unit_beta,
+                residual_stream,
+                meta_embed_prev,
+                sampled_latent_action,
+                prev_switching_unit_gru_hidden,
+                z_prev_initial,
+                self.switch_temperature,
+                resolved_hard_switch
             )
+            
+            switch_beta = sequential_selection_output.switch_beta
+            gated_action = sequential_selection_output.gated_action
+            next_switching_unit_gru_hidden = sequential_selection_output.next_switching_unit_gru_hidden
 
-            switch_beta_logit = self.to_switching_unit_beta(switching_unit_gru_out)
+            next_switch_gated_action = gated_action[:, -1:]
 
-            switch_beta = (switch_beta_logit / self.switch_temperature).sigmoid()
-            switch_beta = rearrange(switch_beta, '... 1 -> ...')
+        else:
+            # switch input is previous latent action and the embedding
+            # eq (16)
+
+            switch_input = cat((
+                residual_stream,
+                meta_embed_prev,
+                z_prev
+            ), dim = -1)
+
+            if exists(switch_beta_frequency):
+                ablate_switch_beta = self.create_regular_switch_beta(batch, seq_len, switch_beta_frequency, offset = ablate_offset, device = device)
+
+            if exists(ablate_switch_beta):
+                switch_beta = ablate_switch_beta
+
+                if switch_beta.ndim == 1:
+                    switch_beta = rearrange(switch_beta, 'b -> b 1')
+
+                next_switching_unit_gru_hidden = prev_switching_unit_gru_hidden
+            else:
+                switching_unit_gru_out, next_switching_unit_gru_hidden = self.switching_unit(
+                    switch_input, 
+                    prev_switching_unit_gru_hidden
+                )
+
+                switch_beta_logit = self.to_switching_unit_beta(switching_unit_gru_out)
+
+                switch_beta = (switch_beta_logit / self.switch_temperature).sigmoid()
+                switch_beta = rearrange(switch_beta, '... 1 -> ...')
+
+            # maybe hard switch
+
+            hard_switch = default(hard_switch, self.hard_switch, not discovery_phase)
+
+            switch_beta_for_gate = switch_beta
+
+            if hard_switch:
+                hard_switch_beta = (switch_beta_for_gate > 0.5).float()
+                switch_beta_for_gate = straight_through(switch_beta_for_gate, hard_switch_beta)
+
+            # associative scan
+
+            forget_gate = 1. - switch_beta_for_gate
+
+            gated_sampled_latent_action = einx.multiply('b n d, b n', sampled_latent_action, switch_beta_for_gate)
+            gated_action = self.switch_gating(forget_gate, gated_sampled_latent_action, prev = prev_switch_gated_hiddens)
+
+            next_switch_gated_action = gated_action[:, -1:]
 
         # need to encourage normal distribution
 
@@ -705,25 +899,6 @@ class MetaController(Module):
 
             kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.
             kl_loss = kl_loss * kl_loss_weight
-
-        # maybe hard switch
-
-        hard_switch = default(hard_switch, self.hard_switch, not discovery_phase)
-
-        switch_beta_for_gate = switch_beta
-
-        if hard_switch:
-            hard_switch_beta = (switch_beta_for_gate > 0.5).float()
-            switch_beta_for_gate = straight_through(switch_beta_for_gate, hard_switch_beta)
-
-        # associative scan
-
-        forget_gate = 1. - switch_beta_for_gate
-
-        gated_sampled_latent_action = einx.multiply('b n d, b n', sampled_latent_action, switch_beta_for_gate)
-        gated_action = self.switch_gating(forget_gate, gated_sampled_latent_action, prev = prev_switch_gated_hiddens)
-
-        next_switch_gated_action = gated_action[:, -1]
 
         # decoder
 

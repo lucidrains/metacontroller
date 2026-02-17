@@ -117,6 +117,20 @@ model.evolve(
 )
 ```
 
+## Contributing
+
+To install the dependencies for testing, run
+
+```shell
+$ uv sync --extra test
+```
+
+To run the tests with pytest, run
+
+```shell
+$ uv run pytest
+```
+
 ## Citations
 
 ```bibtex

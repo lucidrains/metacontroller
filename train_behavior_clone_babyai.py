@@ -139,6 +139,8 @@ def train(
     gradient_accumulation_steps = None, 
     lr = 1e-4,
     discovery_lr = 1e-4,
+    lr_schedule = "cosine",  # "cosine" or "constant"; cosine decays LR to lr * lr_min_ratio over BC phase
+    lr_min_ratio = 0.05,     # minimum LR as fraction of initial (e.g. 0.05 -> 5e-6 for lr=1e-4)
     weight_decay = 0.03,
     discovery_weight_decay = 0.03,
     dim = 512,
@@ -178,7 +180,8 @@ def train(
     switching_unit_decoder_attn_dim_head = 64,
     kl_loss_threshold = 0.1,
     hypernetwork_low_rank = 8,
-    target_temporal_segment_len = 4
+    target_temporal_segment_len = 4,
+    compact_sequence_embedding = False
 ):
 
     def store_checkpoint(step:int = None, is_discovering: bool = False):
@@ -222,6 +225,8 @@ def train(
                 "discovery_epochs": discovery_epochs,
                 "batch_size": batch_size,
                 "lr": lr,
+                "lr_schedule": lr_schedule,
+                "lr_min_ratio": lr_min_ratio if lr_schedule == "cosine" else None,
                 "dim": dim,
                 "depth": depth,
                 "heads": heads,
@@ -275,7 +280,9 @@ def train(
             ratio_loss_weight = discovery_ratio_loss_weight,
             kl_loss_weight = discovery_kl_loss_weight,
             kl_loss_warmup_steps = discovery_kl_loss_warmup_steps,
-            apply_kl_loss_weight = True
+            apply_kl_loss_weight = True,
+            compact_sequence_embedding = compact_sequence_embedding
+            pool_embedded_sequence = False
         )
     else:
         meta_controller = MetaControllerWithBinaryMapper(
@@ -355,6 +362,15 @@ def train(
     # prepare
 
     model, optim_model, optim_meta_controller, dataloader = accelerator.prepare(model, optim_model, optim_meta_controller, dataloader)
+
+    # optional LR schedule for BC phase (reduces overshooting / loss increase after initial decrease)
+    scheduler_model = None
+    if lr_schedule == "cosine" and cloning_epochs > 0:
+        num_bc_steps = cloning_epochs * len(dataloader)
+        scheduler_model = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optim_model, T_max=num_bc_steps, eta_min=lr * lr_min_ratio
+        )
+        accelerator.print(f"Using cosine LR schedule for BC: {num_bc_steps} steps, eta_min={lr * lr_min_ratio:.2e}")
 
     # training
 
@@ -520,6 +536,9 @@ def train(
                     optim.step()
                     optim.zero_grad()
 
+                    if not is_discovering and scheduler_model is not None:
+                        scheduler_model.step()
+
                     if is_discovering:
                         if isinstance(model, DistributedDataParallel):
                             model.module.meta_controller_maybe_increment_kl_loss_step()
@@ -536,11 +555,14 @@ def train(
                 if is_discovering: prefix = "discovery_phase"
                 else: prefix = "behavior_cloning"
 
-                accelerator.log({
+                log_dict = {
                     **log,
                     f"{prefix}_total_loss": loss.item(),
                     f"{prefix}_grad_norm": grad_norm.item()
-                }, step=gradient_step)
+                }
+                if not is_discovering and scheduler_model is not None:
+                    log_dict["behavior_cloning_lr"] = scheduler_model.get_last_lr()[0]
+                accelerator.log(log_dict, step=gradient_step)
 
                 progress_bar.set_postfix(**log)
 
