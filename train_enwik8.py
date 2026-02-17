@@ -1,6 +1,6 @@
 # /// script
 # dependencies = [
-#   "metacontroller-pytorch>=0.2.15",
+#   "metacontroller-pytorch>=0.2.17",
 #   "accelerate",
 #   "fire",
 #   "torch",
