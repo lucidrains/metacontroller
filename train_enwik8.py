@@ -6,7 +6,8 @@
 #   "torch",
 #   "einops",
 #   "tqdm",
-#   "numpy"
+#   "numpy",
+#   "jax[cuda12]"
 # ]
 # ///
 
@@ -158,8 +159,10 @@ def train(
     discovery_kl_loss_weight = 0.2,
     discovery_kl_loss_warmup_steps = 0,
     discovery_entropy_loss_weight = 0.75,
+    discovery_entropy_loss_threshold = 0.4,
     discovery_negative_entropy_loss_weight = 0.75,
-    ratio_loss_weight = 2.0,
+    ratio_loss_weight = 4.0,
+    ratio_loss_final_weight = 0.5,
     validate_every = 100,
     generate_every = 250,
     prime_length = 128,
@@ -172,10 +175,10 @@ def train(
     heads = 8,
     attn_dim_head = 48,
     hypernetwork_low_rank = 8,
-    target_temporal_segment_len = 4,
+    target_temporal_segment_len = 8,
     use_binary_mapper = True,
     dim_code_bits = 4,
-    switching_unit_type = 'qk',
+    switching_unit_type = 'gru',
     dim_queries_keys = 256,
     boundary_threshold = 0.5,
     switching_unit_decoder_heads = 8,
@@ -212,7 +215,7 @@ Grad Accum Every:   {grad_accum_every}
 BC Learning Rate:   {learning_rate}
 Disc Learning Rate: {discovery_learning_rate}
 BC Loss Weights:    state: {bc_state_loss_weight} action: {bc_action_loss_weight}
-Disc Loss Weights:  state: {discovery_state_loss_weight} action: {discovery_action_loss_weight} kl: {discovery_kl_loss_weight} kl_warmup: {discovery_kl_loss_warmup_steps} entropy: {discovery_entropy_loss_weight} neg_entropy: {discovery_negative_entropy_loss_weight} ratio: {ratio_loss_weight}
+Disc Loss Weights:  state: {discovery_state_loss_weight} action: {discovery_action_loss_weight} kl: {discovery_kl_loss_weight} kl_warmup: {discovery_kl_loss_warmup_steps} entropy: {discovery_entropy_loss_weight} (hinge: {discovery_entropy_loss_threshold}) neg_entropy: {discovery_negative_entropy_loss_weight} ratio: {ratio_loss_weight} -> {ratio_loss_final_weight}
 Seq Len:            {seq_len}
 CPU:                {cpu}
 Model Dim:          {dim}
@@ -260,7 +263,9 @@ Checkpoint Path:    {checkpoint_path}
             kl_loss_warmup_steps = discovery_kl_loss_warmup_steps,
             target_temporal_segment_len = target_temporal_segment_len,
             ratio_loss_weight = ratio_loss_weight,
-            ratio_loss_chunk_size = 8 * target_temporal_segment_len,
+            ratio_loss_chunk_size = 4 * target_temporal_segment_len,
+            ratio_loss_final_weight = ratio_loss_final_weight,
+            ratio_loss_warmdown_steps = num_discovery_batches,
             sequential_latent_action_selection = sequential_latent_action_selection,
             hard_switch = discovery_hard_switch
         )
@@ -284,7 +289,9 @@ Checkpoint Path:    {checkpoint_path}
             kl_loss_warmup_steps = discovery_kl_loss_warmup_steps,
             target_temporal_segment_len = target_temporal_segment_len,
             ratio_loss_weight = ratio_loss_weight,
-            ratio_loss_chunk_size = 8 * target_temporal_segment_len,
+            ratio_loss_chunk_size = 4 * target_temporal_segment_len,
+            ratio_loss_final_weight = ratio_loss_final_weight,
+            ratio_loss_warmdown_steps = num_discovery_batches,
             sequential_latent_action_selection = sequential_latent_action_selection,
             hard_switch = discovery_hard_switch
         )
@@ -406,6 +413,7 @@ Checkpoint Path:    {checkpoint_path}
                 obs_loss, action_recon_loss, kl_loss, ratio_loss = discovery_losses
                 
                 entropy_loss = binary_entropy(meta_output.switch_beta).mean()
+                entropy_loss = (entropy_loss - discovery_entropy_loss_threshold).relu()
 
                 # dynamic entropy weight
                 # if density is 0, apply negative entropy weight to push switch betas towards 0.5

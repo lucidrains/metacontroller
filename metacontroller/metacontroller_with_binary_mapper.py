@@ -31,7 +31,8 @@ from torch_einops_utils.save_load import save_load
 
 from vector_quantize_pytorch import BinaryMapper
 
-from metacontroller.metacontroller import MetaControllerOutput, policy_loss, ratio_loss, BidirectionalSequenceEmbedder, CausalSequenceEmbedder, perform_sequential_selection
+from metacontroller.metacontroller import MetaControllerOutput, policy_loss, ratio_loss, BidirectionalSequenceEmbedder, CausalSequenceEmbedder
+from metacontroller.sequential_selection import perform_sequential_selection
 
 # constants
 
@@ -191,7 +192,9 @@ class MetaControllerWithBinaryMapper(Module):
         kl_loss_warmup_steps = 0,
         apply_kl_loss_weight = True,
         sequential_latent_action_selection = False,
-        ratio_loss_chunk_size = None
+        ratio_loss_chunk_size = None,
+        ratio_loss_final_weight = None,
+        ratio_loss_warmdown_steps = 0
     ):
         super().__init__()
         self.dim_model = dim_model
@@ -286,6 +289,9 @@ class MetaControllerWithBinaryMapper(Module):
         self.target_temporal_segment_len = target_temporal_segment_len
         self.ratio_loss_chunk_size = ratio_loss_chunk_size
 
+        self.ratio_loss_final_weight = ratio_loss_final_weight
+        self.ratio_loss_warmdown_steps = ratio_loss_warmdown_steps
+
         # decoder
 
         assert hypernetwork_low_rank < self.num_codes
@@ -333,6 +339,15 @@ class MetaControllerWithBinaryMapper(Module):
         step = self.kl_loss_step_count.item()
         warmup_factor = min(1.0, step / self.kl_loss_warmup_steps)
         return self.kl_loss_weight * warmup_factor
+
+    @property
+    def current_ratio_loss_weight(self):
+        if not exists(self.ratio_loss_final_weight) or self.ratio_loss_warmdown_steps == 0:
+            return self.ratio_loss_weight
+
+        step = self.kl_loss_step_count.item()
+        warmdown_factor = min(1.0, step / self.ratio_loss_warmdown_steps)
+        return self.ratio_loss_weight + (self.ratio_loss_final_weight - self.ratio_loss_weight) * warmdown_factor
 
     def discovery_parameters(self):
         return [
@@ -600,7 +615,7 @@ class MetaControllerWithBinaryMapper(Module):
                 chunk_size = self.ratio_loss_chunk_size
             )
 
-            aux_ratio_loss = aux_ratio_loss * self.ratio_loss_weight
+            aux_ratio_loss = aux_ratio_loss * self.current_ratio_loss_weight
 
         # returning
 

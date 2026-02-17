@@ -11,7 +11,6 @@ from metacontroller.metacontroller import Transformer, MetaController, ActionPro
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
 
 from torch_einops_utils.save_load import save_load
-from minGRU_pytorch import minGRU
 
 from memmap_replay_buffer import ReplayBuffer
 
@@ -28,7 +27,6 @@ def exists(v):
 @param('action_discrete', (False, True))
 @param('embed_past_actions', (False, True))
 @param('variable_length', (False, True))
-@param('use_mingru', (False, True))
 @param('normalize_state_action_losses', (False, True))
 @param('variant_and_sequential_selection', [
     ((False, None), False),
@@ -42,7 +40,6 @@ def test_metacontroller(
     action_discrete,
     embed_past_actions,
     variable_length,
-    use_mingru,
     accept_condition,
     normalize_state_action_losses
 ):
@@ -101,17 +98,7 @@ def test_metacontroller(
     # discovery and internal rl phase with meta controller
 
     action_proposer_kwargs = dict()
-
-    if use_mingru:
-        action_proposer_kwargs = dict(
-            action_proposer = save_load()(ActionProposerWrapper)(
-                save_load()(minGRU)(dim = dim_model),
-                cache_key = 'prev_hidden',
-                return_cache_key = 'return_next_prev_hidden'
-            )
-        )
-    else:
-        action_proposer_kwargs['action_proposer'] = dict(depth = 1, attn_dim_head = 16, heads = 2)
+    action_proposer_kwargs['action_proposer'] = dict(depth = 1, attn_dim_head = 16, heads = 2)
 
     if not use_binary_mapper_variant:
         meta_controller = MetaController(
@@ -620,3 +607,44 @@ def test_lax_scan_parity():
     # compare
     
     assert torch.allclose(mc_out_seq.switch_beta, iter_switch_beta, atol = 1e-5)
+
+def test_jax_sequential_selection_gpu_parity():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    
+    from metacontroller.sequential_selection import HAS_JAX, perform_sequential_selection, pytorch_sequential_selection
+    
+    if not HAS_JAX:
+        pytest.skip("JAX not installed")
+
+    device = torch.device('cuda')
+    dim_model = 64
+    dim_meta = 32
+    dim_latent = 16
+    seq_len = 8
+    batch = 2
+
+    gru = nn.GRU(dim_model + dim_meta + dim_latent, dim_meta, batch_first=True).to(device)
+    to_beta = nn.Linear(dim_meta, 1).to(device)
+
+    rs = torch.randn(batch, seq_len, dim_model, device=device)
+    me = torch.randn(batch, seq_len, dim_meta, device=device)
+    sla = torch.randn(batch, seq_len, dim_latent, device=device)
+    h0 = torch.randn(1, batch, dim_meta, device=device)
+    z0 = torch.randn(batch, 1, dim_latent, device=device)
+    sz0 = torch.randn(batch, 1, dim_latent, device=device)
+    
+    temp = 1.0
+    hard = False
+
+    # 1. Reference (PyTorch)
+    with torch.no_grad():
+        pytorch_out = pytorch_sequential_selection(gru, to_beta, rs, me, sla, h0, z0, sz0, temp, hard)
+    
+    # 2. Dispatcher (Should hit JAX)
+    with torch.no_grad():
+        dispatch_out = perform_sequential_selection(gru, to_beta, rs, me, sla, h0, z0, sz0, temp, hard)
+
+    assert torch.allclose(pytorch_out.switch_beta, dispatch_out.switch_beta, atol=1e-5)
+    assert torch.allclose(pytorch_out.gated_action, dispatch_out.gated_action, atol=1e-5)
+    assert torch.allclose(pytorch_out.next_switching_unit_gru_hidden, dispatch_out.next_switching_unit_gru_hidden, atol=1e-5)
