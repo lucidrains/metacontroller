@@ -1,6 +1,6 @@
 # /// script
 # dependencies = [
-#   "metacontroller-pytorch",
+#   "metacontroller-pytorch>=0.2.15",
 #   "accelerate",
 #   "fire",
 #   "torch",
@@ -182,6 +182,7 @@ def train(
     kl_loss_threshold = 0.1,
     switch_temperature = 0.1,
     discovery_phase = False,
+    sequential_latent_action_selection = False,
     cpu = False,
     checkpoint_path = './results-enwik8/train-enwik8.pt',
     enwik8_path = './data/enwik8.gz',
@@ -215,6 +216,7 @@ CPU:                {cpu}
 Model Dim:          {dim}
 MC Dim:             {dim_meta_controller}
 Latent Dim:         {dim_latent}
+Sequential Selection: {sequential_latent_action_selection}
 Binary Mapper:      True (bits: {dim_code_bits} type: {switching_unit_type} qk_dim: {dim_queries_keys} thresh: {boundary_threshold} kl_thresh: {kl_loss_threshold} temp: {switch_temperature})
 Depth:              {depth}
 Heads:              {heads}
@@ -253,7 +255,8 @@ Checkpoint Path:    {checkpoint_path}
             hypernetwork_low_rank = hypernetwork_low_rank,
             target_temporal_segment_len = target_temporal_segment_len,
             ratio_loss_weight = ratio_loss_weight,
-            ratio_loss_chunk_size = 8 * target_temporal_segment_len
+            ratio_loss_chunk_size = 8 * target_temporal_segment_len,
+            sequential_latent_action_selection = sequential_latent_action_selection
         )
     else:
         meta_controller = MetaControllerWithBinaryMapper(
@@ -272,7 +275,8 @@ Checkpoint Path:    {checkpoint_path}
             switch_temperature = switch_temperature,
             hypernetwork_low_rank = hypernetwork_low_rank,
             target_temporal_segment_len = target_temporal_segment_len,
-            ratio_loss_weight = ratio_loss_weight
+            ratio_loss_weight = ratio_loss_weight,
+            sequential_latent_action_selection = sequential_latent_action_selection
         )
 
     model = Transformer(
