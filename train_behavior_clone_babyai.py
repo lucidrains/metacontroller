@@ -131,6 +131,7 @@ def visualize_switch_betas(
     plt.close(fig)
 
 def train(
+    run_seed = 42,
     input_dir = None,
     env_id = None,
     cloning_epochs = 10,
@@ -183,6 +184,8 @@ def train(
     target_temporal_segment_len = 4,
     compact_sequence_embedding = False
 ):
+
+    torch.manual_seed(run_seed)
 
     def store_checkpoint(step:int = None, is_discovering: bool = False):
         if accelerator.is_main_process:
@@ -281,8 +284,9 @@ def train(
             kl_loss_weight = discovery_kl_loss_weight,
             kl_loss_warmup_steps = discovery_kl_loss_warmup_steps,
             apply_kl_loss_weight = True,
-            compact_sequence_embedding = compact_sequence_embedding
-            pool_embedded_sequence = False
+            compact_sequence_embedding = compact_sequence_embedding,
+            pool_embedded_sequence = False,
+            bidirectional = True
         )
     else:
         meta_controller = MetaControllerWithBinaryMapper(
@@ -555,11 +559,20 @@ def train(
                 if is_discovering: prefix = "discovery_phase"
                 else: prefix = "behavior_cloning"
 
+                m = model.module if isinstance(model, DistributedDataParallel) else model
                 log_dict = {
                     **log,
                     f"{prefix}_total_loss": loss.item(),
                     f"{prefix}_grad_norm": grad_norm.item()
                 }
+                if m.running_bc_state_loss is not None:
+                    log_dict["running_bc_state_loss"] = m.running_bc_state_loss.squeeze().item()
+                if m.running_bc_action_loss is not None:
+                    log_dict["running_bc_action_loss"] = m.running_bc_action_loss.squeeze().item()
+                if m.running_discovery_state_loss is not None:
+                    log_dict["running_discovery_state_loss"] = m.running_discovery_state_loss.squeeze().item()
+                if m.running_discovery_action_loss is not None:
+                    log_dict["running_discovery_action_loss"] = m.running_discovery_action_loss.squeeze().item()
                 if not is_discovering and scheduler_model is not None:
                     log_dict["behavior_cloning_lr"] = scheduler_model.get_last_lr()[0]
                 accelerator.log(log_dict, step=gradient_step)

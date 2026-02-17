@@ -734,11 +734,15 @@ class MetaController(Module):
             # s(e_1:T) is a single compact embedding
 
             if self.compact_sequence_embedding:
-                seq_mask = maybe(lens_to_mask)(episode_lens, residual_stream.shape[1])
-                seq_mask = seq_mask.unsqueeze(-1).repeat(1, 1, residual_stream.shape[2])
+
+                # pack_padded_sequence requires lengths on CPU (PyTorch contract)
+                lengths_cpu = episode_lens.cpu().long()
+                packed_residual_streams = nn.utils.rnn.pack_padded_sequence(
+                    residual_stream, lengths_cpu, batch_first=True, enforce_sorted=False
+                )
 
                 # f_emb
-                _, summarized_sequence = self.internal_sequence_embedder(residual_stream * seq_mask) # B, L, D -> layer, B, D
+                _, summarized_sequence = self.internal_sequence_embedder(packed_residual_streams) # B, L, D -> layer, B, D
                 summarized_sequence = summarized_sequence[-1] # B, D
 
                 # channel-mixing projection
