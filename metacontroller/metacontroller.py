@@ -584,7 +584,7 @@ class MetaController(Module):
 
         # destruct prev cache
 
-        prev_summarized, prev_action_proposer_hidden, prev_switching_unit_gru_hidden, prev_switch_gated_hiddens, prev_sampled_latent_action = cache.prev_hiddens if exists(cache) else ((None,) * 5)
+        prev_summarized, prev_action_proposer_hidden, prev_switching_unit_gru_hidden, gated_prev_latent, sampled_prev_latent = cache.prev_hiddens if exists(cache) else ((None,) * 5)
 
         # getting proposed action for the two phases
 
@@ -657,18 +657,18 @@ class MetaController(Module):
 
         # initialize prev sampled latent action / gated action to be zeros if not available (for first timestep and for discovery phase)
 
-        if not exists(prev_sampled_latent_action):
-            prev_sampled_latent_action = torch.zeros(batch, 1, self.dim_latent, device = device)
+        if not exists(sampled_prev_latent):
+            sampled_prev_latent = torch.zeros(batch, 1, self.dim_latent, device = device)
 
-        if not exists(prev_switch_gated_hiddens):
-            prev_switch_gated_hiddens = torch.zeros(batch, 1, self.dim_latent, device = device)
+        if not exists(gated_prev_latent):
+            gated_prev_latent = torch.zeros(batch, 1, self.dim_latent, device = device)
 
-        z_prev_initial = prev_switch_gated_hiddens
+        z_prev_initial = gated_prev_latent
 
         if self.sequential_latent_action_selection and seq_len > 1:
             z_prev = z_prev_initial
         elif discovery_phase or seq_len > 1:
-            z_prev = cat((prev_sampled_latent_action, sampled_latent_action[:, :-1]), dim = 1)
+            z_prev = cat((sampled_prev_latent, sampled_latent_action[:, :-1]), dim = 1)
         else:
             z_prev = z_prev_initial
         
@@ -692,7 +692,7 @@ class MetaController(Module):
                 sampled_latent_action,
                 prev_switching_unit_gru_hidden,
                 z_prev_initial,
-                prev_sampled_latent_action,
+                sampled_prev_latent,
                 self.switch_temperature,
                 resolved_hard_switch
             )
@@ -749,7 +749,7 @@ class MetaController(Module):
             forget_gate = 1. - switch_beta_for_gate
 
             gated_sampled_latent_action = einx.multiply('b n d, b n', sampled_latent_action, switch_beta_for_gate)
-            gated_action = self.switch_gating(forget_gate, gated_sampled_latent_action, prev = prev_switch_gated_hiddens)
+            gated_action = self.switch_gating(forget_gate, gated_sampled_latent_action, prev = gated_prev_latent)
 
             next_switch_gated_action = gated_action[:, -1:]
 

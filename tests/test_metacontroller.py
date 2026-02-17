@@ -536,15 +536,20 @@ def test_switch_ablation():
     _, cache1 = transformer(torch.randn(batch, 1, dim), switch_beta_frequency = frequency, cache = cache1, return_cache = True)
     assert torch.all(cache1.prev_hiddens.meta_controller.switch_beta == 1.)
 
-def test_lax_scan_parity():
-    # parity test for jax.lax.scan (via jax2torch) vs iterative pytorch
-    
+
+
+def test_sequential_selection_parallel_vs_iterative():
+    """
+    Validates that parallel discovery (full sequence) matches
+    iterative cached discovery when sequential_latent_action_selection is on.
+    """
+
     dim = 64
-    seq_len = 5
+    seq_len = 8
     batch = 1
     dim_latent = 32
-    dim_meta = 256
-    
+    dim_meta = 64
+
     mc = MetaController(
         dim_model = dim,
         dim_meta_controller = dim_meta,
@@ -552,7 +557,7 @@ def test_lax_scan_parity():
         sequential_latent_action_selection = True
     )
 
-    # force components to be context-free for bit-perfect parity
+    # force context-free components for bit-perfect parity
 
     class IdentityEmbedder(nn.Module):
         def forward(self, x, mask = None):
@@ -566,47 +571,48 @@ def test_lax_scan_parity():
             return self.linear(x), None
 
     mc.internal_sequence_embedder = IdentityEmbedder()
-    
-    dim_emitter_in = dim_meta + dim + 32
+
+    dim_emitter_in = dim_meta + dim + dim_latent
     mc.emitter = LinearEmitter(dim_emitter_in, dim_meta * 2)
-    
+
     mc.eval()
-    
-    # pre-computed inputs
-    
+
     residual_stream = torch.randn(batch, seq_len, dim)
-    
-    # 1. Whole sequence sequential discovery (using JAX)
-    
+
+    # 1. Parallel discovery (full sequence, uses JAX scan or PyTorch loop)
+
     torch.manual_seed(42)
     with torch.no_grad():
-        _, mc_out_seq = mc(
+        _, mc_out_parallel = mc(
             residual_stream,
             discovery_phase = True
         )
-        
-    # 2. Iterative (PyTorch loop)
-    
+
+    # 2. Iterative cached discovery (step-by-step)
+
     iter_switch_betas = []
     cache = None
     torch.manual_seed(42)
-    
+
     for t in range(seq_len):
         x_t = residual_stream[:, t:t+1]
-        
-        _, out_t = mc(
-            x_t,
-            cache = cache,
-            discovery_phase = True
-        )
+
+        with torch.no_grad():
+            _, out_t = mc(
+                x_t,
+                cache = cache,
+                discovery_phase = True
+            )
+
         cache = out_t
         iter_switch_betas.append(out_t.switch_beta)
-        
+
     iter_switch_beta = torch.cat(iter_switch_betas, dim = 1)
-    
-    # compare
-    
-    assert torch.allclose(mc_out_seq.switch_beta, iter_switch_beta, atol = 1e-5)
+
+    # compare switch betas
+
+    assert torch.allclose(mc_out_parallel.switch_beta, iter_switch_beta, atol = 1e-5), \
+        f'switch beta mismatch: max diff = {(mc_out_parallel.switch_beta - iter_switch_beta).abs().max().item()}'
 
 def test_jax_sequential_selection_gpu_parity():
     if not torch.cuda.is_available():

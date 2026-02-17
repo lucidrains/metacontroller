@@ -7,9 +7,11 @@
 #   "einops",
 #   "tqdm",
 #   "numpy",
-#   "jax[cuda12]"
+#   "jax"
 # ]
 # ///
+
+# modify jax above to jax[cuda11|12|13] for gpu
 
 import os
 import gzip

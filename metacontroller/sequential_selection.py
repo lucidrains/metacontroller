@@ -49,7 +49,8 @@ def jax_sequential_selection_scan(
     meta_embeddings,
     sampled_latent_actions,
     gru_hidden,
-    current_latent_action,
+    gated_prev_latent,
+    sampled_prev_latent,
     switch_temperature,
     hard_switch
 ):
@@ -58,16 +59,22 @@ def jax_sequential_selection_scan(
     Uses pre-computed input projections to minimize GEMMs inside the scan loop.
     """
     
-    # pre-calculate input projections for the entire sequence at once
+    # input-to-hidden projections
+    
+    # beta_t depends on S_{t-1}
+    # we need to concatenate initial sampled latent with all but last proposal
+    
+    prev_sampled_latent_actions = jnp.concatenate([
+        rearrange(sampled_prev_latent, '... -> 1 ...'),
+        sampled_latent_actions[:, :-1]
+    ], axis = 1)
 
     gru_input_all = jnp.concatenate([
         residual_stream, 
         meta_embeddings, 
-        sampled_latent_actions
+        prev_sampled_latent_actions
     ], axis = -1)
     
-    # input-to-hidden projections
-
     projected_input_hidden_all = gru_input_all @ weight_ih.T + bias_ih
     
     # transpose for lax.scan indexing (seq_len, batch, dim)
@@ -106,7 +113,7 @@ def jax_sequential_selection_scan(
         
         return (h_next, z_next), (beta, z_next)
 
-    initial_carry = (gru_hidden, current_latent_action)
+    initial_carry = (gru_hidden, gated_prev_latent)
     inputs = (projected_input_hidden_all_T, sampled_latent_actions_T)
 
     # perform scan
@@ -133,7 +140,7 @@ if HAS_JAX:
 
     # Define the backward-supporting JIT function at module level for persistent caching
 
-    @partial(jax.jit, static_argnums = (11, 12))
+    @partial(jax.jit, static_argnums = (12, 13))
     def jitted_vjp_logic(
         weight_ih,
         weight_hh,
@@ -145,14 +152,15 @@ if HAS_JAX:
         meta_embeddings,
         sampled_latent_actions,
         gru_hidden,
-        current_latent_action,
+        gated_prev_latent,
+        sampled_prev_latent,
         switch_temperature,
         hard_switch
     ):
         return vjp(
             lambda *args: jax_sequential_selection_scan(*args, switch_temperature, hard_switch),
             weight_ih, weight_hh, bias_ih, bias_hh, weight_beta, bias_beta, 
-            residual_stream, meta_embeddings, sampled_latent_actions, gru_hidden, current_latent_action
+            residual_stream, meta_embeddings, sampled_latent_actions, gru_hidden, gated_prev_latent, sampled_prev_latent
         )
 
     # dlpack conversion helpers
@@ -193,7 +201,8 @@ if HAS_JAX:
             meta_embeddings,
             sampled_latent_actions,
             gru_hidden,
-            current_latent_action,
+            gated_prev_latent,
+            sampled_prev_latent,
             switch_temperature,
             hard_switch
         ):
@@ -202,7 +211,7 @@ if HAS_JAX:
             
             # convert all torch tensors to jax
 
-            jax_args = [t2j(t) for t in (weight_ih, weight_hh, bias_ih, bias_hh, weight_beta, bias_beta, residual_stream, meta_embeddings, sampled_latent_actions, gru_hidden, current_latent_action)]
+            jax_args = [t2j(t) for t in (weight_ih, weight_hh, bias_ih, bias_hh, weight_beta, bias_beta, residual_stream, meta_embeddings, sampled_latent_actions, gru_hidden, gated_prev_latent, sampled_prev_latent)]
             
             # use module-level JIT to compute forward and retrieve VJP function
 
@@ -253,11 +262,12 @@ if HAS_JAX:
         meta_embeddings,
         sampled_latent_actions,
         gru_hidden,
-        current_latent_action,
+        gated_prev_latent,
+        sampled_prev_latent,
         switch_temperature,
         hard_switch
     ):
-        return JaxSequentialSelection.apply(weight_ih, weight_hh, bias_ih, bias_hh, weight_beta, bias_beta, residual_stream, meta_embeddings, sampled_latent_actions, gru_hidden, current_latent_action, switch_temperature, hard_switch)
+        return JaxSequentialSelection.apply(weight_ih, weight_hh, bias_ih, bias_hh, weight_beta, bias_beta, residual_stream, meta_embeddings, sampled_latent_actions, gru_hidden, gated_prev_latent, sampled_prev_latent, switch_temperature, hard_switch)
 
 # reference PyTorch implementation
 
@@ -268,24 +278,27 @@ def pytorch_sequential_selection(
     meta_embeddings: Tensor, 
     sampled_latent_actions: Tensor, 
     hidden_init: Tensor | None, 
-    latent_init: Tensor, 
-    sampled_latent_init: Tensor, 
+    gated_prev_latent: Tensor, 
+    sampled_prev_latent: Tensor, 
     switch_temperature: float, 
     hard_switch: bool
 ):
     batch, seq_len, _ = residual_stream.shape
     betas, gated = [], []
     
-    hidden, latent = hidden_init, latent_init
+    hidden, latent = hidden_init, gated_prev_latent
     
     for t in range(seq_len):
         
         # 1. GRU Step
+        # beta_t depends on S_{t-1}
+
+        prev_sampled_latent = sampled_latent_actions[:, t-1:t] if t > 0 else sampled_prev_latent
 
         input_t = cat([
             residual_stream[:, t:t+1],
             meta_embeddings[:, t:t+1],
-            sampled_latent_actions[:, t:t+1]
+            prev_sampled_latent
         ], dim = -1)
         
         _, hidden = gru(input_t, hidden)
@@ -321,8 +334,8 @@ def perform_sequential_selection(
     meta_embeddings: Tensor, 
     sampled_latent_actions: Tensor, 
     hidden_init: Tensor | None, 
-    latent_init: Tensor, 
-    sampled_latent_init: Tensor, 
+    gated_prev_latent: Tensor, 
+    sampled_prev_latent: Tensor, 
     switch_temperature: float, 
     hard_switch: bool
 ):
@@ -341,12 +354,13 @@ def perform_sequential_selection(
             # reshape inputs for JAX-friendly format
 
             gru_hidden = rearrange(hidden_init, '1 b h -> b h') if exists(hidden_init) else torch.zeros(residual_stream.shape[0], gru.hidden_size, device = device)
-            current_latent_action = rearrange(latent_init, 'b 1 l -> b l')
+            gated_prev_latent_jax = rearrange(gated_prev_latent, 'b 1 l -> b l')
+            sampled_prev_latent_jax = rearrange(sampled_prev_latent, 'b 1 l -> b l')
             
             outputs = torch_jax_sequential_selection(
                 weight_ih, weight_hh, bias_ih, bias_hh, weight_beta, bias_beta, 
                 residual_stream, meta_embeddings, sampled_latent_actions, 
-                gru_hidden, current_latent_action, 
+                gru_hidden, gated_prev_latent_jax, sampled_prev_latent_jax,
                 switch_temperature, hard_switch
             )
             
@@ -362,4 +376,4 @@ def perform_sequential_selection(
             # fallback on any JAX-specific failure
             pass
 
-    return pytorch_sequential_selection(gru, to_beta, residual_stream, meta_embeddings, sampled_latent_actions, hidden_init, latent_init, sampled_latent_init, switch_temperature, hard_switch)
+    return pytorch_sequential_selection(gru, to_beta, residual_stream, meta_embeddings, sampled_latent_actions, hidden_init, gated_prev_latent, sampled_prev_latent, switch_temperature, hard_switch)
