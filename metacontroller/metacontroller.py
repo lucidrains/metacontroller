@@ -367,7 +367,7 @@ class MetaController(Module):
         kl_loss_weight = 1.,
         kl_loss_warmup_steps = 0,
         apply_kl_loss_weight = True,
-        sequential_latent_action_selection = False,
+        sequential_latent_action_selection = True,
         ratio_loss_final_weight = None,
         ratio_loss_warmdown_steps = 0
     ):
