@@ -155,7 +155,8 @@ def train(
     bc_action_loss_weight = 1.,
     discovery_state_loss_weight = 1.,
     discovery_action_loss_weight = 1.,
-    discovery_kl_loss_weight = 0.1,
+    discovery_kl_loss_weight = 0.2,
+    discovery_kl_loss_warmup_steps = 0,
     discovery_entropy_loss_weight = 0.75,
     discovery_negative_entropy_loss_weight = 0.75,
     ratio_loss_weight = 2.0,
@@ -183,6 +184,7 @@ def train(
     switch_temperature = 0.1,
     discovery_phase = False,
     sequential_latent_action_selection = False,
+    discovery_hard_switch = False,
     cpu = False,
     checkpoint_path = './results-enwik8/train-enwik8.pt',
     enwik8_path = './data/enwik8.gz',
@@ -210,13 +212,14 @@ Grad Accum Every:   {grad_accum_every}
 BC Learning Rate:   {learning_rate}
 Disc Learning Rate: {discovery_learning_rate}
 BC Loss Weights:    state: {bc_state_loss_weight} action: {bc_action_loss_weight}
-Disc Loss Weights:  state: {discovery_state_loss_weight} action: {discovery_action_loss_weight} kl: {discovery_kl_loss_weight} entropy: {discovery_entropy_loss_weight} neg_entropy: {discovery_negative_entropy_loss_weight} ratio: {ratio_loss_weight}
+Disc Loss Weights:  state: {discovery_state_loss_weight} action: {discovery_action_loss_weight} kl: {discovery_kl_loss_weight} kl_warmup: {discovery_kl_loss_warmup_steps} entropy: {discovery_entropy_loss_weight} neg_entropy: {discovery_negative_entropy_loss_weight} ratio: {ratio_loss_weight}
 Seq Len:            {seq_len}
 CPU:                {cpu}
 Model Dim:          {dim}
 MC Dim:             {dim_meta_controller}
 Latent Dim:         {dim_latent}
 Sequential Selection: {sequential_latent_action_selection}
+Disc Hard Switch:   {discovery_hard_switch}
 Binary Mapper:      True (bits: {dim_code_bits} type: {switching_unit_type} qk_dim: {dim_queries_keys} thresh: {boundary_threshold} kl_thresh: {kl_loss_threshold} temp: {switch_temperature})
 Depth:              {depth}
 Heads:              {heads}
@@ -253,10 +256,13 @@ Checkpoint Path:    {checkpoint_path}
             dim_meta_controller = dim_meta_controller,
             dim_latent = dim_latent,
             hypernetwork_low_rank = hypernetwork_low_rank,
+            kl_loss_weight = discovery_kl_loss_weight,
+            kl_loss_warmup_steps = discovery_kl_loss_warmup_steps,
             target_temporal_segment_len = target_temporal_segment_len,
             ratio_loss_weight = ratio_loss_weight,
             ratio_loss_chunk_size = 8 * target_temporal_segment_len,
-            sequential_latent_action_selection = sequential_latent_action_selection
+            sequential_latent_action_selection = sequential_latent_action_selection,
+            hard_switch = discovery_hard_switch
         )
     else:
         meta_controller = MetaControllerWithBinaryMapper(
@@ -274,9 +280,12 @@ Checkpoint Path:    {checkpoint_path}
             kl_loss_threshold = kl_loss_threshold,
             switch_temperature = switch_temperature,
             hypernetwork_low_rank = hypernetwork_low_rank,
+            kl_loss_weight = discovery_kl_loss_weight,
+            kl_loss_warmup_steps = discovery_kl_loss_warmup_steps,
             target_temporal_segment_len = target_temporal_segment_len,
             ratio_loss_weight = ratio_loss_weight,
-            sequential_latent_action_selection = sequential_latent_action_selection
+            sequential_latent_action_selection = sequential_latent_action_selection,
+            hard_switch = discovery_hard_switch
         )
 
     model = Transformer(
@@ -378,6 +387,9 @@ Checkpoint Path:    {checkpoint_path}
                 discovery_step = i - num_bc_batches
                 multiplier = min(1.0, discovery_step / discovery_warmup_steps)
 
+            if is_discovering:
+                meta_controller.maybe_increment_kl_loss_step()
+
             outputs = model(
                 state = state,
                 actions = actions,
@@ -405,7 +417,7 @@ Checkpoint Path:    {checkpoint_path}
 
                 loss = (action_recon_loss + 0.5) * discovery_action_loss_weight + \
                        (obs_loss + 0.5) * discovery_state_loss_weight + \
-                       kl_loss * discovery_kl_loss_weight + \
+                       kl_loss + \
                        entropy_loss * entropy_weight + \
                        ratio_loss
                 
@@ -414,6 +426,7 @@ Checkpoint Path:    {checkpoint_path}
                 last_switch_density = (meta_output.switch_beta > 0.5).float().mean().item()
                 last_ratio_loss = ratio_loss.item()
                 last_kl_loss = kl_loss.item()
+                last_kl_weight = meta_controller.current_kl_loss_weight
                 last_entropy_loss = entropy_loss.item()
             else:
                 state_loss, action_loss = outputs
@@ -439,8 +452,8 @@ Checkpoint Path:    {checkpoint_path}
             log_str = f"{i}: loss: {last_loss:.3f} ({phase}) state: {last_state_loss:.3f} {action_loss_key}: {last_action_loss:.3f}"
             
             if is_discovering:
-                log_str += f" density: {last_switch_density:.3f} kl: {last_kl_loss:.3f} entropy: {last_entropy_loss:.3f} ratio: {last_ratio_loss:.3f}"
-                pbar.set_postfix(state=f"{last_state_loss:.3f}", action_recon=f"{last_action_loss:.3f}", density=f"{last_switch_density:.3f}", kl=f"{last_kl_loss:.3f}")
+                log_str += f" density: {last_switch_density:.3f} kl: {last_kl_loss:.3f} kl_weight: {last_kl_weight:.3f} entropy: {last_entropy_loss:.3f} ratio: {last_ratio_loss:.3f}"
+                pbar.set_postfix(state=f"{last_state_loss:.3f}", action_recon=f"{last_action_loss:.3f}", density=f"{last_switch_density:.3f}", kl=f"{last_kl_loss:.3f}", kl_weight=f"{last_kl_weight:.3f}")
             else:
                 pbar.set_postfix(state=f"{last_state_loss:.3f}", action=f"{last_action_loss:.3f}")
 
