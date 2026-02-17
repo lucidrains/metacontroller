@@ -190,7 +190,8 @@ class MetaControllerWithBinaryMapper(Module):
         kl_loss_weight = 1.,
         kl_loss_warmup_steps = 0,
         apply_kl_loss_weight = True,
-        sequential_latent_action_selection = False
+        sequential_latent_action_selection = False,
+        ratio_loss_chunk_size = None
     ):
         super().__init__()
         self.dim_model = dim_model
@@ -283,6 +284,7 @@ class MetaControllerWithBinaryMapper(Module):
 
         self.ratio_loss_weight = ratio_loss_weight
         self.target_temporal_segment_len = target_temporal_segment_len
+        self.ratio_loss_chunk_size = ratio_loss_chunk_size
 
         # decoder
 
@@ -487,7 +489,7 @@ class MetaControllerWithBinaryMapper(Module):
         if self.sequential_latent_action_selection and seq_len > 1:
             z_prev = z_prev_initial
         elif discovery_phase or seq_len > 1:
-            z_prev = cat((z_prev_initial, sampled_codes[:, :-1]), dim = 1)
+            z_prev = cat((prev_sampled_code, sampled_codes[:, :-1]), dim = 1)
         else:
             z_prev = z_prev_initial
 
@@ -508,6 +510,7 @@ class MetaControllerWithBinaryMapper(Module):
                 sampled_codes,
                 prev_switching_unit_hidden,
                 z_prev_initial,
+                prev_sampled_code,
                 self.switch_temperature,
                 resolved_hard_switch
             )
@@ -593,7 +596,8 @@ class MetaControllerWithBinaryMapper(Module):
             aux_ratio_loss = self.ratio_loss(
                 self.target_temporal_segment_len,
                 switch_beta,
-                episode_lens = episode_lens
+                episode_lens = episode_lens,
+                chunk_size = self.ratio_loss_chunk_size
             )
 
             aux_ratio_loss = aux_ratio_loss * self.ratio_loss_weight

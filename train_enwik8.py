@@ -284,6 +284,7 @@ Checkpoint Path:    {checkpoint_path}
             kl_loss_warmup_steps = discovery_kl_loss_warmup_steps,
             target_temporal_segment_len = target_temporal_segment_len,
             ratio_loss_weight = ratio_loss_weight,
+            ratio_loss_chunk_size = 8 * target_temporal_segment_len,
             sequential_latent_action_selection = sequential_latent_action_selection,
             hard_switch = discovery_hard_switch
         )

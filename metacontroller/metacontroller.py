@@ -48,10 +48,10 @@ def jax_sequential_selection_scan(
     switch_temperature, hard_switch
 ):
     def scan_fn(carry, inputs):
-        h_prev, z_prev_inner = carry
+        h_prev, z_prev_inner, sampled_z_prev_inner = carry
         x_t, meta_prev_t, sampled_z_t = inputs
         
-        switch_input_t = jnp.concatenate([x_t, meta_prev_t, z_prev_inner], axis = -1)
+        switch_input_t = jnp.concatenate([x_t, meta_prev_t, sampled_z_prev_inner], axis = -1)
         
         h_next = jax_gru_cell(W_ih, W_hh, b_ih, b_hh, h_prev, switch_input_t)
         
@@ -65,7 +65,7 @@ def jax_sequential_selection_scan(
         forget_gate = 1. - beta
         z_t = z_prev_inner * forget_gate + sampled_z_t * beta
         
-        return (h_next, z_t), (beta, z_t)
+        return (h_next, z_t, sampled_z_t), (beta, z_t)
 
     # transpose inputs to have time as first dimension for lax.scan
 
@@ -78,13 +78,13 @@ def jax_sequential_selection_scan(
         x_t, meta_prev_t, sampled_z_t = inputs
         
         # vmap the scan_fn's logic for one step
-        def step(h, z, x, m, s):
-            return scan_fn((h, z), (x, m, s))
+        def step(h, z, sz, x, m, s):
+            return scan_fn((h, z, sz), (x, m, s))
             
-        (h_next, z_next), (beta, z_next_out) = jax.vmap(step)(h_prev, z_prev_inner, x_t, meta_prev_t, sampled_z_t)
-        return (h_next, z_next), (beta, z_next_out)
+        (h_next, z_next, sz_next), (beta, z_next_out) = jax.vmap(step)(h_prev, z_prev_inner, sampled_z_prev_inner, x_t, meta_prev_t, sampled_z_t)
+        return (h_next, z_next, sz_next), (beta, z_next_out)
 
-    initial_carry = (gru_hidden, z_t_prev)
+    initial_carry = (gru_hidden, z_t_prev, sampled_z_t_prev)
     inputs = (residual_stream, meta_embed_prev, sampled_latent_action)
     
     final_carry, (betas, gated_actions) = jax.lax.scan(scan_over_batch, initial_carry, inputs)
@@ -199,42 +199,89 @@ def perform_sequential_selection(
     sampled_latent_action: Tensor,
     prev_switching_unit_gru_hidden: Tensor,
     z_prev_initial: Tensor,
+    sampled_z_prev_initial: Tensor,
     switch_temperature: float,
     hard_switch: bool
 ):
     device = residual_stream.device
     batch = residual_stream.shape[0]
+    seq_len = residual_stream.shape[1]
 
     if not exists(prev_switching_unit_gru_hidden):
         prev_switching_unit_gru_hidden = torch.zeros(1, batch, gru.hidden_size, device = device)
 
-    # getting weights for jax
-    
-    W_ih = gru.weight_ih_l0
-    W_hh = gru.weight_hh_l0
-    b_ih = gru.bias_ih_l0
-    b_hh = gru.bias_hh_l0
-    W_beta = to_beta.weight
-    
-    # initial states
-    
-    gru_h0 = rearrange(prev_switching_unit_gru_hidden, '1 b h -> b h')
-    z_initial = rearrange(z_prev_initial, 'b 1 l -> b l')
-    
-    # call jax
-    
-    switch_beta, gated_action, next_gru_h0 = torch_sequential_selection(
-        W_ih, W_hh, b_ih, b_hh, W_beta,
-        residual_stream, meta_embed_prev, sampled_latent_action,
-        gru_h0, z_initial,
-        tensor(switch_temperature, device = device),
-        tensor(hard_switch, device = device)
-    )
-    
-    switch_beta = rearrange(switch_beta, '... 1 -> ...')
-    next_switching_unit_gru_hidden = next_gru_h0.unsqueeze(0)
+    # try to use jax if possible, else fallback to pytorch loop
 
-    return SequentialSelectionOutput(switch_beta, gated_action, next_switching_unit_gru_hidden)
+    try:
+        # getting weights for jax
+        
+        W_ih = gru.weight_ih_l0
+        W_hh = gru.weight_hh_l0
+        b_ih = gru.bias_ih_l0
+        b_hh = gru.bias_hh_l0
+        W_beta = to_beta.weight
+        
+        # initial states
+        
+        gru_h0 = rearrange(prev_switching_unit_gru_hidden, '1 b h -> b h')
+        z_initial = rearrange(z_prev_initial, 'b 1 l -> b l')
+        sampled_z_initial = rearrange(sampled_z_prev_initial, 'b 1 l -> b l')
+        
+        # call jax
+        
+        switch_beta, gated_action, next_gru_h0 = torch_sequential_selection(
+            W_ih, W_hh, b_ih, b_hh, W_beta,
+            residual_stream, meta_embed_prev, sampled_latent_action,
+            gru_h0, z_initial, sampled_z_initial,
+            tensor(switch_temperature, device = device),
+            tensor(hard_switch, device = device)
+        )
+        
+        switch_beta = rearrange(switch_beta, '... 1 -> ...')
+        next_switching_unit_gru_hidden = next_gru_h0.unsqueeze(0)
+
+        return SequentialSelectionOutput(switch_beta, gated_action, next_switching_unit_gru_hidden)
+
+    except Exception as e:
+        # manual pytorch loop fallback
+
+        h_t = prev_switching_unit_gru_hidden
+        z_t = rearrange(z_prev_initial, 'b 1 d -> b d')
+        sampled_z_prev = rearrange(sampled_z_prev_initial, 'b 1 d -> b d')
+
+        all_betas = []
+        all_gated_actions = []
+
+        for t in range(seq_len):
+            x_t = residual_stream[:, t]
+            meta_prev_t = meta_embed_prev[:, t]
+            sampled_z_t = sampled_latent_action[:, t]
+
+            switch_input_t = cat((x_t, meta_prev_t, sampled_z_prev), dim = -1)
+            
+            # compute gru step
+            
+            gru_out, h_t = gru(switch_input_t.unsqueeze(1), h_t)
+            
+            beta_logit = to_beta(gru_out.squeeze(1))
+            beta = (beta_logit / switch_temperature).sigmoid()
+            
+            if hard_switch:
+                hard_beta = (beta > 0.5).float()
+                beta = straight_through(beta, hard_beta)
+
+            all_betas.append(beta)
+            
+            forget_gate = 1. - beta
+            z_t = z_t * forget_gate + sampled_z_t * beta
+            sampled_z_prev = sampled_z_t
+            
+            all_gated_actions.append(z_t)
+
+        switch_beta = cat(all_betas, dim = 1)
+        gated_action = stack(all_gated_actions, dim = 1)
+        
+        return SequentialSelectionOutput(switch_beta, gated_action, h_t)
 
 class LossNormalizer(Module):
     def __init__(
@@ -770,7 +817,7 @@ class MetaController(Module):
         if self.sequential_latent_action_selection and seq_len > 1:
             z_prev = z_prev_initial
         elif discovery_phase or seq_len > 1:
-            z_prev = cat((z_prev_initial, sampled_latent_action[:, :-1]), dim = 1)
+            z_prev = cat((prev_sampled_latent_action, sampled_latent_action[:, :-1]), dim = 1)
         else:
             z_prev = z_prev_initial
         
@@ -794,6 +841,7 @@ class MetaController(Module):
                 sampled_latent_action,
                 prev_switching_unit_gru_hidden,
                 z_prev_initial,
+                prev_sampled_latent_action,
                 self.switch_temperature,
                 resolved_hard_switch
             )
