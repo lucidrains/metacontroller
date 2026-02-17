@@ -161,11 +161,11 @@ def train(
     action_loss_weight = 1.,
     discovery_action_recon_loss_weight = 1.,
     discovery_obs_loss_weight = 1e-3,
-    discovery_kl_loss_weight = 0.05,
-    discovery_entropy_loss_weight = 0.1,
-    discovery_negative_entropy_loss_weight = 0.75,
-    discovery_ratio_loss_weight = 1.0,
-    discovery_kl_loss_warmup_steps = 0,
+    discovery_kl_loss_weight = 0.2,   # paper: alpha up to 0.2; KL ramp is the only switching regularizer
+    discovery_entropy_loss_weight = 0.0,   # paper: no entropy regularizer for switching
+    discovery_negative_entropy_loss_weight = 0.0,
+    discovery_ratio_loss_weight = 0.0,     # paper: no ratio loss for switching
+    discovery_kl_loss_warmup_steps = 2000,  # paper: linear ramp over first 2K steps (0 -> final alpha)
     normalize_state_action_losses = False,
     max_grad_norm = 1.,
     use_resnet = False,
@@ -305,7 +305,10 @@ def train(
             switch_temperature = switch_temperature,
             hypernetwork_low_rank = hypernetwork_low_rank,
             target_temporal_segment_len = target_temporal_segment_len,
-            ratio_loss_weight = discovery_ratio_loss_weight
+            ratio_loss_weight = discovery_ratio_loss_weight,
+            kl_loss_weight = discovery_kl_loss_weight,
+            kl_loss_warmup_steps = discovery_kl_loss_warmup_steps,
+            apply_kl_loss_weight = True,
         )
 
     # transformer
@@ -379,7 +382,7 @@ def train(
     # training
 
     old_discovery_obs_loss_weight = discovery_obs_loss_weight
-    old_discovery_action_recon_loss_weight = discovery_action_recon_loss_weight 
+    old_discovery_action_recon_loss_weight = discovery_action_recon_loss_weight
 
     gradient_step = 0
     is_discovering = False
@@ -395,6 +398,13 @@ def train(
             store_checkpoint(gradient_step, False)
 
         is_discovering = (epoch >= cloning_epochs) # discovery phase is BC with metacontroller tuning
+
+        # Paper: KL ramp over first 2K discovery steps; reset counter when entering discovery.
+        if is_discovering and epoch == cloning_epochs:
+            if isinstance(model, DistributedDataParallel):
+                model.module.meta_controller_reset_kl_loss_warmup()
+            else:
+                model.meta_controller_reset_kl_loss_warmup()
 
         # if is_discovering:
         #     if isinstance(model, DistributedDataParallel):
@@ -461,12 +471,9 @@ def train(
                 )
 
                 if is_discovering:
-                    
                     obs_loss, action_recon_loss, kl_loss, ratio_loss = losses
 
-                    # Mask for valid (non-padded) switch positions: for episode length L we have L-1 transitions.
-                    # Density and entropy must use this mask so they match what we visualize (valid only).
-                    # Otherwise padding positions dominate and density can be ~0.6 while real trajectory is all zeros.
+                    # Mask for valid (non-padded) switch positions
                     switch_beta = meta_controller_output.switch_beta
                     _, T_minus_1 = switch_beta.shape
                     if exists(episode_lens):
@@ -482,25 +489,22 @@ def train(
                         last_hard_switch_density = (switch_beta > 0.5).float().mean().item()
                         last_soft_switch_density = switch_beta.mean().item()
 
-                    # zero betas -> feasibility restoration -> losses: (entropy, kl)
+                    # Optional: zero betas -> feasibility restoration (entropy, kl only). Default weights are 0.
                     if last_hard_switch_density < 0.1:
                         entropy_weight = -discovery_negative_entropy_loss_weight
                         discovery_obs_loss_weight = 0
                         discovery_action_recon_loss_weight = 0
-                    
-                    # otherwise losses: (obs, action, kl)
                     else:
                         entropy_weight = discovery_entropy_loss_weight
                         discovery_obs_loss_weight = old_discovery_obs_loss_weight
                         discovery_action_recon_loss_weight = old_discovery_action_recon_loss_weight
 
                     loss = (
-                        obs_loss * discovery_obs_loss_weight + 
-                        action_recon_loss * discovery_action_recon_loss_weight +
-                        # manually multiply kl loss by the warmup weight, since researcher set apply_kl_loss_weight = False in the MetaController init
-                        kl_loss * meta_controller_output.kl_loss_weight +
-                        entropy_loss * entropy_weight +
-                        ratio_loss * discovery_ratio_loss_weight
+                        obs_loss * discovery_obs_loss_weight
+                        + action_recon_loss * discovery_action_recon_loss_weight
+                        + kl_loss * meta_controller_output.kl_loss_weight
+                        + entropy_loss * entropy_weight
+                        + ratio_loss * discovery_ratio_loss_weight
                     )
 
                     log = dict(
