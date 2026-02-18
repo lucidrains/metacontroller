@@ -45,6 +45,8 @@ from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithB
 from torch.nn.parallel import DistributedDataParallel
 from functools import partial
 
+torch.manual_seed(456)
+
 # Patch x_transformers so checkpoint config can unpickle (Identity was removed/moved in some versions)
 try:
     import x_transformers.x_transformers as _xt_module
