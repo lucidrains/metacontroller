@@ -28,23 +28,17 @@ def exists(v):
 @param('embed_past_actions', (False, True))
 @param('variable_length', (False, True))
 @param('normalize_state_action_losses', (False, True))
-@param('variant_and_sequential_selection', [
-    ((False, None), False),
-    ((False, None), True),
-    ((True, 'qk'), False),
-    ((True, 'gru'), False),
-    ((True, 'gru'), True)
-])
+@param('variant', (False, True))
 def test_metacontroller(
-    variant_and_sequential_selection,
+    variant,
     action_discrete,
     embed_past_actions,
     variable_length,
     accept_condition,
     normalize_state_action_losses
 ):
-    variant, sequential_latent_action_selection = variant_and_sequential_selection
-    use_binary_mapper_variant, switching_unit_type = variant
+    use_binary_mapper_variant = variant
+    switching_unit_type = 'gru'
 
     dim_model = 32
     dim_meta = 16
@@ -106,7 +100,6 @@ def test_metacontroller(
             dim_meta_controller = dim_meta,
             dim_latent = 64,
             internal_sequence_embedder = dict(attn_dim_head = 16, heads = 2, depth = 1),
-            sequential_latent_action_selection = sequential_latent_action_selection,
             **action_proposer_kwargs
         )
     else:
@@ -114,9 +107,7 @@ def test_metacontroller(
             dim_model = dim_model,
             dim_meta_controller = dim_meta,
             dim_code_bits = 8,
-            switching_unit_type = switching_unit_type,
             internal_sequence_embedder = dict(attn_dim_head = 16, heads = 2, depth = 1),
-            sequential_latent_action_selection = sequential_latent_action_selection,
             **action_proposer_kwargs
         )
 
@@ -553,8 +544,7 @@ def test_sequential_selection_parallel_vs_iterative():
     mc = MetaController(
         dim_model = dim,
         dim_meta_controller = dim_meta,
-        dim_latent = dim_latent,
-        sequential_latent_action_selection = True
+        dim_latent = dim_latent
     )
 
     # force context-free components for bit-perfect parity

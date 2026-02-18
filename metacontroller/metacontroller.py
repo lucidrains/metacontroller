@@ -11,7 +11,7 @@ from torch.nn import Module, GRU, Linear, Identity
 
 import torch.nn.functional as F
 
-from metacontroller.sequential_selection import perform_sequential_selection, SequentialSelectionOutput
+from metacontroller.sequential_action_selection import perform_sequential_action_selection, SequentialActionSelectionOutput
 
 # einops
 
@@ -367,7 +367,6 @@ class MetaController(Module):
         kl_loss_weight = 1.,
         kl_loss_warmup_steps = 0,
         apply_kl_loss_weight = True,
-        sequential_latent_action_selection = True,
         ratio_loss_final_weight = None,
         ratio_loss_warmdown_steps = 0
     ):
@@ -380,7 +379,6 @@ class MetaController(Module):
         self.register_buffer('kl_loss_step_count', tensor(0.))
 
         self.apply_kl_loss_weight = apply_kl_loss_weight
-        self.sequential_latent_action_selection = sequential_latent_action_selection
         
         self.ratio_loss_final_weight = ratio_loss_final_weight
         self.ratio_loss_warmdown_steps = ratio_loss_warmdown_steps
@@ -584,7 +582,7 @@ class MetaController(Module):
 
         # destruct prev cache
 
-        prev_summarized, prev_action_proposer_hidden, prev_switching_unit_gru_hidden, gated_prev_latent, sampled_prev_latent = cache.prev_hiddens if exists(cache) else ((None,) * 5)
+        prev_summarized, prev_action_proposer_hidden, prev_switching_unit_gru_hidden, gated_prev_latent = cache.prev_hiddens if exists(cache) else ((None,) * 4)
 
         # getting proposed action for the two phases
 
@@ -657,26 +655,12 @@ class MetaController(Module):
 
         # initialize prev sampled latent action / gated action to be zeros if not available (for first timestep and for discovery phase)
 
-        if not exists(sampled_prev_latent):
-            sampled_prev_latent = torch.zeros(batch, 1, self.dim_latent, device = device)
-
         if not exists(gated_prev_latent):
             gated_prev_latent = torch.zeros(batch, 1, self.dim_latent, device = device)
 
-        z_prev_initial = gated_prev_latent
+        z_prev = gated_prev_latent
 
-        if self.sequential_latent_action_selection and seq_len > 1:
-            z_prev = z_prev_initial
-        elif discovery_phase or seq_len > 1:
-            z_prev = cat((sampled_prev_latent, sampled_latent_action[:, :-1]), dim = 1)
-        else:
-            z_prev = z_prev_initial
-        
-        # maybe sequential selection (the lax.scan way)
-        # as requested, to fix the issue where f_switch needs the code actually in use (z_{t-1})
-        # rather than a parallel approximation
-
-        if self.sequential_latent_action_selection and seq_len > 1:
+        if seq_len > 1 and not (exists(ablate_switch_beta) or exists(switch_beta_frequency)):
 
             # resolve hard switch
 
@@ -684,15 +668,14 @@ class MetaController(Module):
 
             # call jax
             
-            sequential_selection_output = perform_sequential_selection(
+            sequential_selection_output = perform_sequential_action_selection(
                 self.switching_unit,
                 self.to_switching_unit_beta,
                 residual_stream,
                 meta_embed_prev,
                 sampled_latent_action,
                 prev_switching_unit_gru_hidden,
-                z_prev_initial,
-                sampled_prev_latent,
+                z_prev,
                 self.switch_temperature,
                 resolved_hard_switch
             )
@@ -704,15 +687,6 @@ class MetaController(Module):
             next_switch_gated_action = gated_action[:, -1:]
 
         else:
-            # switch input is previous latent action and the embedding
-            # eq (16)
-
-            switch_input = cat((
-                residual_stream,
-                meta_embed_prev,
-                z_prev
-            ), dim = -1)
-
             if exists(switch_beta_frequency):
                 ablate_switch_beta = self.create_regular_switch_beta(batch, seq_len, switch_beta_frequency, offset = ablate_offset, device = device)
 
@@ -724,6 +698,15 @@ class MetaController(Module):
 
                 next_switching_unit_gru_hidden = prev_switching_unit_gru_hidden
             else:
+                # switch input is previous latent action and the embedding
+                # eq (16)
+
+                switch_input = cat((
+                    residual_stream,
+                    meta_embed_prev,
+                    z_prev
+                ), dim = -1)
+
                 switching_unit_gru_out, next_switching_unit_gru_hidden = self.switching_unit(
                     switch_input, 
                     prev_switching_unit_gru_hidden
@@ -773,6 +756,10 @@ class MetaController(Module):
             kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.
             kl_loss = kl_loss * kl_loss_weight
 
+        else:
+            kl_loss = self.zero
+            kl_loss_weight = self.zero
+
         # decoder
 
         decoder_out = self.decoder(gated_action)
@@ -805,8 +792,7 @@ class MetaController(Module):
             next_summarized,
             next_action_proposer_hidden,
             next_switching_unit_gru_hidden,
-            next_switch_gated_action,
-            sampled_latent_action[:, -1:]
+            next_switch_gated_action
         )
 
         return control_signal, MetaControllerOutput(next_hiddens, residual_stream, action_dist, sampled_latent_action, switch_beta, kl_loss, kl_loss_weight if discovery_phase else self.zero, aux_ratio_loss)
