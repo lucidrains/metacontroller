@@ -25,10 +25,11 @@ class ConvNextBlock(Module):
     def __init__(
         self,
         dim,
-        expansion_factor = 4
+        expansion_factor = 4,
+        kernel_size = 3
     ):
         super().__init__()
-        self.dw_conv = nn.Conv2d(dim, dim, kernel_size = 7, padding = 3, groups = dim)
+        self.dw_conv = nn.Conv2d(dim, dim, kernel_size = kernel_size, padding = kernel_size // 2, groups = dim)
         self.norm = nn.LayerNorm(dim)
         self.pw_mlp = nn.Sequential(
             nn.Linear(dim, expansion_factor * dim),
@@ -50,12 +51,13 @@ class SpatialProcessor(Module):
     def __init__(
         self,
         dim,
-        depth = 4
+        depth = 4,
+        kernel_size = 3
     ):
         super().__init__()
         self.layers = ModuleList([])
         for _ in range(depth):
-            self.layers.append(ConvNextBlock(dim))
+            self.layers.append(ConvNextBlock(dim, kernel_size = kernel_size))
 
     def forward(self, x):
         # x: (batch, time, width, height, dim)
@@ -94,17 +96,24 @@ class TransformerForSymbolicGrid(Transformer):
         num_discrete = (11, 6, 3), # Type, Color, State
         grid_size = 7,
         spatial_processor_depth = 4,
+        convnext_kernel_size = 3,
         **kwargs
     ):
+        assert 'state_embed_readout' not in kwargs, 'state_embed_readout should not be passed to TransformerForSymbolicGrid, use num_discrete instead'
+
+        kwargs['state_embed_readout'] = dict(
+            num_discrete = num_discrete
+        )
+
         super().__init__(dim = dim, **kwargs)
 
-        self.symbolic_embed, self.symbolic_readout = EmbedAndReadout(
-            dim,
-            num_discrete = num_discrete,
-            weight_tie = False
-        )
+        self.symbolic_embed, self.symbolic_readout = self.state_embed, self.state_readout
         
-        self.spatial_processor = SpatialProcessor(dim, depth = spatial_processor_depth)
+        self.spatial_processor = SpatialProcessor(
+            dim,
+            depth = spatial_processor_depth,
+            kernel_size = convnext_kernel_size
+        )
         
         self.to_model_dim = Reduce('b t w h d -> b t d', 'mean')
 

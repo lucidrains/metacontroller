@@ -19,9 +19,6 @@ def test_symbolic_transformer():
         dim,                             # model dimension
         num_discrete = (11, 6, 3),       # Type, Color, State
         grid_size = 7,                   # Square grid dimension
-        state_embed_readout = dict(
-            num_discrete = (11, 6, 3)    # State discrete buckets
-        ),
         action_embed_readout = dict(
             num_discrete = 10            # Action discrete buckets
         ),
