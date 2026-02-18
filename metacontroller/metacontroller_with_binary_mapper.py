@@ -369,7 +369,11 @@ class MetaControllerWithBinaryMapper(Module):
 
             mask = maybe(lens_to_mask)(episode_lens, meta_embed.shape[1])
 
-            encoded_temporal = self.internal_sequence_embedder(residual_stream, mask = mask)
+            kwargs = dict()
+            if exists(episode_lens):
+                kwargs['episode_lens'] = episode_lens
+
+            encoded_temporal = self.internal_sequence_embedder(residual_stream, mask = mask, **kwargs)
 
             summarized_sequence_embed = self.to_sequence_summary_embed(encoded_temporal)
 
@@ -414,7 +418,9 @@ class MetaControllerWithBinaryMapper(Module):
 
         z_prev = prev_switch_gated_hiddens
 
-        if seq_len > 1 and not (exists(ablate_switch_beta) or exists(switch_beta_frequency)):
+        is_ablating_switch = exists(ablate_switch_beta) or exists(switch_beta_frequency)
+
+        if seq_len > 1 and not is_ablating_switch:
 
             # resolve hard switch
             
@@ -444,7 +450,7 @@ class MetaControllerWithBinaryMapper(Module):
             if exists(switch_beta_frequency):
                 ablate_switch_beta = self.create_regular_switch_beta(batch, seq_len, switch_beta_frequency, offset = ablate_offset, device = device)
 
-            if exists(ablate_switch_beta):
+            if is_ablating_switch:
                 switch_beta = ablate_switch_beta
 
                 if switch_beta.ndim == 1:

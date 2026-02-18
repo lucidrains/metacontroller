@@ -42,6 +42,7 @@ import gymnasium as gym
 from gymnasium.vector import AsyncVectorEnv
 from metacontroller.metacontroller import Transformer, MetaController, z_score, extract_grpo_data
 from metacontroller.transformer_with_resnet import TransformerWithResnet
+from torch.nn.parallel import DistributedDataParallel
 from functools import partial
 
 # Patch x_transformers so checkpoint config can unpickle (Identity was removed/moved in some versions)
@@ -92,7 +93,8 @@ def visualize_switch_betas(
     switch_betas,      # (B, T-1)
     episode_lens,      # (B,) or None
     gradient_step,
-    num_samples = 3
+    num_samples = 3,
+    use_wandb = False
 ):
     """
     Visualize switch betas for randomly sampled sequences in the batch.
@@ -133,9 +135,10 @@ def visualize_switch_betas(
     plt.tight_layout()
     
     # log to wandb
-    wandb.log({
-        f"switch_betas/step_{gradient_step}": wandb.Image(fig)
-    }, step=gradient_step)
+    if use_wandb:
+        wandb.log({
+            f"switch_betas/step_{gradient_step}": wandb.Image(fig)
+        }, step=gradient_step)
     
     plt.close(fig)
 
@@ -150,7 +153,7 @@ def main(
     num_episodes = int(10e6),
     max_timesteps = 500,
     render_every_eps = 1_000,
-    video_folder = './recordings/',
+    video_folder = None,
     transformer_weights_path: str | None = None,
     meta_controller_weights_path: str | None = None,
     output_meta_controller_path = 'metacontroller_rl_trained.pt',
@@ -236,7 +239,6 @@ def main(
         weights_path = Path(meta_controller_weights_path)
         assert weights_path.exists(), f"meta controller weights not found at {weights_path}"
         meta_controller = MetaController.init_and_load(str(weights_path), strict = False)
-        meta_controller.eval()
 
     meta_controller = default(meta_controller, getattr(model, 'meta_controller', None))
     assert exists(meta_controller), "MetaController must be present for reinforcement learning"
@@ -260,6 +262,9 @@ def main(
     
     print("starting training")
     unwrapped_model.eval()
+    unwrapped_meta_controller.train()
+
+    group_rejections = 0
 
     for gradient_step in pbar:
 
@@ -293,10 +298,17 @@ def main(
             image = state['image']
             image_tensor = torch.from_numpy(image).float().to(accelerator.device)
 
+            # match behavior cloning preprocessing (see train_behavior_clone_babyai.py)
+            image_tensor = torch.clamp(image_tensor / 255.0, min=0.0, max=1.0)
+            mean = torch.tensor([0.485, 0.456, 0.406], device=image_tensor.device)
+            std = torch.tensor([0.229, 0.224, 0.225], device=image_tensor.device)
+            image_tensor = (image_tensor - mean) / std
+
             if use_resnet:
+                # add sequence dimension; keep channels last, TransformerWithResnet.visual_encode handles encoding
                 image_tensor = rearrange(image_tensor, 'b h w c -> b 1 h w c')
-                image_tensor = unwrapped_model.visual_encode(image_tensor)
             else:
+                # flatten spatial and channel dims into a single state vector
                 image_tensor = rearrange(image_tensor, 'b h w c -> b 1 (h w c)')
 
             if torch.is_tensor(past_action_id):
@@ -304,8 +316,8 @@ def main(
 
             with torch.no_grad():
                 logits, cache = unwrapped_model(
-                    image_tensor,
-                    past_action_id,
+                    state=image_tensor,
+                    actions=past_action_id,
                     meta_controller = unwrapped_meta_controller,
                     return_cache = True,
                     return_raw_action_dist = True,
@@ -374,6 +386,7 @@ def main(
 
         if not exists(shaped_rewards):
             accelerator.print(f'group rejected - variance of {cumulative_rewards.var().item():.4f} is lower than threshold of {reject_threshold_cumulative_reward_variance}')
+            group_rejections += 1
             continue
 
         # gather across GPUs if multi-GPU
@@ -393,19 +406,21 @@ def main(
 
         if torch.any(torch.isnan(group_advantages)):
             accelerator.print(f'group rejected - advantages contained NaNs')
+            group_rejections += 1
             continue
 
         # whether to reject group based on switch betas (as it determines the mask for learning)
 
         if should_reject_group_based_on_switch_betas(group_switch_betas, episode_lens):
             accelerator.print(f'group rejected - switch betas for the entire group does not meet criteria for learning')
+            group_rejections += 1
             continue
 
         # learn on this group directly (on-policy GRPO)
 
-        meta_controller.train_internal_rl(eval_rest = True)
+        # meta_controller.train_internal_rl(eval_rest = True)
 
-        loss = meta_controller.policy_loss(
+        loss = unwrapped_meta_controller.policy_loss(
             group_states,
             group_log_probs,
             group_latent_actions,
@@ -421,7 +436,7 @@ def main(
         optim.step()
         optim.zero_grad()
 
-        meta_controller.eval()
+        # meta_controller.eval()
 
         pbar.set_postfix(
             loss = f'{loss.item():.4f}',
@@ -435,8 +450,9 @@ def main(
             'grad_norm': grad_norm.item(),
             'reward': cumulative_rewards.mean().item(),
             'reward_std': cumulative_rewards.std().item(),
-            'switch_density': group_switch_betas.mean().item()
-        })
+            'switch_density': group_switch_betas.mean().item(),
+            'group_rejections': group_rejections
+        }, step=gradient_step)
 
         accelerator.print(f'loss: {loss.item():.4f}, grad_norm: {grad_norm.item():.4f}, reward: {cumulative_rewards.mean().item():.4f}, seeds: {group_seeds}')
 
@@ -448,7 +464,8 @@ def main(
                 switch_betas = group_switch_betas,
                 episode_lens = episode_lens,
                 gradient_step = gradient_step,
-                num_samples = 3
+                num_samples = 3,
+                use_wandb = use_wandb
             )
 
     env.close()

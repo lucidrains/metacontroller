@@ -14,7 +14,7 @@ from torch_einops_utils.save_load import save_load
 
 from memmap_replay_buffer import ReplayBuffer
 
-from einops import rearrange
+from einops import rearrange, repeat
 
 # functions
 
@@ -637,3 +637,25 @@ def test_jax_pytorch_parity():
     assert torch.allclose(pt_out.switch_beta, jax_beta, atol = 1e-6)
     assert torch.allclose(pt_out.gated_action, jax_action, atol = 1e-6)
     assert torch.allclose(pt_out.next_switching_unit_gru_hidden, jax_hidden.unsqueeze(0), atol = 1e-6)
+
+def test_compact_sequence_embedder():
+    from metacontroller.compact_sequence_embedder import CompactSequenceEmbedder
+    
+    dim = 64
+    seq_len = 10
+    batch = 2
+    
+    embedder = CompactSequenceEmbedder(dim = dim)
+    
+    x = torch.randn(batch, seq_len, dim)
+    episode_lens = torch.tensor([5, 10])
+    
+    out = embedder(x, episode_lens = episode_lens)
+    
+    assert out.shape == (batch, seq_len, dim)
+    
+    # manual check: last hidden of first sequence (len 5) should be repeated for out[0]
+    _, h = embedder.gru(x[0:1, :5])
+    expected0 = repeat(h[-1], '1 d -> n d', n = seq_len)
+    
+    assert torch.allclose(out[0], expected0, atol = 1e-6)

@@ -221,9 +221,9 @@ class TransformerWithResnet(Transformer):
 
             self.attn = Encoder(**encoder_kwargs)
 
-    def forward(self, **kwargs):
-        kwargs["state"] = self.visual_encode(kwargs["state"])
-        return super().forward(**kwargs)
+    def forward(self, state, actions = None, **kwargs):
+        state = self.visual_encode(state)
+        return super().forward(state, actions = actions, **kwargs)
 
     def visual_encode(self, x):
         if self.is_channel_last:

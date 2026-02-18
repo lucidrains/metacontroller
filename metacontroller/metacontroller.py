@@ -180,7 +180,8 @@ class BidirectionalSequenceEmbedder(Module):
     def forward(
         self,
         x,
-        mask = None
+        mask = None,
+        **kwargs
     ):
         encoded = self.encoder(x, mask = mask)
 
@@ -203,7 +204,8 @@ class CausalSequenceEmbedder(Module):
     def forward(
         self,
         x,
-        mask = None
+        mask = None,
+        **kwargs
     ):
         return self.decoder(x, mask = mask)
 
@@ -618,7 +620,11 @@ class MetaController(Module):
 
             mask = maybe(lens_to_mask)(episode_lens, meta_embed.shape[1])
 
-            encoded_residual_stream = self.internal_sequence_embedder(residual_stream, mask = mask)
+            kwargs = dict()
+            if exists(episode_lens):
+                kwargs['episode_lens'] = episode_lens
+
+            encoded_residual_stream = self.internal_sequence_embedder(residual_stream, mask = mask, **kwargs)
 
             summarized_sequence_embed = self.to_sequence_summary_embed(encoded_residual_stream)
 
@@ -660,7 +666,9 @@ class MetaController(Module):
 
         z_prev = gated_prev_latent
 
-        if seq_len > 1 and not (exists(ablate_switch_beta) or exists(switch_beta_frequency)):
+        is_ablating_switch = exists(ablate_switch_beta) or exists(switch_beta_frequency)
+
+        if seq_len > 1 and not is_ablating_switch:
 
             # resolve hard switch
 
@@ -690,7 +698,7 @@ class MetaController(Module):
             if exists(switch_beta_frequency):
                 ablate_switch_beta = self.create_regular_switch_beta(batch, seq_len, switch_beta_frequency, offset = ablate_offset, device = device)
 
-            if exists(ablate_switch_beta):
+            if is_ablating_switch:
                 switch_beta = ablate_switch_beta
 
                 if switch_beta.ndim == 1:
@@ -904,7 +912,11 @@ class Transformer(Module):
         if not exists(self.meta_controller):
             return
 
-        self.meta_controller.maybe_increment_kl_loss_step()
+        m = self.meta_controller
+        if hasattr(m, 'module'):
+            m = m.module
+
+        m.maybe_increment_kl_loss_step()
 
     def meta_controller_reset_kl_loss_warmup(self):
         if not exists(self.meta_controller):
