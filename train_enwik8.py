@@ -1,6 +1,8 @@
+from __future__ import annotations
 # /// script
 # dependencies = [
-#   "metacontroller-pytorch>=0.2.17",
+#   "metacontroller-pytorch>=0.2.18",
+#   "transformers",
 #   "accelerate",
 #   "fire",
 #   "torch",
@@ -32,6 +34,8 @@ from einops import rearrange
 
 from metacontroller import MetaController, Transformer, binary_entropy
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
+
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 # helpers
 
@@ -77,6 +81,62 @@ def visualize_segments(
         segments.append(decode_tokens(curr_segment))
 
     return delimiter.join(segments)
+
+# sentiment rewarding
+
+SENTIMENT_MODEL_NAME = "arnabdhar/tinybert-imdb"
+
+def sentiment_rewarding(
+    texts: list[str],
+    batch_size: int = 32,
+    device: str | None = None
+) -> list[float]:
+    """
+    Computes sentiment scores for a list of strings using the smallest transformer model (BERT-Tiny).
+    Returns a list of floats representing the probability of the sentiment being POSITIVE.
+    """
+    if not texts:
+        return []
+
+    # Determine device
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    
+    device = torch.device(device)
+
+    # Load tokenizer and model
+    tokenizer = AutoTokenizer.from_pretrained(SENTIMENT_MODEL_NAME)
+    model = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL_NAME)
+    model.to(device)
+    model.eval()
+
+    results = []
+
+    # Process in batches
+    with torch.no_grad():
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i : i + batch_size]
+            
+            # Tokenize and move to device
+            inputs = tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                return_tensors="pt"
+            ).to(device)
+
+            # Forward pass
+            outputs = model(**inputs)
+            
+            # Get probabilities via softmax
+            # Label 0: NEGATIVE, Label 1: POSITIVE
+            probs = torch.softmax(outputs.logits, dim=-1)
+            
+            # Extract probability for POSITIVE (index 1)
+            positive_probs = probs[:, 1].tolist()
+            results.extend(positive_probs)
+
+    return results
 
 # sampling
 
