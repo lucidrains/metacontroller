@@ -604,43 +604,36 @@ def test_sequential_selection_parallel_vs_iterative():
     assert torch.allclose(mc_out_parallel.switch_beta, iter_switch_beta, atol = 1e-5), \
         f'switch beta mismatch: max diff = {(mc_out_parallel.switch_beta - iter_switch_beta).abs().max().item()}'
 
-def test_jax_sequential_selection_gpu_parity():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    
-    from metacontroller.sequential_selection import HAS_JAX, perform_sequential_selection, pytorch_sequential_selection
+def test_jax_pytorch_parity():
+    from metacontroller.sequential_action_selection import (
+        pytorch_sequential_action_selection,
+        torch_jax_sequential_selection,
+        HAS_JAX
+    )
     
     if not HAS_JAX:
         pytest.skip("JAX not installed")
 
-    device = torch.device('cuda')
-    dim_model = 64
-    dim_meta = 32
-    dim_latent = 16
-    seq_len = 8
-    batch = 2
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dim_model, dim_meta, dim_latent, seq_len, batch = 64, 32, 16, 8, 2
 
     gru = nn.GRU(dim_model + dim_meta + dim_latent, dim_meta, batch_first=True).to(device)
-    to_beta = nn.Linear(dim_meta, 1).to(device)
+    to_beta = nn.Linear(dim_meta, 1, bias = False).to(device)
 
-    rs = torch.randn(batch, seq_len, dim_model, device=device)
-    me = torch.randn(batch, seq_len, dim_meta, device=device)
-    sla = torch.randn(batch, seq_len, dim_latent, device=device)
-    h0 = torch.randn(1, batch, dim_meta, device=device)
-    z0 = torch.randn(batch, 1, dim_latent, device=device)
-    sz0 = torch.randn(batch, 1, dim_latent, device=device)
+    rs = torch.randn(batch, seq_len, dim_model, device = device)
+    me = torch.randn(batch, seq_len, dim_meta, device = device)
+    sla = torch.randn(batch, seq_len, dim_latent, device = device)
+    h0 = torch.randn(1, batch, dim_meta, device = device)
+    z0 = torch.randn(batch, 1, dim_latent, device = device)
     
-    temp = 1.0
-    hard = False
-
-    # 1. Reference (PyTorch)
     with torch.no_grad():
-        pytorch_out = pytorch_sequential_selection(gru, to_beta, rs, me, sla, h0, z0, sz0, temp, hard)
-    
-    # 2. Dispatcher (Should hit JAX)
-    with torch.no_grad():
-        dispatch_out = perform_sequential_selection(gru, to_beta, rs, me, sla, h0, z0, sz0, temp, hard)
+        pt_out = pytorch_sequential_action_selection(gru, to_beta, rs, me, sla, h0, z0, 1.0, False)
+        
+        jax_beta, jax_action, jax_hidden = torch_jax_sequential_selection(
+            gru.weight_ih_l0, gru.weight_hh_l0, gru.bias_ih_l0, gru.bias_hh_l0,
+            to_beta.weight, to_beta.bias, rs, me, sla, h0.squeeze(0), z0.squeeze(1), 1.0, False
+        )
 
-    assert torch.allclose(pytorch_out.switch_beta, dispatch_out.switch_beta, atol=1e-5)
-    assert torch.allclose(pytorch_out.gated_action, dispatch_out.gated_action, atol=1e-5)
-    assert torch.allclose(pytorch_out.next_switching_unit_gru_hidden, dispatch_out.next_switching_unit_gru_hidden, atol=1e-5)
+    assert torch.allclose(pt_out.switch_beta, jax_beta, atol = 1e-6)
+    assert torch.allclose(pt_out.gated_action, jax_action, atol = 1e-6)
+    assert torch.allclose(pt_out.next_switching_unit_gru_hidden, jax_hidden.unsqueeze(0), atol = 1e-6)
