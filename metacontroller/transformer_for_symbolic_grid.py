@@ -59,13 +59,17 @@ class SpatialProcessor(Module):
         for _ in range(depth):
             self.layers.append(ConvNextBlock(dim, kernel_size = kernel_size))
 
+        self.norm = nn.LayerNorm(dim, bias = False)
+
     def forward(self, x):
         # x: (batch, time, width, height, dim)
         batch, time, width, height, dim = x.shape
         x = rearrange(x, 'b t w h d -> (b t) d w h')
         for layer in self.layers:
             x = layer(x)
-        return rearrange(x, '(b t) d w h -> b t w h d', b = batch, t = time)
+
+        x = rearrange(x, '(b t) d w h -> b t w h d', b = batch, t = time)
+        return self.norm(x)
 
 # wrapped readout for spatial projection
 
