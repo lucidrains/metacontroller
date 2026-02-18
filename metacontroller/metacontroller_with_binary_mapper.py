@@ -526,6 +526,10 @@ class MetaControllerWithBinaryMapper(Module):
             next_switch_gated_codes
         )
 
+        if discovery_phase:
+            kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.
+            kl_loss = kl_loss * kl_loss_weight
+
         return control_signal, MetaControllerOutput(next_hiddens, residual_stream, binary_logits, sampled_codes, switch_beta, kl_loss, kl_loss_weight if discovery_phase else self.zero, aux_ratio_loss)
 
 MetaControllerWithBinaryMapper.policy_loss = policy_loss
