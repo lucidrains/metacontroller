@@ -6,10 +6,12 @@ from __future__ import annotations
 #   "accelerate",
 #   "fire",
 #   "torch",
+#   "torch-einops-utils>=0.0.30",  
 #   "einops",
 #   "tqdm",
 #   "numpy",
-#   "jax"
+#   "jax[cuda12]",
+#   "wandb"
 # ]
 # ///
 
@@ -33,6 +35,7 @@ from accelerate import Accelerator
 from einops import rearrange
 
 from metacontroller import MetaController, Transformer, binary_entropy
+from metacontroller.metacontroller import extract_grpo_data, z_score
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -82,63 +85,47 @@ def visualize_segments(
 
     return delimiter.join(segments)
 
+# exclamation rewarding
+
+class ExclamationRewarder:
+    def __init__(self, cap = 10):
+        self.cap = cap
+
+    def __call__(self, texts: list[str], batch_size = 32) -> list[float]:
+        return [float(min(self.cap, text.count('!'))) for text in texts]
+
 # sentiment rewarding
 
 SENTIMENT_MODEL_NAME = "arnabdhar/tinybert-imdb"
 
-def sentiment_rewarding(
-    texts: list[str],
-    batch_size: int = 32,
-    device: str | None = None
-) -> list[float]:
-    """
-    Computes sentiment scores for a list of strings using the smallest transformer model (BERT-Tiny).
-    Returns a list of floats representing the probability of the sentiment being POSITIVE.
-    """
-    if not texts:
-        return []
+class SentimentRewarder:
+    def __init__(self, device: str | None = None):
+        self.device = device
+        self.tokenizer = AutoTokenizer.from_pretrained(SENTIMENT_MODEL_NAME)
+        self.model = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL_NAME)
+        self.model.to(device)
+        self.model.eval()
 
-    # Determine device
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    
-    device = torch.device(device)
-
-    # Load tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(SENTIMENT_MODEL_NAME)
-    model = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL_NAME)
-    model.to(device)
-    model.eval()
-
-    results = []
-
-    # Process in batches
-    with torch.no_grad():
+    @torch.no_grad()
+    def __call__(self, texts: list[str], batch_size = 32) -> list[float]:
+        results = []
         for i in range(0, len(texts), batch_size):
             batch_texts = texts[i : i + batch_size]
-            
-            # Tokenize and move to device
-            inputs = tokenizer(
+            inputs = self.tokenizer(
                 batch_texts,
-                padding=True,
-                truncation=True,
-                return_tensors="pt"
-            ).to(device)
+                padding = True,
+                truncation = True,
+                return_tensors = "pt"
+            ).to(self.device)
 
-            # Forward pass
-            outputs = model(**inputs)
-            
-            # Get probabilities via softmax
-            # Label 0: NEGATIVE, Label 1: POSITIVE
-            probs = torch.softmax(outputs.logits, dim=-1)
-            
-            # Extract probability for POSITIVE (index 1)
-            positive_probs = probs[:, 1].tolist()
-            results.extend(positive_probs)
+            outputs = self.model(**inputs)
+            probs = torch.softmax(outputs.logits, dim = -1)
+            results.extend(probs[:, 1].tolist())
 
-    return results
+        return results
 
 # sampling
+
 
 @torch.no_grad()
 def sample(
@@ -165,12 +152,12 @@ def sample(
         meta_controller = meta_controller
     )
 
-    next_action = next_state = model.action_readout.sample(action_dist[:, -1:], temperature = temperature)
+    actual_model = getattr(model, 'model', model)
+    next_action = next_state = actual_model.action_readout.sample(action_dist[:, -1:], temperature = temperature)
 
     state = torch.cat((state, next_state), dim = -1)
 
     for _ in range(sample_num_times):
-
         (action_dist, _), next_cache = model(
             state = state[:, -1:],
             actions = state[:, -1:],
@@ -180,7 +167,7 @@ def sample(
             meta_controller = meta_controller
         )
 
-        next_state = model.action_readout.sample(action_dist[:, -1:], temperature = temperature)
+        next_state = actual_model.action_readout.sample(action_dist[:, -1:], temperature = temperature)
 
         state = torch.cat((state, next_state), dim = -1)
 
@@ -227,8 +214,8 @@ def train(
     ratio_loss_final_weight = 0.5,
     validate_every = 100,
     generate_every = 250,
-    prime_length = 128,
-    generate_length = 512,
+    prime_length = 16,
+    generate_length = 160,
     seq_len = 128,
     dim = 512,
     dim_meta_controller = 128,
@@ -239,7 +226,7 @@ def train(
     hypernetwork_low_rank = 8,
     target_temporal_segment_len = 8,
     use_binary_mapper = True,
-    dim_code_bits = 4,
+    dim_code_bits = 8,
     kl_loss_threshold = 0.1,
     switch_temperature = 0.1,
     discovery_phase = False,
@@ -247,10 +234,25 @@ def train(
     cpu = False,
     checkpoint_path = './results-enwik8/train-enwik8.pt',
     enwik8_path = './data/enwik8.gz',
+    grpo_phase = False,
+    num_grpo_batches = 1000,
+    grpo_group_size = 32,
+    grpo_learning_rate = 1e-5,
+    grpo_reward_var_threshold = 0.0,
+    grpo_hard_switch = True,
+    grpo_reward_type = 'exclamation',
+    evo_phase = False,
+    num_evo_generations = 50,
+    evo_population_size = 32,
+    evo_noise_std = 0.02,
 ):
     # accelerator
 
     accelerator = Accelerator(cpu = cpu)
+
+    if (grpo_phase or evo_phase) and accelerator.is_main_process:
+        import wandb
+        wandb.init(project="metacontroller-enwik8", name="grpo_exclamation" if grpo_phase else "evo_exclamation")
 
     # ensure checkpoint directory exists
 
@@ -278,13 +280,23 @@ Model Dim:          {dim}
 MC Dim:             {dim_meta_controller}
 Latent Dim:         {dim_latent}
 Disc Hard Switch:   {discovery_hard_switch}
-Binary Mapper:      True (bits: {dim_code_bits} temp: {switch_temperature})
+Binary Mapper:      {use_binary_mapper} (bits: {dim_code_bits} temp: {switch_temperature})
 Depth:              {depth}
 Heads:              {heads}
 Target Seg Len:     {target_temporal_segment_len}
 Hypernet Rank:      {hypernetwork_low_rank}
 Warmup Steps:       {discovery_warmup_steps}
 Checkpoint Path:    {checkpoint_path}
+GRPO Phase:         {grpo_phase}
+GRPO Batches:       {num_grpo_batches}
+GRPO Group Size:    {grpo_group_size}
+GRPO Learning Rate: {grpo_learning_rate}
+GRPO Hard Switch:   {grpo_hard_switch}
+GRPO Reward Type:   {grpo_reward_type}
+EVO Phase:          {evo_phase}
+EVO Generations:    {num_evo_generations}
+EVO Population:     {evo_population_size}
+EVO Noise Std:      {evo_noise_std}
 {'='*50}
 """)
 
@@ -309,7 +321,8 @@ Checkpoint Path:    {checkpoint_path}
     # model
 
     if not use_binary_mapper:
-        meta_controller = MetaController(
+        meta_controller_klass = MetaController
+        meta_controller_kwargs = dict(
             dim_model = dim,
             dim_meta_controller = dim_meta_controller,
             dim_latent = dim_latent,
@@ -324,7 +337,8 @@ Checkpoint Path:    {checkpoint_path}
             hard_switch = discovery_hard_switch
         )
     else:
-        meta_controller = MetaControllerWithBinaryMapper(
+        meta_controller_klass = MetaControllerWithBinaryMapper
+        meta_controller_kwargs = dict(
             dim_model = dim,
             dim_meta_controller = dim_meta_controller,
             dim_code_bits = dim_code_bits,
@@ -341,7 +355,9 @@ Checkpoint Path:    {checkpoint_path}
             hard_switch = discovery_hard_switch
         )
 
-    model = Transformer(
+    meta_controller = meta_controller_klass(**meta_controller_kwargs)
+
+    model_kwargs = dict(
         dim = dim,
         state_embed_readout = dict(num_discrete = 256),
         action_embed_readout = dict(num_discrete = 256),
@@ -350,15 +366,37 @@ Checkpoint Path:    {checkpoint_path}
         meta_controller = None
     )
 
-    # load checkpoint if it exists or if we are in discovery phase
+    model = Transformer(**model_kwargs)
 
-    if discovery_phase or Path(checkpoint_path).exists():
+    # load checkpoint if it exists or if we are in discovery phase or grpo phase
+
+    if grpo_phase or evo_phase:
+        discovery_checkpoint_path = str(Path(checkpoint_path).with_stem(f"{Path(checkpoint_path).stem}-discovery"))
+        
+        load_path = discovery_checkpoint_path
+            
+        if exists(load_path):
+            accelerator.print(f"loading meta controller checkpoint from {load_path}")
+            meta_controller = meta_controller_klass.init_and_load(load_path, strict = False)
+        else:
+            accelerator.print(f"error: refinement phase requested but no base checkpoint found")
+            return
+        
+        # for backbone, if loading from discovery, we might want to also load the backbone that was saved at discovery end
+        # (though currently discovery only saves mc, but it's safer to check)
+        
+        if Path(checkpoint_path).exists():
+            accelerator.print(f"loading backbone checkpoint from {checkpoint_path}")
+            model = Transformer.init_and_load(checkpoint_path, strict = False)
+
+    elif discovery_phase or Path(checkpoint_path).exists():
         if Path(checkpoint_path).exists():
             accelerator.print(f"loading checkpoint from {checkpoint_path}")
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.load(checkpoint_path, strict = False)
+            model = Transformer.init_and_load(checkpoint_path, strict = False)
         elif discovery_phase:
             accelerator.print(f"warning: discovery phase requested but {checkpoint_path} not found. training from scratch.")
+
+    model.meta_controller = meta_controller
 
     # optimizer
 
@@ -366,8 +404,10 @@ Checkpoint Path:    {checkpoint_path}
 
     discovery_optim = AdamW(meta_controller.discovery_parameters(), lr = discovery_learning_rate)
 
-    model, meta_controller, bc_optim, discovery_optim, train_loader, val_loader = accelerator.prepare(
-        model, meta_controller, bc_optim, discovery_optim, train_loader, val_loader
+    grpo_optim = AdamW(meta_controller.internal_rl_parameters(), lr = grpo_learning_rate)
+
+    model, meta_controller, bc_optim, discovery_optim, grpo_optim, train_loader, val_loader = accelerator.prepare(
+        model, meta_controller, bc_optim, discovery_optim, grpo_optim, train_loader, val_loader
     )
 
     train_loader = cycle(train_loader)
@@ -407,6 +447,214 @@ Checkpoint Path:    {checkpoint_path}
             accelerator.print(f"initial ablated discovery loss: {state_recon_loss.item() + action_recon_loss.item():.3f} (state: {state_recon_loss.item():.3f} action: {action_recon_loss.item():.3f})\n")
 
     # training
+
+    if grpo_phase:
+        if grpo_reward_type == 'sentiment':
+            rewarder = SentimentRewarder(device = accelerator.device)
+        else:
+            rewarder = ExclamationRewarder()
+        
+        # validation sanity check from discovery checkpoint
+
+        model.eval()
+        with torch.no_grad():
+            valid_data = next(val_loader)
+            state = valid_data[:, :-1]
+            actions = valid_data[:, 1:]
+            
+            outputs = model(
+                state = state,
+                actions = actions,
+                discovery_phase = True,
+                return_meta_controller_output = True,
+                meta_controller = meta_controller
+            )
+            
+            discovery_losses, meta_output = outputs
+            
+            segmented_str = visualize_segments(valid_data[0], meta_output.switch_beta[0], threshold = 0.5)
+            accelerator.print(f"\n\n[GRPO START VALIDATION] SEGMENTED: {segmented_str}\n")
+
+        pbar = tqdm.tqdm(total = num_grpo_batches, mininterval = 10.0, desc = "grpo")
+        i = 0
+
+        while i < num_grpo_batches:
+            model.eval()
+            meta_controller.train_internal_rl()
+
+            # 1. Sample prompt
+            data = next(train_loader)
+            prompt = data[0:1, :prime_length] # (1, prime_length)
+            prompt = prompt.to(accelerator.device).repeat(grpo_group_size, 1)
+
+            prompt_seq_len = prompt.shape[-1]
+            sample_num_times = max(2, generate_length - prompt_seq_len)
+
+            state = prompt
+            action = prompt[:, 1:]
+
+            with torch.no_grad():
+                out, cache = model(
+                    state = state,
+                    actions = action,
+                    return_cache = True,
+                    force_behavior_cloning = False,
+                    meta_controller = meta_controller,
+                    hard_switch = grpo_hard_switch
+                )
+                action_dist = out[0] if isinstance(out, tuple) else out
+
+                next_state = model.action_readout.sample(action_dist[:, -1:], temperature = 1.)
+                state = torch.cat((state, next_state), dim = -1)
+
+                grpo_data_list = []
+
+                for _ in range(sample_num_times - 1):
+                    out, next_cache = model(
+                        state = state[:, -1:],
+                        actions = state[:, -1:],
+                        cache = cache,
+                        return_cache = True,
+                        force_behavior_cloning = False,
+                        meta_controller = meta_controller,
+                        hard_switch = grpo_hard_switch
+                    )
+                    action_dist = out[0] if isinstance(out, tuple) else out
+
+                    grpo_data_list.append(extract_grpo_data(meta_controller, next_cache))
+
+                    next_state = model.action_readout.sample(action_dist[:, -1:], temperature = 1.)
+                    state = torch.cat((state, next_state), dim = -1)
+                    cache = next_cache
+
+            # Extract generated text and calculate reward
+            generated = state[:, prompt_seq_len:]
+            texts = [decode_tokens(t.tolist()) for t in generated]
+
+            rewards = rewarder(texts, batch_size = grpo_group_size)
+            rewards_tensor = torch.tensor(rewards, device = accelerator.device, dtype = torch.float32)
+
+            reward_var = rewards_tensor.var()
+            if reward_var <= grpo_reward_var_threshold:
+                continue
+
+            advantages = z_score(rewards_tensor)
+
+            # Grpo tensors
+            states, actions, log_probs, switch_betas = zip(*grpo_data_list)
+            group_states = torch.cat(states, dim = 1) # (G, T, D)
+            group_actions = torch.cat(actions, dim = 1) # (G, T, D_latent)
+            group_log_probs = torch.cat(log_probs, dim = 1) # (G, T, D_latent)
+            group_switch_betas = torch.cat(switch_betas, dim = 1) # (G, T)
+
+            # Policy loss
+            loss = meta_controller.policy_loss(
+                state = group_states,
+                old_log_probs = group_log_probs,
+                actions = group_actions,
+                advantages = advantages,
+                mask = (group_switch_betas > 0.5)
+            )
+
+            accelerator.backward(loss)
+            accelerator.clip_grad_norm_(meta_controller.parameters(), 0.5)
+            grpo_optim.step()
+            grpo_optim.zero_grad()
+
+            mean_reward = rewards_tensor.mean().item()
+            max_reward = rewards_tensor.max().item()
+            loss_val = loss.item()
+
+            if accelerator.is_main_process:
+                import wandb
+                if exists(wandb.run):
+                    log_dict = {'grpo_loss': loss_val, 'mean_reward': mean_reward, 'max_reward': max_reward, 'reward_var': reward_var.item()}
+                    
+                    if divisible_by(i, generate_every):
+                        table = wandb.Table(columns=["Prompt", "Generated", "Reward"])
+                        table.add_data(decode_tokens(prompt[0].tolist()), texts[0], rewards[0])
+                        log_dict['samples'] = table
+                    
+                    wandb.log(log_dict)
+
+            if divisible_by(i, 10):
+                pbar.set_postfix(loss = f"{loss_val:.3f}", reward = f"{mean_reward:.3f}")
+                tqdm.tqdm.write(f"{i}: loss: {loss_val:.3f} reward: {mean_reward:.3f} max: {max_reward:.3f}")
+
+            if divisible_by(i, generate_every):
+                accelerator.print(f"\nPROMPT: {decode_tokens(prompt[0].tolist())}")
+                accelerator.print(f"GENERATED ({rewards[0]:.3f}): {decode_tokens(generated[0].tolist())}\n")
+
+            i += 1
+            pbar.update(1)
+
+        # Save GRPO checkpoint
+        grpo_checkpoint_path = str(Path(checkpoint_path).with_stem(f"{Path(checkpoint_path).stem}-grpo"))
+        accelerator.print(f"saving GRPO checkpoint (metacontroller only) to {grpo_checkpoint_path}")
+        accelerator.wait_for_everyone()
+        unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
+        unwrapped_meta_controller.save(grpo_checkpoint_path)
+        if not evo_phase:
+            return
+
+    if evo_phase:
+        if grpo_reward_type == 'sentiment':
+            rewarder = SentimentRewarder(device = accelerator.device)
+        else:
+            rewarder = ExclamationRewarder()
+
+        @torch.no_grad()
+        def sentiment_env(transformer):
+            transformer.eval()
+            
+            # handle x_evolution Noisable wrapper
+            mc = getattr(transformer, 'meta_controller', None)
+            if not exists(mc):
+                mc = transformer.model.meta_controller
+
+            mc.train_internal_rl()
+
+            num_eval_samples = 8
+            data = next(train_loader)
+            prompt = data[:num_eval_samples, :prime_length]
+            prompt = prompt.to(accelerator.device)
+
+            generated = sample(
+                transformer,
+                prompt = prompt,
+                seq_len = generate_length,
+                meta_controller = mc
+            )
+
+            texts = [decode_tokens(t.tolist()) for t in generated]
+            rewards = rewarder(texts, batch_size = num_eval_samples)
+            
+            fitness = np.mean(rewards)
+            
+            if accelerator.is_main_process:
+                import wandb
+                if exists(wandb.run):
+                    wandb.log({'evo_fitness': fitness})
+
+            return fitness
+
+        accelerator.print(f"starting ES optimization for {num_evo_generations} generations...")
+        
+        model.meta_controller = meta_controller
+        
+        model.evolve(
+            num_generations = num_evo_generations,
+            environment = sentiment_env,
+            noise_population_size = evo_population_size,
+            noise_scale = evo_noise_std
+        )
+
+        evo_checkpoint_path = str(Path(checkpoint_path).with_stem(f"{Path(checkpoint_path).stem}-evo"))
+        accelerator.print(f"saving ES checkpoint (metacontroller only) to {evo_checkpoint_path}")
+        accelerator.wait_for_everyone()
+        unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
+        unwrapped_meta_controller.save(evo_checkpoint_path)
+        return
 
     start_step = num_bc_batches if discovery_phase else 0
     total_steps = num_bc_batches + num_discovery_batches
@@ -572,6 +820,9 @@ Checkpoint Path:    {checkpoint_path}
         accelerator.wait_for_everyone()
         unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
         unwrapped_meta_controller.save(discovery_checkpoint_path)
+
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.save(checkpoint_path)
 
 if __name__ == '__main__':
     fire.Fire(train)

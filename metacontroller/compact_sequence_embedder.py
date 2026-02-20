@@ -8,7 +8,7 @@ from einops import repeat
 def exists(v):
     return v is not None
 
-@save_load()
+@save_load
 class CompactSequenceEmbedder(Module):
     def __init__(
         self,

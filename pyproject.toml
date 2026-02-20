@@ -1,6 +1,6 @@
 [project]
 name = "metacontroller-pytorch"
-version = "0.2.21"
+version = "0.2.22"
 description = "Transformer Metacontroller"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -31,7 +31,7 @@ dependencies = [
     "loguru",
     "memmap-replay-buffer>=0.0.25",
     "torch>=2.5",
-    "torch-einops-utils>=0.0.29",
+    "torch-einops-utils>=0.0.30",
     "vector-quantize-pytorch>=1.27.20",
     "x-evolution>=0.1.23",
     "x-mlps-pytorch",

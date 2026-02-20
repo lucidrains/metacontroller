@@ -71,7 +71,7 @@ def straight_through(src, tgt):
 # action proposer wrapper
 # normalizes any action proposer to a standard interface for MetaController
 
-@save_load()
+@save_load
 class ActionProposerWrapper(Module):
     def __init__(
         self,
@@ -165,7 +165,7 @@ class LossNormalizer(Module):
 
 # meta controller classes
 
-@save_load()
+@save_load
 class BidirectionalSequenceEmbedder(Module):
     def __init__(
         self,
@@ -191,7 +191,7 @@ class BidirectionalSequenceEmbedder(Module):
         mean_pooled = masked_mean(encoded, mask, dim = 1)
         return repeat(mean_pooled, 'b d -> b n d', n = x.shape[1])
 
-@save_load()
+@save_load
 class CausalSequenceEmbedder(Module):
     def __init__(
         self,
@@ -334,7 +334,7 @@ def extract_grpo_data(meta_controller, transformer_output):
 
     return GRPOOutput(state, action, log_prob, switch_beta)
 
-@save_load()
+@save_load
 class MetaController(Module):
     def __init__(
         self,
@@ -822,7 +822,7 @@ TransformerOutput = namedtuple('TransformerOutput', (
     'cache_steps'
 ))
 
-@save_load()
+@save_load
 class Transformer(Module):
     def __init__(
         self,
@@ -1037,8 +1037,10 @@ class Transformer(Module):
         control_signal_multiplier = 1.,
         ablate_switch_beta: Tensor | None = None,
         switch_beta_frequency: int | None = None,
-        update_loss_ema: bool | None = None
+        update_loss_ema: bool | None = None,
+        hard_switch: bool | None = None
     ):
+
         device = state.device
 
         # meta controller is either given or already given at init
@@ -1147,7 +1149,8 @@ class Transformer(Module):
                     episode_lens = episode_lens,
                     ablate_switch_beta = ablate_switch_beta,
                     switch_beta_frequency = switch_beta_frequency,
-                    ablate_offset = cache_steps
+                    ablate_offset = cache_steps,
+                    hard_switch = hard_switch
                 )
             else:
                 control_signal, next_meta_hiddens = self.zero, None

@@ -59,7 +59,7 @@ def log(t, eps = 1e-20):
 
 # meta controller classes
 
-@save_load()
+@save_load
 class GRUSwitchingUnit(Module):
     def __init__(
         self,
@@ -90,7 +90,7 @@ class GRUSwitchingUnit(Module):
         
         return beta, next_hidden
 
-@save_load()
+@save_load
 class MetaControllerWithBinaryMapper(Module):
     def __init__(
         self,

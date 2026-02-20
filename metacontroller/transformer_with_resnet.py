@@ -188,7 +188,7 @@ def resnet50(num_classes = 1000, use_layernorm = False):
 
 # transformer with resnet
 
-@save_load()
+@save_load
 class TransformerWithResnet(Transformer):
     def __init__(
         self,
