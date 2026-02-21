@@ -148,7 +148,6 @@ def sample(
         actions = action,
         return_cache = True,
         return_state_action_cache = True,
-        force_behavior_cloning = True,
         meta_controller = meta_controller
     )
 
@@ -163,7 +162,6 @@ def sample(
             actions = state[:, -1:],
             cache = cache,
             return_state_action_cache = True,
-            force_behavior_cloning = True,
             meta_controller = meta_controller
         )
 
