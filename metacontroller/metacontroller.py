@@ -242,7 +242,7 @@ def policy_loss(
     advantages,
     mask = None,
     episode_lens = None,
-    eps_clip = 0.2,
+    eps_clip: float | tuple[float, float] = 0.2,
     switch_beta_frequency: int | None = None
 ):
     if exists(switch_beta_frequency):
@@ -270,7 +270,14 @@ def policy_loss(
     # ppo surrogate loss
 
     surr1 = ratio * advantages
-    surr2 = ratio.clamp(1 - eps_clip, 1 + eps_clip) * advantages
+
+    if isinstance(eps_clip, (float, int)):
+        eps_clip = (eps_clip, eps_clip)
+
+    eps_lower, eps_upper = eps_clip
+    ratio_clip = ratio.clamp(1 - eps_lower, 1 + eps_upper)
+
+    surr2 = ratio_clip * advantages
 
     losses = -torch.min(surr1, surr2)
 
