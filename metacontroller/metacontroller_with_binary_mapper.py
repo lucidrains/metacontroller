@@ -16,7 +16,7 @@ from torch.nn.functional import cosine_similarity, sigmoid
 # einops
 
 import einx
-from einops import einsum, rearrange, repeat
+from einops import einsum, rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 
 # external modules
@@ -500,14 +500,16 @@ class MetaControllerWithBinaryMapper(Module):
         # losses
 
         if discovery_phase:
-            kl_loss = self.calculate_kl_loss(binary_logits)
-            kl_loss = masked_mean(kl_loss, mask)
-
             kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.
-            kl_loss = kl_loss * kl_loss_weight
 
+            if kl_loss.ndim == 3:
+                kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
+
+            kl_loss = masked_mean(kl_loss, mask)
+            kl_loss = kl_loss * kl_loss_weight
         else:
             kl_loss = self.zero
+            kl_loss_weight = self.zero
 
         decoder_out = self.decoder(gated_codes)
 
@@ -542,11 +544,7 @@ class MetaControllerWithBinaryMapper(Module):
             next_switch_gated_codes
         )
 
-        if discovery_phase:
-            kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.
-            kl_loss = kl_loss * kl_loss_weight
-
-        return control_signal, MetaControllerOutput(next_hiddens, residual_stream, binary_logits, sampled_codes, switch_beta, kl_loss, kl_loss_weight if discovery_phase else self.zero, aux_ratio_loss)
+        return control_signal, MetaControllerOutput(next_hiddens, residual_stream, binary_logits, sampled_codes, switch_beta, kl_loss, kl_loss_weight, aux_ratio_loss)
 
 MetaControllerWithBinaryMapper.policy_loss = policy_loss
 MetaControllerWithBinaryMapper.ratio_loss = ratio_loss
