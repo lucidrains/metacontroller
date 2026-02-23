@@ -59,7 +59,7 @@ def log(t, eps = 1e-20):
 
 # meta controller classes
 
-@save_load
+@save_load()
 class GRUSwitchingUnit(Module):
     def __init__(
         self,
@@ -90,7 +90,7 @@ class GRUSwitchingUnit(Module):
         
         return beta, next_hidden
 
-@save_load
+@save_load()
 class MetaControllerWithBinaryMapper(Module):
     def __init__(
         self,
@@ -294,11 +294,26 @@ class MetaControllerWithBinaryMapper(Module):
 
     def get_action_dist_for_internal_rl(
         self,
-        residual_stream
+        residual_stream,
+        return_kl_loss = False
     ):
         proposed_action_hidden, _ = self.action_proposer(residual_stream)
 
-        return self.proposer_to_binary_logits(proposed_action_hidden)
+        logits = self.proposer_to_binary_logits(proposed_action_hidden)
+
+        if not return_kl_loss:
+            return logits
+
+        return logits, self.calculate_kl_loss(logits)
+
+    def calculate_kl_loss(
+        self,
+        binary_logits
+    ):
+        # hack for now, need to fix binary mapper upstream at vq-pytorch
+
+        _, kl_loss = self.binary_mapper(binary_logits, reduce_aux_kl_loss = False)
+        return kl_loss
 
     def log_prob(
         self,
@@ -485,6 +500,7 @@ class MetaControllerWithBinaryMapper(Module):
         # losses
 
         if discovery_phase:
+            kl_loss = self.calculate_kl_loss(binary_logits)
             kl_loss = masked_mean(kl_loss, mask)
 
             kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.

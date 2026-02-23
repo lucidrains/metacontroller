@@ -71,7 +71,7 @@ def straight_through(src, tgt):
 # action proposer wrapper
 # normalizes any action proposer to a standard interface for MetaController
 
-@save_load
+@save_load()
 class ActionProposerWrapper(Module):
     def __init__(
         self,
@@ -165,7 +165,7 @@ class LossNormalizer(Module):
 
 # meta controller classes
 
-@save_load
+@save_load()
 class BidirectionalSequenceEmbedder(Module):
     def __init__(
         self,
@@ -191,7 +191,7 @@ class BidirectionalSequenceEmbedder(Module):
         mean_pooled = masked_mean(encoded, mask, dim = 1)
         return repeat(mean_pooled, 'b d -> b n d', n = x.shape[1])
 
-@save_load
+@save_load()
 class CausalSequenceEmbedder(Module):
     def __init__(
         self,
@@ -243,7 +243,9 @@ def policy_loss(
     mask = None,
     episode_lens = None,
     eps_clip: float | tuple[float, float] = 0.2,
-    switch_beta_frequency: int | None = None
+    switch_beta_frequency: int | None = None,
+    return_kl_loss = False,
+    kl_loss_weight = 0.
 ):
     if exists(switch_beta_frequency):
         batch, seq_len = state.shape[:2]
@@ -256,7 +258,13 @@ def policy_loss(
 
     # get new log probs
 
-    action_dist = meta_controller.get_action_dist_for_internal_rl(state)
+    action_dist_out = meta_controller.get_action_dist_for_internal_rl(state, return_kl_loss = return_kl_loss)
+
+    if return_kl_loss:
+        action_dist, kl_loss = action_dist_out
+    else:
+        action_dist = action_dist_out
+
     new_log_probs = meta_controller.log_prob(action_dist, actions)
 
     # calculate ratio
@@ -292,7 +300,17 @@ def policy_loss(
 
     losses = reduce(losses, 'b n d -> b n', 'sum')
 
-    return masked_mean(losses, mask)
+    grpo_loss = masked_mean(losses, mask)
+
+    if not return_kl_loss:
+        return grpo_loss
+
+    if kl_loss.ndim == 3:
+        kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
+
+    kl_loss = masked_mean(kl_loss, mask)
+
+    return grpo_loss, kl_loss * kl_loss_weight
 
 @move_inputs_to_module_device
 def ratio_loss(
@@ -341,7 +359,7 @@ def extract_grpo_data(meta_controller, transformer_output):
 
     return GRPOOutput(state, action, log_prob, switch_beta)
 
-@save_load
+@save_load()
 class MetaController(Module):
     def __init__(
         self,
@@ -560,12 +578,33 @@ class MetaController(Module):
 
     def get_action_dist_for_internal_rl(
         self,
-        residual_stream
+        residual_stream,
+        return_kl_loss = False
     ):
 
         proposed_action_hidden, _ = self.action_proposer(residual_stream)
 
-        return self.action_proposer_mean_log_var(proposed_action_hidden)
+        action_dist = self.action_proposer_mean_log_var(proposed_action_hidden)
+
+        if not return_kl_loss:
+            return action_dist
+
+        return action_dist, self.calculate_kl_loss(action_dist)
+
+    def calculate_kl_loss(
+        self,
+        action_dist
+    ):
+        mean, log_var = action_dist.unbind(dim = -1)
+
+        kl_loss = (0.5 * (
+            log_var.exp()
+            + mean.square()
+            - log_var
+            - 1.
+        ))
+
+        return kl_loss
 
     def log_prob(
         self,
@@ -756,14 +795,7 @@ class MetaController(Module):
         kl_loss = self.zero
 
         if discovery_phase:
-            mean, log_var = action_dist.unbind(dim = -1)
-
-            kl_loss = (0.5 * (
-                log_var.exp()
-                + mean.square()
-                - log_var
-                - 1.
-            ))
+            kl_loss = self.calculate_kl_loss(action_dist)
 
             kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
             kl_loss = masked_mean(kl_loss, mask)
@@ -829,7 +861,7 @@ TransformerOutput = namedtuple('TransformerOutput', (
     'cache_steps'
 ))
 
-@save_load
+@save_load()
 class Transformer(Module):
     def __init__(
         self,
