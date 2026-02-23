@@ -274,7 +274,6 @@ def main(
 
                 if use_resnet:
                     image_tensor = rearrange(image_tensor, 'b h w c -> b 1 h w c')
-                    image_tensor = unwrapped_model.visual_encode(image_tensor)
                 else:
                     image_tensor = rearrange(image_tensor, 'b h w c -> b 1 (h w c)')
 

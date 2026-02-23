@@ -31,7 +31,8 @@ from torch_einops_utils.save_load import save_load
 
 from vector_quantize_pytorch import BinaryMapper
 
-from metacontroller.metacontroller import MetaControllerOutput, policy_loss, ratio_loss, BidirectionalSequenceEmbedder, CausalSequenceEmbedder, perform_sequential_selection
+from metacontroller.metacontroller import MetaControllerOutput, policy_loss, ratio_loss, BidirectionalSequenceEmbedder, CausalSequenceEmbedder
+from metacontroller.sequential_action_selection import perform_sequential_action_selection
 
 # constants
 
@@ -90,64 +91,6 @@ class GRUSwitchingUnit(Module):
         return beta, next_hidden
 
 @save_load()
-class QKSimilaritySwitchingUnit(Module):
-    def __init__(
-        self,
-        dim_model,
-        dim_queries_keys = 256,
-        boundary_threshold = 0.5,
-        decoder_kwargs: dict = dict(
-            heads = 8,
-            attn_dim_head = 64,
-            polar_pos_emb = True
-        )
-    ):
-        super().__init__()
-        self.decoder = Decoder(
-            dim = dim_model,
-            depth = 1,
-            **decoder_kwargs
-        )
-
-        self.to_queries_keys = Linear(dim_model, dim_queries_keys * 2, bias = False)
-        self.start_key_token = Parameter(torch.randn(dim_queries_keys) * 1e-2)
-        self.boundary_threshold = boundary_threshold
-
-    def forward(
-        self,
-        residual_stream,
-        cache = None
-    ):
-        # apply decoder first
-
-        decoder_cache = None
-        prev_key = None
-
-        if exists(cache):
-            decoder_cache, prev_key = cache
-
-        # decoder from x-transformers
-
-        decoded, next_decoder_cache = self.decoder(
-            residual_stream,
-            cache = decoder_cache,
-            return_hiddens = True
-        )
-
-        queries, keys = self.to_queries_keys(decoded).chunk(2, dim = -1)
-        batch = queries.shape[0]
-
-        if not exists(prev_key):
-            prev_key = repeat(self.start_key_token, 'd -> b 1 d', b = batch)
-
-        keys_with_prev = cat((prev_key, keys), dim = 1)
-        cosine_sim = cosine_similarity(queries, keys_with_prev[:, :-1], dim = -1)
-        
-        beta = (1. - cosine_sim) * 0.5
-        
-        return beta, (next_decoder_cache, keys[:, -1:])
-
-@save_load()
 class MetaControllerWithBinaryMapper(Module):
     def __init__(
         self,
@@ -158,14 +101,6 @@ class MetaControllerWithBinaryMapper(Module):
         decoder_expansion_factor = 2.,
         decoder_depth = 1,
         hypernetwork_low_rank = 16,
-        switching_unit_type = 'qk', # 'qk' or 'gru'
-        dim_queries_keys = 256,
-        boundary_threshold = 0.5,
-        switching_unit_decoder_kwargs: dict = dict(
-            heads = 8,
-            attn_dim_head = 64,
-            polar_pos_emb = True
-        ),
         assoc_scan_kwargs: dict = dict(),
         internal_sequence_embedder: Module | dict = dict(
             attn_dim_head = 32,
@@ -190,7 +125,9 @@ class MetaControllerWithBinaryMapper(Module):
         kl_loss_weight = 1.,
         kl_loss_warmup_steps = 0,
         apply_kl_loss_weight = True,
-        sequential_latent_action_selection = False
+        ratio_loss_chunk_size = None,
+        ratio_loss_final_weight = None,
+        ratio_loss_warmdown_steps = 0
     ):
         super().__init__()
         self.dim_model = dim_model
@@ -201,10 +138,6 @@ class MetaControllerWithBinaryMapper(Module):
         self.register_buffer('kl_loss_step_count', tensor(0.))
 
         self.apply_kl_loss_weight = apply_kl_loss_weight
-        self.sequential_latent_action_selection = sequential_latent_action_selection
-
-        if sequential_latent_action_selection:
-            assert switching_unit_type == 'gru', 'sequential latent action selection currently only supported for gru switching unit'
 
         dim_meta = default(dim_meta_controller, dim_model)
 
@@ -251,25 +184,12 @@ class MetaControllerWithBinaryMapper(Module):
         self.dim_code_bits = dim_code_bits
         self.num_codes = self.binary_mapper.num_codes
 
-        # switching unit
-
-        assert switching_unit_type in {'qk', 'gru'}
-        self.switching_unit_type = switching_unit_type
-
-        if switching_unit_type == 'qk':
-            self.switching_unit = QKSimilaritySwitchingUnit(
-                dim_model = dim_model,
-                dim_queries_keys = dim_queries_keys,
-                boundary_threshold = boundary_threshold,
-                decoder_kwargs = switching_unit_decoder_kwargs
-            )
-        else:
-            self.switching_unit = GRUSwitchingUnit(
-                dim_model = dim_model,
-                dim_meta = dim_meta_controller,
-                num_codes = self.num_codes,
-                switch_temperature = switch_temperature
-            )
+        self.switching_unit = GRUSwitchingUnit(
+            dim_model = dim_model,
+            dim_meta = dim_meta_controller,
+            num_codes = self.num_codes,
+            switch_temperature = switch_temperature
+        )
 
         self.switch_temperature = switch_temperature
 
@@ -283,6 +203,10 @@ class MetaControllerWithBinaryMapper(Module):
 
         self.ratio_loss_weight = ratio_loss_weight
         self.target_temporal_segment_len = target_temporal_segment_len
+        self.ratio_loss_chunk_size = ratio_loss_chunk_size
+
+        self.ratio_loss_final_weight = ratio_loss_final_weight
+        self.ratio_loss_warmdown_steps = ratio_loss_warmdown_steps
 
         # decoder
 
@@ -331,6 +255,15 @@ class MetaControllerWithBinaryMapper(Module):
         step = self.kl_loss_step_count.item()
         warmup_factor = min(1.0, step / self.kl_loss_warmup_steps)
         return self.kl_loss_weight * warmup_factor
+
+    @property
+    def current_ratio_loss_weight(self):
+        if not exists(self.ratio_loss_final_weight) or self.ratio_loss_warmdown_steps == 0:
+            return self.ratio_loss_weight
+
+        step = self.kl_loss_step_count.item()
+        warmdown_factor = min(1.0, step / self.ratio_loss_warmdown_steps)
+        return self.ratio_loss_weight + (self.ratio_loss_final_weight - self.ratio_loss_weight) * warmdown_factor
 
     def discovery_parameters(self):
         return [
@@ -403,7 +336,7 @@ class MetaControllerWithBinaryMapper(Module):
 
         # destruct prev cache
 
-        prev_summarized, prev_action_proposer_hidden, prev_switching_unit_hidden, prev_switch_gated_hiddens, prev_sampled_code = cache.prev_hiddens if exists(cache) else ((None,) * 5)
+        prev_summarized, prev_action_proposer_hidden, prev_switching_unit_hidden, prev_switch_gated_hiddens = cache.prev_hiddens if exists(cache) else ((None,) * 4)
 
         # getting proposed action for the two phases
 
@@ -436,7 +369,11 @@ class MetaControllerWithBinaryMapper(Module):
 
             mask = maybe(lens_to_mask)(episode_lens, meta_embed.shape[1])
 
-            encoded_temporal = self.internal_sequence_embedder(residual_stream, mask = mask)
+            kwargs = dict()
+            if exists(episode_lens):
+                kwargs['episode_lens'] = episode_lens
+
+            encoded_temporal = self.internal_sequence_embedder(residual_stream, mask = mask, **kwargs)
 
             summarized_sequence_embed = self.to_sequence_summary_embed(encoded_temporal)
 
@@ -476,23 +413,14 @@ class MetaControllerWithBinaryMapper(Module):
 
         batch, seq_len, _ = sampled_codes.shape
 
-        if not exists(prev_sampled_code):
-            prev_sampled_code = torch.zeros(batch, 1, self.num_codes, device = device)
-
         if not exists(prev_switch_gated_hiddens):
             prev_switch_gated_hiddens = torch.zeros(batch, 1, self.num_codes, device = device)
 
-        z_prev_initial = prev_switch_gated_hiddens
+        z_prev = prev_switch_gated_hiddens
 
-        if self.sequential_latent_action_selection and seq_len > 1:
-            z_prev = z_prev_initial
-        elif discovery_phase or seq_len > 1:
-            z_prev = cat((z_prev_initial, sampled_codes[:, :-1]), dim = 1)
-        else:
-            z_prev = z_prev_initial
+        is_ablating_switch = exists(ablate_switch_beta) or exists(switch_beta_frequency)
 
-        if self.sequential_latent_action_selection and seq_len > 1:
-            assert self.switching_unit_type == 'gru', 'sequential latent action selection currently only supported for gru switching unit'
+        if seq_len > 1 and not is_ablating_switch:
 
             # resolve hard switch
             
@@ -500,14 +428,14 @@ class MetaControllerWithBinaryMapper(Module):
 
             # call jax
             
-            sequential_selection_output = perform_sequential_selection(
+            sequential_selection_output = perform_sequential_action_selection(
                 self.switching_unit.gru,
                 self.switching_unit.to_beta,
                 residual_stream,
                 meta_embed_prev,
                 sampled_codes,
                 prev_switching_unit_hidden,
-                z_prev_initial,
+                z_prev,
                 self.switch_temperature,
                 resolved_hard_switch
             )
@@ -518,43 +446,25 @@ class MetaControllerWithBinaryMapper(Module):
 
             next_switch_gated_codes = gated_codes[:, -1:]
 
-        elif exists(ablate_switch_beta):
-            switch_beta = ablate_switch_beta
-
-            if switch_beta.ndim == 1:
-                switch_beta = rearrange(switch_beta, 'b -> b 1')
-
-            next_switching_unit_hidden = prev_switching_unit_hidden
-
-        elif self.switching_unit_type == 'qk':
-            switch_beta, next_switching_unit_hidden = self.switching_unit(
-                residual_stream,
-                prev_switching_unit_hidden
-            )
         else:
-            switch_beta, next_switching_unit_hidden = self.switching_unit(
-                residual_stream,
-                meta_embed_prev,
-                z_prev,
-                prev_switching_unit_hidden
-            )
+            if exists(switch_beta_frequency):
+                ablate_switch_beta = self.create_regular_switch_beta(batch, seq_len, switch_beta_frequency, offset = ablate_offset, device = device)
 
-        # losses
+            if is_ablating_switch:
+                switch_beta = ablate_switch_beta
 
-        if discovery_phase:
-            kl_loss = masked_mean(kl_loss, mask)
+                if switch_beta.ndim == 1:
+                    switch_beta = rearrange(switch_beta, 'b -> b 1')
 
-            kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.
-            kl_loss = kl_loss * kl_loss_weight
+                next_switching_unit_hidden = prev_switching_unit_hidden
+            else:
+                switch_beta, next_switching_unit_hidden = self.switching_unit(
+                    residual_stream,
+                    meta_embed_prev,
+                    z_prev,
+                    prev_switching_unit_hidden
+                )
 
-        else:
-            kl_loss = self.zero
-
-        # maybe hard switch, then use associative scan
-
-        switch_beta_for_gate = switch_beta
-
-        if not (self.sequential_latent_action_selection and seq_len > 1):
             # maybe hard switch, then use associative scan
 
             switch_beta_for_gate = switch_beta
@@ -566,14 +476,22 @@ class MetaControllerWithBinaryMapper(Module):
             forget_gate = 1. - switch_beta_for_gate
 
             # gated codes (or soft distribution)
-
             gated_sampled_codes = einx.multiply('b n d, b n', sampled_codes, switch_beta_for_gate)
 
             gated_codes = self.switch_gating(forget_gate, gated_sampled_codes, prev = prev_switch_gated_hiddens)
 
             next_switch_gated_codes = gated_codes[:, -1:]
 
-        # decoder
+        # losses
+
+        if discovery_phase:
+            kl_loss = masked_mean(kl_loss, mask)
+
+            kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.
+            kl_loss = kl_loss * kl_loss_weight
+
+        else:
+            kl_loss = self.zero
 
         decoder_out = self.decoder(gated_codes)
 
@@ -593,10 +511,11 @@ class MetaControllerWithBinaryMapper(Module):
             aux_ratio_loss = self.ratio_loss(
                 self.target_temporal_segment_len,
                 switch_beta,
-                episode_lens = episode_lens
+                episode_lens = episode_lens,
+                chunk_size = self.ratio_loss_chunk_size
             )
 
-            aux_ratio_loss = aux_ratio_loss * self.ratio_loss_weight
+            aux_ratio_loss = aux_ratio_loss * self.current_ratio_loss_weight
 
         # returning
 
@@ -604,9 +523,12 @@ class MetaControllerWithBinaryMapper(Module):
             next_summarized,
             next_action_proposer_hidden,
             next_switching_unit_hidden,
-            next_switch_gated_codes,
-            sampled_codes[:, -1:]
+            next_switch_gated_codes
         )
+
+        if discovery_phase:
+            kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.
+            kl_loss = kl_loss * kl_loss_weight
 
         return control_signal, MetaControllerOutput(next_hiddens, residual_stream, binary_logits, sampled_codes, switch_beta, kl_loss, kl_loss_weight if discovery_phase else self.zero, aux_ratio_loss)
 

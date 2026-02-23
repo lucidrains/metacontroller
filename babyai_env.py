@@ -142,14 +142,17 @@ def create_env(
     render_mode = 'rgb_array',
     video_folder = None,
     render_every_eps = 1000,
-    use_symbolic = True
+    use_symbolic = True,
+    fully_obs = True
 ):
     # register minigrid environments if needed
     # minigrid.register_minigrid_envs()
 
     # environment
     env = gym.make(env_id, render_mode = render_mode)
-    env = FullyObsWrapper(env)
+
+    if fully_obs:
+        env = FullyObsWrapper(env)
 
     if use_symbolic:
         env = SymbolicObsWrapper(env)

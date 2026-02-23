@@ -221,7 +221,8 @@ def main(
         render_mode = 'rgb_array',
         video_folder = video_folder,
         render_every_eps = render_every_eps,
-        use_symbolic = (not use_resnet)
+        use_symbolic = False,
+        fully_obs = use_resnet
     )
 
     env = AsyncVectorEnv([env_make_fn] * batch_size, shared_memory = env_shared_memory, context = env_context)
@@ -243,6 +244,7 @@ def main(
         assert weights_path.exists(), f"meta controller weights not found at {weights_path}"
         meta_controller_klass = MetaControllerWithBinaryMapper if use_binary_mapper else MetaController
         meta_controller = meta_controller_klass.init_and_load(str(weights_path), strict = False)
+        meta_controller.eval()
 
     meta_controller = default(meta_controller, getattr(model, 'meta_controller', None))
     assert exists(meta_controller), "MetaController must be present for reinforcement learning"
@@ -302,17 +304,13 @@ def main(
             image = state['image']
             image_tensor = torch.from_numpy(image).float().to(accelerator.device)
 
-            # match behavior cloning preprocessing (see train_behavior_clone_babyai.py)
             if use_resnet:
-                # RGB normalization (ImageNet stats) — matches BC resnet path
                 image_tensor = torch.clamp(image_tensor / 255.0, min=0.0, max=1.0)
                 mean = torch.tensor([0.485, 0.456, 0.406], device=image_tensor.device)
                 std = torch.tensor([0.229, 0.224, 0.225], device=image_tensor.device)
                 image_tensor = (image_tensor - mean) / std
-                # add sequence dimension; keep channels last, TransformerWithResnet.visual_encode handles encoding
                 image_tensor = rearrange(image_tensor, 'b h w c -> b 1 h w c')
             else:
-                # symbolic obs: no normalization, just flatten — matches BC non-resnet path
                 image_tensor = rearrange(image_tensor, 'b h w c -> b 1 (h w c)')
 
             if torch.is_tensor(past_action_id):

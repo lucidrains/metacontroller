@@ -11,11 +11,10 @@ from metacontroller.metacontroller import Transformer, MetaController, ActionPro
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
 
 from torch_einops_utils.save_load import save_load
-from minGRU_pytorch import minGRU
 
 from memmap_replay_buffer import ReplayBuffer
 
-from einops import rearrange
+from einops import rearrange, repeat
 
 # functions
 
@@ -28,26 +27,18 @@ def exists(v):
 @param('action_discrete', (False, True))
 @param('embed_past_actions', (False, True))
 @param('variable_length', (False, True))
-@param('use_mingru', (False, True))
 @param('normalize_state_action_losses', (False, True))
-@param('variant_and_sequential_selection', [
-    ((False, None), False),
-    ((False, None), True),
-    ((True, 'qk'), False),
-    ((True, 'gru'), False),
-    ((True, 'gru'), True)
-])
+@param('variant', (False, True))
 def test_metacontroller(
-    variant_and_sequential_selection,
+    variant,
     action_discrete,
     embed_past_actions,
     variable_length,
-    use_mingru,
     accept_condition,
     normalize_state_action_losses
 ):
-    variant, sequential_latent_action_selection = variant_and_sequential_selection
-    use_binary_mapper_variant, switching_unit_type = variant
+    use_binary_mapper_variant = variant
+    switching_unit_type = 'gru'
 
     dim_model = 32
     dim_meta = 16
@@ -101,17 +92,7 @@ def test_metacontroller(
     # discovery and internal rl phase with meta controller
 
     action_proposer_kwargs = dict()
-
-    if use_mingru:
-        action_proposer_kwargs = dict(
-            action_proposer = save_load()(ActionProposerWrapper)(
-                save_load()(minGRU)(dim = dim_model),
-                cache_key = 'prev_hidden',
-                return_cache_key = 'return_next_prev_hidden'
-            )
-        )
-    else:
-        action_proposer_kwargs['action_proposer'] = dict(depth = 1, attn_dim_head = 16, heads = 2)
+    action_proposer_kwargs['action_proposer'] = dict(depth = 1, attn_dim_head = 16, heads = 2)
 
     if not use_binary_mapper_variant:
         meta_controller = MetaController(
@@ -119,7 +100,6 @@ def test_metacontroller(
             dim_meta_controller = dim_meta,
             dim_latent = 64,
             internal_sequence_embedder = dict(attn_dim_head = 16, heads = 2, depth = 1),
-            sequential_latent_action_selection = sequential_latent_action_selection,
             **action_proposer_kwargs
         )
     else:
@@ -127,9 +107,7 @@ def test_metacontroller(
             dim_model = dim_model,
             dim_meta_controller = dim_meta,
             dim_code_bits = 8,
-            switching_unit_type = switching_unit_type,
             internal_sequence_embedder = dict(attn_dim_head = 16, heads = 2, depth = 1),
-            sequential_latent_action_selection = sequential_latent_action_selection,
             **action_proposer_kwargs
         )
 
@@ -549,23 +527,27 @@ def test_switch_ablation():
     _, cache1 = transformer(torch.randn(batch, 1, dim), switch_beta_frequency = frequency, cache = cache1, return_cache = True)
     assert torch.all(cache1.prev_hiddens.meta_controller.switch_beta == 1.)
 
-def test_lax_scan_parity():
-    # parity test for jax.lax.scan (via jax2torch) vs iterative pytorch
-    
+
+
+def test_sequential_selection_parallel_vs_iterative():
+    """
+    Validates that parallel discovery (full sequence) matches
+    iterative cached discovery when sequential_latent_action_selection is on.
+    """
+
     dim = 64
-    seq_len = 5
+    seq_len = 8
     batch = 1
     dim_latent = 32
-    dim_meta = 256
-    
+    dim_meta = 64
+
     mc = MetaController(
         dim_model = dim,
         dim_meta_controller = dim_meta,
-        dim_latent = dim_latent,
-        sequential_latent_action_selection = True
+        dim_latent = dim_latent
     )
 
-    # force components to be context-free for bit-perfect parity
+    # force context-free components for bit-perfect parity
 
     class IdentityEmbedder(nn.Module):
         def forward(self, x, mask = None):
@@ -579,44 +561,101 @@ def test_lax_scan_parity():
             return self.linear(x), None
 
     mc.internal_sequence_embedder = IdentityEmbedder()
-    
-    dim_emitter_in = dim_meta + dim + 32
+
+    dim_emitter_in = dim_meta + dim + dim_latent
     mc.emitter = LinearEmitter(dim_emitter_in, dim_meta * 2)
-    
+
     mc.eval()
-    
-    # pre-computed inputs
-    
+
     residual_stream = torch.randn(batch, seq_len, dim)
-    
-    # 1. Whole sequence sequential discovery (using JAX)
-    
+
+    # 1. Parallel discovery (full sequence, uses JAX scan or PyTorch loop)
+
     torch.manual_seed(42)
     with torch.no_grad():
-        _, mc_out_seq = mc(
+        _, mc_out_parallel = mc(
             residual_stream,
             discovery_phase = True
         )
-        
-    # 2. Iterative (PyTorch loop)
-    
+
+    # 2. Iterative cached discovery (step-by-step)
+
     iter_switch_betas = []
     cache = None
     torch.manual_seed(42)
-    
+
     for t in range(seq_len):
         x_t = residual_stream[:, t:t+1]
-        
-        _, out_t = mc(
-            x_t,
-            cache = cache,
-            discovery_phase = True
-        )
+
+        with torch.no_grad():
+            _, out_t = mc(
+                x_t,
+                cache = cache,
+                discovery_phase = True
+            )
+
         cache = out_t
         iter_switch_betas.append(out_t.switch_beta)
-        
+
     iter_switch_beta = torch.cat(iter_switch_betas, dim = 1)
+
+    # compare switch betas
+
+    assert torch.allclose(mc_out_parallel.switch_beta, iter_switch_beta, atol = 1e-5), \
+        f'switch beta mismatch: max diff = {(mc_out_parallel.switch_beta - iter_switch_beta).abs().max().item()}'
+
+def test_jax_pytorch_parity():
+    from metacontroller.sequential_action_selection import (
+        pytorch_sequential_action_selection,
+        torch_jax_sequential_selection,
+        HAS_JAX
+    )
     
-    # compare
+    if not HAS_JAX:
+        pytest.skip("JAX not installed")
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dim_model, dim_meta, dim_latent, seq_len, batch = 64, 32, 16, 8, 2
+
+    gru = nn.GRU(dim_model + dim_meta + dim_latent, dim_meta, batch_first=True).to(device)
+    to_beta = nn.Linear(dim_meta, 1, bias = False).to(device)
+
+    rs = torch.randn(batch, seq_len, dim_model, device = device)
+    me = torch.randn(batch, seq_len, dim_meta, device = device)
+    sla = torch.randn(batch, seq_len, dim_latent, device = device)
+    h0 = torch.randn(1, batch, dim_meta, device = device)
+    z0 = torch.randn(batch, 1, dim_latent, device = device)
     
-    assert torch.allclose(mc_out_seq.switch_beta, iter_switch_beta, atol = 1e-5)
+    with torch.no_grad():
+        pt_out = pytorch_sequential_action_selection(gru, to_beta, rs, me, sla, h0, z0, 1.0, False)
+        
+        jax_beta, jax_action, jax_hidden = torch_jax_sequential_selection(
+            gru.weight_ih_l0, gru.weight_hh_l0, gru.bias_ih_l0, gru.bias_hh_l0,
+            to_beta.weight, to_beta.bias, rs, me, sla, h0.squeeze(0), z0.squeeze(1), 1.0, False
+        )
+
+    assert torch.allclose(pt_out.switch_beta, jax_beta, atol = 1e-6)
+    assert torch.allclose(pt_out.gated_action, jax_action, atol = 1e-6)
+    assert torch.allclose(pt_out.next_switching_unit_gru_hidden, jax_hidden.unsqueeze(0), atol = 1e-6)
+
+def test_compact_sequence_embedder():
+    from metacontroller.compact_sequence_embedder import CompactSequenceEmbedder
+    
+    dim = 64
+    seq_len = 10
+    batch = 2
+    
+    embedder = CompactSequenceEmbedder(dim = dim)
+    
+    x = torch.randn(batch, seq_len, dim)
+    episode_lens = torch.tensor([5, 10])
+    
+    out = embedder(x, episode_lens = episode_lens)
+    
+    assert out.shape == (batch, seq_len, dim)
+    
+    # manual check: last hidden of first sequence (len 5) should be repeated for out[0]
+    _, h = embedder.gru(x[0:1, :5])
+    expected0 = repeat(h[-1], '1 d -> n d', n = seq_len)
+    
+    assert torch.allclose(out[0], expected0, atol = 1e-6)

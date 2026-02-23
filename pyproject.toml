@@ -1,6 +1,6 @@
 [project]
 name = "metacontroller-pytorch"
-version = "0.2.15"
+version = "0.2.18"
 description = "Transformer Metacontroller"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -38,7 +38,6 @@ dependencies = [
     "x-transformers>=2.16.0",
     "jax",
     "jaxlib",
-    "jax2torch"
 ]
 
 [project.urls]
@@ -47,9 +46,9 @@ Repository = "https://github.com/lucidrains/metacontroller"
 
 [project.optional-dependencies]
 examples = []
+
 test = [
     "pytest",
-    "minGRU-pytorch"
 ]
 
 [tool.pytest.ini_options]

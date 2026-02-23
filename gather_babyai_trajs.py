@@ -42,6 +42,7 @@ from memmap_replay_buffer import ReplayBuffer
 # Difficulty thresholds based on mission length
 EASY_MAX_LENGTH = 30      # easy: 0 to 30
 MEDIUM_MAX_LENGTH = 75    # medium: 30 to 75, hard: > 75
+MIN_ACCEPTABLE_EP_LENGTH = 25
 
 # helpers
 
@@ -234,7 +235,10 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
                 return episode_state, episode_action, True, _step + 1, seed
 
         env.close()
-        return episode_state, episode_action, False, num_steps, seed
+        if len(episode_state) < MIN_ACCEPTABLE_EP_LENGTH:
+            return None, None, False, 0, seed
+        else:
+            return episode_state, episode_action, False, num_steps, seed
 
     except Exception:
         env.close()

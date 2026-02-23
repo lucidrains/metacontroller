@@ -31,6 +31,7 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 from memmap_replay_buffer import ReplayBuffer
 from einops import rearrange
+from torch_einops_utils import maybe, lens_to_mask
 
 import matplotlib.pyplot as plt
 import wandb
@@ -74,10 +75,6 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
-
-def lens_to_mask(lens, seq_len, device):
-    """Boolean mask (B, seq_len): True where t < lens[b]."""
-    return torch.arange(seq_len, device=device, dtype=lens.dtype).unsqueeze(0) < lens.unsqueeze(1)
 
 def visualize_switch_betas(
     switch_betas,      # (B, T-1)
@@ -141,7 +138,6 @@ def train(
     lr = 1e-4,
     discovery_lr = 1e-4,
     lr_schedule = "cosine",  # "cosine" or "constant"; cosine decays LR to lr * lr_min_ratio over BC phase
-    lr_min_ratio = 0.05,     # minimum LR as fraction of initial (e.g. 0.05 -> 5e-6 for lr=1e-4)
     weight_decay = 0.03,
     discovery_weight_decay = 0.03,
     dim = 512,
@@ -165,12 +161,14 @@ def train(
     discovery_entropy_loss_weight = 0.0,   # paper: no entropy regularizer for switching
     discovery_negative_entropy_loss_weight = 0.0,
     discovery_ratio_loss_weight = 0.0,     # paper: no ratio loss for switching
+    discovery_ratio_loss_weight_end = None, # if set, linearly decay ratio_loss_weight -> this value over discovery
     discovery_kl_loss_warmup_steps = 2000,  # paper: linear ramp over first 2K steps (0 -> final alpha)
     normalize_state_action_losses = False,
     max_grad_norm = 1.,
     use_resnet = False,
     condition_on_mission_embed = False,
     mission_embed_dim = 384,
+    lr_min_ratio = 0.05,     # minimum LR as fraction of initial
     use_binary_mapper = False,
     dim_meta_controller = 128,
     dim_code_bits = 4,
@@ -198,7 +196,7 @@ def train(
                 checkpoint_path_with_step = checkpoint_path
                 meta_controller_checkpoint_path_with_step = meta_controller_checkpoint_path
 
-            if not is_discovering:
+            if not is_discovering or not exists(step):
                 unwrapped_model = accelerator.unwrap_model(model)
                 unwrapped_model.save(checkpoint_path_with_step)
                 accelerator.print(f"Model saved to {checkpoint_path_with_step}")
@@ -247,7 +245,9 @@ def train(
                 "kl_loss_threshold": kl_loss_threshold if use_binary_mapper else None,
                 "switch_temperature": switch_temperature,
                 "hypernetwork_low_rank": hypernetwork_low_rank if use_binary_mapper else None,
-                "target_temporal_segment_len": target_temporal_segment_len if use_binary_mapper else None
+                "target_temporal_segment_len": target_temporal_segment_len if use_binary_mapper else None,
+                "discovery_ratio_loss_weight": discovery_ratio_loss_weight,
+                "lr_min_ratio": lr_min_ratio if lr_schedule == "cosine" else None,
             }
         )
 
@@ -293,14 +293,6 @@ def train(
             dim_model = dim,
             dim_meta_controller = dim_meta_controller,
             dim_code_bits = dim_code_bits,
-            switching_unit_type = switching_unit_type,
-            dim_queries_keys = dim_queries_keys,
-            boundary_threshold = boundary_threshold,
-            switching_unit_decoder_kwargs = dict(
-                heads = switching_unit_decoder_heads,
-                attn_dim_head = switching_unit_decoder_attn_dim_head,
-                polar_pos_emb = True
-            ),
             kl_loss_threshold = kl_loss_threshold,
             switch_temperature = switch_temperature,
             hypernetwork_low_rank = hypernetwork_low_rank,
@@ -317,7 +309,10 @@ def train(
 
     transformer_kwargs = dict(
         dim = dim,
-        state_embed_readout = dict(num_continuous = state_dim),
+        state_embed_readout = dict(
+            num_continuous = state_dim,
+            readout_kwargs = dict(continuous_log_var_embed = False)
+        ),
         action_embed_readout = dict(num_discrete = num_actions),
         lower_body = dict(depth = depth, heads = heads, attn_dim_head = dim_head),
         upper_body = dict(depth = depth, heads = heads, attn_dim_head = dim_head),
@@ -370,7 +365,7 @@ def train(
 
     model, optim_model, optim_meta_controller, dataloader = accelerator.prepare(model, optim_model, optim_meta_controller, dataloader)
 
-    # optional LR schedule for BC phase (reduces overshooting / loss increase after initial decrease)
+    # optional LR schedule for BC phase
     scheduler_model = None
     if lr_schedule == "cosine" and cloning_epochs > 0:
         num_bc_steps = cloning_epochs * len(dataloader)
@@ -380,9 +375,12 @@ def train(
         accelerator.print(f"Using cosine LR schedule for BC: {num_bc_steps} steps, eta_min={lr * lr_min_ratio:.2e}")
 
     # training
-
+    
     old_discovery_obs_loss_weight = discovery_obs_loss_weight
     old_discovery_action_recon_loss_weight = discovery_action_recon_loss_weight
+
+    total_discovery_steps = discovery_epochs * len(dataloader) if discovery_epochs > 0 else 1
+    discovery_step = 0
 
     gradient_step = 0
     is_discovering = False
@@ -395,7 +393,7 @@ def train(
         # store checkpoint on switching
         if cloning_epochs > 0 and not is_discovering and epoch >= cloning_epochs:
             accelerator.wait_for_everyone()
-            store_checkpoint(gradient_step, False)
+            store_checkpoint()
 
         is_discovering = (epoch >= cloning_epochs) # discovery phase is BC with metacontroller tuning
 
@@ -447,7 +445,7 @@ def train(
                 states = batch['state'].float()
                 # flatten state: (B, T, 7, 7, 3) -> (B, T, 147)
                 states = rearrange(states, 'b t ... -> b t (...)')
-                # states = symlog(states.float())
+                states = symlog(states.float())
 
             actions = batch['action'].long()
             episode_lens = batch.get('_lens')
@@ -473,23 +471,18 @@ def train(
                 if is_discovering:
                     obs_loss, action_recon_loss, kl_loss, ratio_loss = losses
 
-                    # Mask for valid (non-padded) switch positions
-                    switch_beta = meta_controller_output.switch_beta
-                    _, T_minus_1 = switch_beta.shape
-                    if exists(episode_lens):
-                        lens = episode_lens.to(switch_beta.device)
-                        valid_switch_len = (lens - 1).clamp(min=0)
-                        switch_mask = lens_to_mask(valid_switch_len, T_minus_1, switch_beta.device)
-                        n_valid = switch_mask.sum().clamp(min=1)
-                        entropy_loss = (binary_entropy(switch_beta) * switch_mask).sum() / n_valid
-                        last_hard_switch_density = ((switch_beta > 0.5).float() * switch_mask).sum().item() / n_valid.item()
-                        last_soft_switch_density = (switch_beta * switch_mask).sum().item() / n_valid.item()
+                    switch_mask = maybe(lens_to_mask)(episode_lens, meta_controller_output.switch_beta.shape[1])
+                    if exists(switch_mask):
+                        n_valid = switch_mask.sum()
+                        entropy_loss = (binary_entropy(meta_controller_output.switch_beta) * switch_mask).sum() / n_valid.item()
+                        last_hard_switch_density = ((meta_controller_output.switch_beta > 0.5).float() * switch_mask).sum().item() / n_valid.item()
+                        last_soft_switch_density = (meta_controller_output.switch_beta * switch_mask).sum().item() / n_valid.item()
                     else:
-                        entropy_loss = binary_entropy(switch_beta).mean()
-                        last_hard_switch_density = (switch_beta > 0.5).float().mean().item()
-                        last_soft_switch_density = switch_beta.mean().item()
+                        entropy_loss = binary_entropy(meta_controller_output.switch_beta).mean()
+                        last_hard_switch_density = (meta_controller_output.switch_beta > 0.5).float().mean().item()
+                        last_soft_switch_density = meta_controller_output.switch_beta.mean().item()
 
-                    # Optional: zero betas -> feasibility restoration (entropy, kl only). Default weights are 0.
+                    # zero betas -> feasibility restoration -> losses: (entropy, kl)
                     if last_hard_switch_density < 0.1:
                         entropy_weight = -discovery_negative_entropy_loss_weight
                         discovery_obs_loss_weight = 0
@@ -499,13 +492,21 @@ def train(
                         discovery_obs_loss_weight = old_discovery_obs_loss_weight
                         discovery_action_recon_loss_weight = old_discovery_action_recon_loss_weight
 
+                    if exists(discovery_ratio_loss_weight_end):
+                        frac = min(discovery_step / max(total_discovery_steps - 1, 1), 1.0)
+                        current_ratio_loss_weight = discovery_ratio_loss_weight + (discovery_ratio_loss_weight_end - discovery_ratio_loss_weight) * frac
+                    else:
+                        current_ratio_loss_weight = discovery_ratio_loss_weight
+
                     loss = (
                         obs_loss * discovery_obs_loss_weight
                         + action_recon_loss * discovery_action_recon_loss_weight
                         + kl_loss * meta_controller_output.kl_loss_weight
                         + entropy_loss * entropy_weight
-                        + ratio_loss * discovery_ratio_loss_weight
+                        + ratio_loss * current_ratio_loss_weight
                     )
+
+                    discovery_step += 1
 
                     log = dict(
                         obs_loss = obs_loss.item(),
@@ -514,6 +515,7 @@ def train(
                         kl_loss_weight = meta_controller_output.kl_loss_weight,
                         entropy_loss = entropy_loss.item(),
                         ratio_loss = ratio_loss.item(),
+                        ratio_loss_weight = current_ratio_loss_weight,
                         hard_switch_density = last_hard_switch_density,
                         soft_switch_density = last_soft_switch_density,
                     )
@@ -548,10 +550,8 @@ def train(
                         scheduler_model.step()
 
                     if is_discovering:
-                        if isinstance(model, DistributedDataParallel):
-                            model.module.meta_controller_maybe_increment_kl_loss_step()
-                        else:
-                            model.meta_controller_maybe_increment_kl_loss_step()
+                        m = accelerator.unwrap_model(model)
+                        m.meta_controller_maybe_increment_kl_loss_step()
 
             # log on backprop
 
@@ -563,12 +563,13 @@ def train(
                 if is_discovering: prefix = "discovery_phase"
                 else: prefix = "behavior_cloning"
 
-                m = model.module if isinstance(model, DistributedDataParallel) else model
+                m = accelerator.unwrap_model(model)
                 log_dict = {
                     **log,
                     f"{prefix}_total_loss": loss.item(),
                     f"{prefix}_grad_norm": grad_norm.item()
                 }
+
                 if m.running_bc_state_loss is not None:
                     log_dict["running_bc_state_loss"] = m.running_bc_state_loss.squeeze().item()
                 if m.running_bc_action_loss is not None:
@@ -577,8 +578,10 @@ def train(
                     log_dict["running_discovery_state_loss"] = m.running_discovery_state_loss.squeeze().item()
                 if m.running_discovery_action_loss is not None:
                     log_dict["running_discovery_action_loss"] = m.running_discovery_action_loss.squeeze().item()
+
                 if not is_discovering and scheduler_model is not None:
                     log_dict["behavior_cloning_lr"] = scheduler_model.get_last_lr()[0]
+
                 accelerator.log(log_dict, step=gradient_step)
 
                 progress_bar.set_postfix(**log)
@@ -586,7 +589,7 @@ def train(
 
             gradient_step += 1
 
-            # checkpoint 
+            # checkpoint
 
             if gradient_step % save_steps == 0:
                 accelerator.wait_for_everyone()
