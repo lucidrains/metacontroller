@@ -230,15 +230,17 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
 
             state_obs, reward, terminated, truncated, info = env.step(action)
 
+            # Game completed
             if terminated:
                 env.close()
-                return episode_state, episode_action, True, _step + 1, seed
+                # Only significant trajectories (minimally long)
+                if _step + 1 < MIN_ACCEPTABLE_EP_LENGTH:
+                    return None, None, False, 0, seed
+                else:
+                    return episode_state, episode_action, True, _step + 1, seed
 
         env.close()
-        if len(episode_state) < MIN_ACCEPTABLE_EP_LENGTH:
-            return None, None, False, 0, seed
-        else:
-            return episode_state, episode_action, False, num_steps, seed
+        return episode_state, episode_action, False, num_steps, seed
 
     except Exception:
         env.close()
