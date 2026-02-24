@@ -113,7 +113,8 @@ def jax_sequential_selection_scan(
         beta = jax.nn.sigmoid(logit / switch_temperature)
         
         if hard_switch:
-            beta = (beta > 0.5).astype(jnp.float32)
+            beta_hard = (beta > 0.5).astype(beta.dtype)
+            beta = beta + jax.lax.stop_gradient(beta_hard - beta)
             
         # 3. Gating (Momentum-like transition)
         
@@ -150,9 +151,28 @@ if HAS_JAX:
     from torch.utils.dlpack import from_dlpack as torch_from_dlpack
     from jax.dlpack import from_dlpack as jax_from_dlpack
 
-    # Define the backward-supporting JIT function at module level for persistent caching
-
     @partial(jax.jit, static_argnums = (11, 12))
+    def jax_sequential_selection_scan_jitted(
+        weight_ih,
+        weight_hh,
+        bias_ih,
+        bias_hh,
+        weight_beta,
+        bias_beta,
+        residual_stream,
+        meta_embeddings,
+        sampled_latent_actions,
+        gru_hidden,
+        current_latent_action,
+        switch_temperature,
+        hard_switch
+    ):
+        return jax_sequential_selection_scan(
+            weight_ih, weight_hh, bias_ih, bias_hh, weight_beta, bias_beta, 
+            residual_stream, meta_embeddings, sampled_latent_actions, gru_hidden, current_latent_action,
+            switch_temperature, hard_switch
+        )
+
     def jitted_vjp_logic(
         weight_ih,
         weight_hh,
@@ -169,7 +189,7 @@ if HAS_JAX:
         hard_switch
     ):
         return vjp(
-            lambda *args: jax_sequential_selection_scan(*args, switch_temperature, hard_switch),
+            lambda *args: jax_sequential_selection_scan_jitted(*args, switch_temperature, hard_switch),
             weight_ih, weight_hh, bias_ih, bias_hh, weight_beta, bias_beta, 
             residual_stream, meta_embeddings, sampled_latent_actions, gru_hidden, current_latent_action
         )
@@ -295,8 +315,9 @@ def pytorch_sequential_action_selection(
         beta = rearrange(beta, '1 b 1 -> b 1')
         
         if hard_switch: 
-            beta = (beta > 0.5).float()
-            
+            beta_hard = (beta > 0.5).float()
+            beta = beta + (beta_hard - beta).detach()
+
         # 3. Latent Momentum Gating
 
         forget_gate = 1.0 - beta
@@ -309,7 +330,7 @@ def pytorch_sequential_action_selection(
         gated.append(latent)
         
     return SequentialActionSelectionOutput(
-        cat(betas, dim = 1).squeeze(-1),
+        cat(betas, dim = 1),
         cat(gated, dim = 1),
         hidden
     )
@@ -359,8 +380,10 @@ def perform_sequential_action_selection(
                 final_hidden.unsqueeze(0)
             )
             
-        except Exception:
-            # fallback on any JAX-specific failure
+        except (RuntimeError, TypeError) as e:
+            # fallback on specific JAX/DLPack integration failures
+            import logging
+            logging.warning(f"JAX fallback triggered: {e}")
             pass
 
     return pytorch_sequential_action_selection(gru, to_beta, residual_stream, meta_embeddings, sampled_latent_actions, hidden_init, latent_init, switch_temperature, hard_switch)

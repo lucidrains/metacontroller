@@ -242,8 +242,10 @@ def policy_loss(
     advantages,
     mask = None,
     episode_lens = None,
-    eps_clip = 0.2,
-    switch_beta_frequency: int | None = None
+    eps_clip: float | tuple[float, float] = 0.2,
+    switch_beta_frequency: int | None = None,
+    return_kl_loss = False,
+    kl_loss_weight = 0.
 ):
     if exists(switch_beta_frequency):
         batch, seq_len = state.shape[:2]
@@ -256,7 +258,13 @@ def policy_loss(
 
     # get new log probs
 
-    action_dist = meta_controller.get_action_dist_for_internal_rl(state)
+    action_dist_out = meta_controller.get_action_dist_for_internal_rl(state, return_kl_loss = return_kl_loss)
+
+    if return_kl_loss:
+        action_dist, kl_loss = action_dist_out
+    else:
+        action_dist = action_dist_out
+
     new_log_probs = meta_controller.log_prob(action_dist, actions)
 
     # calculate ratio
@@ -270,7 +278,14 @@ def policy_loss(
     # ppo surrogate loss
 
     surr1 = ratio * advantages
-    surr2 = ratio.clamp(1 - eps_clip, 1 + eps_clip) * advantages
+
+    if isinstance(eps_clip, (float, int)):
+        eps_clip = (eps_clip, eps_clip)
+
+    eps_lower, eps_upper = eps_clip
+    ratio_clip = ratio.clamp(1 - eps_lower, 1 + eps_upper)
+
+    surr2 = ratio_clip * advantages
 
     losses = -torch.min(surr1, surr2)
 
@@ -285,7 +300,17 @@ def policy_loss(
 
     losses = reduce(losses, 'b n d -> b n', 'sum')
 
-    return masked_mean(losses, mask)
+    grpo_loss = masked_mean(losses, mask)
+
+    if not return_kl_loss:
+        return grpo_loss
+
+    if kl_loss.ndim == 3:
+        kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
+
+    kl_loss = masked_mean(kl_loss, mask)
+
+    return grpo_loss, kl_loss * kl_loss_weight
 
 @move_inputs_to_module_device
 def ratio_loss(
@@ -561,12 +586,33 @@ class MetaController(Module):
 
     def get_action_dist_for_internal_rl(
         self,
-        residual_stream
+        residual_stream,
+        return_kl_loss = False
     ):
 
         proposed_action_hidden, _ = self.action_proposer(residual_stream)
 
-        return self.action_proposer_mean_log_var(proposed_action_hidden)
+        action_dist = self.action_proposer_mean_log_var(proposed_action_hidden)
+
+        if not return_kl_loss:
+            return action_dist
+
+        return action_dist, self.calculate_kl_loss(action_dist)
+
+    def calculate_kl_loss(
+        self,
+        action_dist
+    ):
+        mean, log_var = action_dist.unbind(dim = -1)
+
+        kl_loss = (0.5 * (
+            log_var.exp()
+            + mean.square()
+            - log_var
+            - 1.
+        ))
+
+        return kl_loss
 
     def log_prob(
         self,
@@ -779,14 +825,7 @@ class MetaController(Module):
         kl_loss = self.zero
 
         if discovery_phase:
-            mean, log_var = action_dist.unbind(dim = -1)
-
-            kl_loss = (0.5 * (
-                log_var.exp()
-                + mean.square()
-                - log_var
-                - 1.
-            ))
+            kl_loss = self.calculate_kl_loss(action_dist)
 
             kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
             kl_loss = masked_mean(kl_loss, mask)
@@ -1067,8 +1106,10 @@ class Transformer(Module):
         control_signal_multiplier = 1.,
         ablate_switch_beta: Tensor | None = None,
         switch_beta_frequency: int | None = None,
-        update_loss_ema: bool | None = None
+        update_loss_ema: bool | None = None,
+        hard_switch: bool | None = None
     ):
+
         device = state.device
 
         # meta controller is either given or already given at init
@@ -1177,7 +1218,8 @@ class Transformer(Module):
                     episode_lens = episode_lens,
                     ablate_switch_beta = ablate_switch_beta,
                     switch_beta_frequency = switch_beta_frequency,
-                    ablate_offset = cache_steps
+                    ablate_offset = cache_steps,
+                    hard_switch = hard_switch
                 )
             else:
                 control_signal, next_meta_hiddens = self.zero, None
