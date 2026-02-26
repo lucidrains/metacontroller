@@ -2,7 +2,7 @@
 # dependencies = [
 #   "accelerate",
 #   "fire",
-#   "memmap-replay-buffer>=0.0.23",
+#   "memmap-replay-buffer>=0.0.29",
 #   "metacontroller-pytorch>=0.1.0",
 #   "torch",
 #   "einops",
