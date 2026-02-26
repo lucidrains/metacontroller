@@ -377,6 +377,7 @@ class MetaController(Module):
             depth = 2,
             polar_pos_emb = True
         ),
+        compact_sequence_embedding = False,
         bidirectional = True,
         pool_embedded_sequence = True,
         dim_sequence_summary_embed = 32, # the summary embedding from the bidirectional network needs to be bottlenecked
@@ -395,7 +396,8 @@ class MetaController(Module):
         kl_loss_warmup_steps = 0,
         apply_kl_loss_weight = True,
         ratio_loss_final_weight = None,
-        ratio_loss_warmdown_steps = 0
+        ratio_loss_warmdown_steps = 0,
+
     ):
         super().__init__()
         self.dim_model = dim_model
@@ -409,6 +411,8 @@ class MetaController(Module):
         
         self.ratio_loss_final_weight = ratio_loss_final_weight
         self.ratio_loss_warmdown_steps = ratio_loss_warmdown_steps
+
+        self.compact_sequence_embedding = compact_sequence_embedding
         
         dim_meta = default(dim_meta_controller, dim_model)
 
@@ -420,15 +424,21 @@ class MetaController(Module):
 
         # there are two phases, the first (discovery ssl phase) uses acausal with some ssm i don't really believe in - let's just use bidirectional attention as placeholder
 
-        if isinstance(internal_sequence_embedder, dict):
+        # use transformer encoder and map the input to a self-attnded sequence
+
+        if not self.compact_sequence_embedding and isinstance(internal_sequence_embedder, dict):
             embedder_klass = BidirectionalSequenceEmbedder if bidirectional else CausalSequenceEmbedder
             
             if bidirectional:
                 internal_sequence_embedder['pool'] = pool_embedded_sequence
 
             internal_sequence_embedder = embedder_klass(dim = dim_model, **internal_sequence_embedder)
+            self.internal_sequence_embedder = internal_sequence_embedder
 
-        self.internal_sequence_embedder = internal_sequence_embedder
+        # compact sequence embedder -> use GRU last hidden state
+
+        else:
+            self.internal_sequence_embedder = GRU(dim_model, dim_model)
 
         self.to_sequence_summary_embed = Linear(dim_model, dim_sequence_summary_embed)
 
@@ -566,8 +576,6 @@ class MetaController(Module):
         ]
 
     def train_internal_rl(self, eval_rest = False):
-        if eval_rest:
-            self.eval()
 
         if isinstance(self.action_proposer, ActionProposerWrapper):
             self.action_proposer.module.train()
@@ -637,7 +645,7 @@ class MetaController(Module):
         next_action_proposer_hidden = None
 
         # eq (12) - summarizing the input residual stream, then projecting it to meta controller dimension
-
+        # h_t
         summarized, next_summarized = self.summary_gru(residual_stream, prev_summarized)
 
         meta_embed = self.model_to_meta(summarized)
@@ -652,6 +660,7 @@ class MetaController(Module):
 
         # their h_(t-1)
 
+        # B, L, D
         meta_embed_prev = cat((
             self.model_to_meta(prev_summarized),
             meta_embed[:, :-1]
@@ -670,12 +679,33 @@ class MetaController(Module):
             if exists(episode_lens):
                 kwargs['episode_lens'] = episode_lens
 
-            encoded_residual_stream = self.internal_sequence_embedder(residual_stream, mask = mask, **kwargs)
+            # s(e_1:T) is a single compact embedding
 
-            summarized_sequence_embed = self.to_sequence_summary_embed(encoded_residual_stream)
+            if self.compact_sequence_embedding:
+
+                # pack_padded_sequence requires lengths on CPU (PyTorch contract)
+                lengths_cpu = episode_lens.cpu().long()
+                packed_residual_streams = nn.utils.rnn.pack_padded_sequence(
+                    residual_stream, lengths_cpu, batch_first=True, enforce_sorted=False
+                )
+
+                # f_emb
+                _, summarized_sequence = self.internal_sequence_embedder(packed_residual_streams) # B, L, D -> layer, B, D
+                summarized_sequence = summarized_sequence[-1] # B, D
+
+                # channel-mixing projection
+                summarized_sequence_embed = self.to_sequence_summary_embed(summarized_sequence) # B, 32
+                summarized_sequence_embed = summarized_sequence_embed.unsqueeze(1).repeat(1, residual_stream.shape[1], 1) # B, L, 32
+
+            # otherwise treat it as an encoder output sequence (if it's the same)
+
+            else:
+                encoded_residual_stream = self.internal_sequence_embedder(residual_stream, mask = mask, **kwargs)
+                summarized_sequence_embed = self.to_sequence_summary_embed(encoded_residual_stream)
 
             # eq 15
 
+            # residual_stream
             emitter_input = cat((
                 residual_stream,
                 meta_embed_prev,
@@ -1126,7 +1156,7 @@ class Transformer(Module):
             state, target_state = state, state[:, 1:]
 
             if self.state_loss_detach_target_state:
-                target_state = target_state.detach()
+                target_state = target_state.detach().clone()
 
             # actions
 

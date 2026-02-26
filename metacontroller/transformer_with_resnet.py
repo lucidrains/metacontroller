@@ -188,7 +188,7 @@ def resnet50(num_classes = 1000, use_layernorm = False):
 
 # transformer with resnet
 
-@save_load
+@save_load()
 class TransformerWithResnet(Transformer):
     def __init__(
         self,
@@ -200,6 +200,7 @@ class TransformerWithResnet(Transformer):
         encoder_kwargs: dict | None = None,
         **kwargs
     ):
+        kwargs["state_loss_detach_target_state"] = True
         super().__init__(*args, **kwargs)
         self.is_channel_last = is_channel_last
 

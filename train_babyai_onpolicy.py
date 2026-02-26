@@ -29,6 +29,10 @@ import wandb
 
 from einops import rearrange
 
+def symlog(x):
+    """Applies symmetric log transformation."""
+    return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
+
 from torch_einops_utils import pad_sequence, pad_sequence_and_cat, lens_to_mask
 
 from accelerate import Accelerator
@@ -36,12 +40,12 @@ from accelerate import Accelerator
 from babyai_env import (
     create_env,
     get_missions_embeddings,
-    transform_to_symbolic
 )
 import gymnasium as gym
 from gymnasium.vector import AsyncVectorEnv
 from metacontroller.metacontroller import Transformer, MetaController, z_score, extract_grpo_data
 from metacontroller.transformer_with_resnet import TransformerWithResnet
+from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
 from torch.nn.parallel import DistributedDataParallel
 from functools import partial
 
@@ -147,12 +151,13 @@ def visualize_switch_betas(
 # main
 
 def main(
-    seed: int | None = None,
+    seed: int | None = 456,
     npy_seedfile = None,
     env_name = 'BabyAI-BossLevel-v0',
     num_episodes = int(10e6),
     max_timesteps = 500,
     render_every_eps = 1_000,
+    kl_loss_weight = 0.01,
     video_folder = None,
     transformer_weights_path: str | None = None,
     meta_controller_weights_path: str | None = None,
@@ -167,9 +172,12 @@ def main(
     wandb_project = 'metacontroller-babyai-rl',
     reject_threshold_cumulative_reward_variance = None,
     condition_on_mission_embed = False,
+    use_binary_mapper = False,
     env_shared_memory = True,
     env_context = 'fork'
 ):
+
+    torch.manual_seed(seed)
 
     if not exists(max_grad_norm): max_grad_norm = float('inf')
 
@@ -218,7 +226,8 @@ def main(
         render_mode = 'rgb_array',
         video_folder = video_folder,
         render_every_eps = render_every_eps,
-        use_symbolic = False
+        use_symbolic = False,
+        fully_obs = use_resnet
     )
 
     env = AsyncVectorEnv([env_make_fn] * batch_size, shared_memory = env_shared_memory, context = env_context)
@@ -238,7 +247,9 @@ def main(
     if exists(meta_controller_weights_path):
         weights_path = Path(meta_controller_weights_path)
         assert weights_path.exists(), f"meta controller weights not found at {weights_path}"
-        meta_controller = MetaController.init_and_load(str(weights_path), strict = False)
+        meta_controller_klass = MetaControllerWithBinaryMapper if use_binary_mapper else MetaController
+        meta_controller = meta_controller_klass.init_and_load(str(weights_path), strict = False)
+        meta_controller.eval()
 
     meta_controller = default(meta_controller, getattr(model, 'meta_controller', None))
     assert exists(meta_controller), "MetaController must be present for reinforcement learning"
@@ -298,18 +309,15 @@ def main(
             image = state['image']
             image_tensor = torch.from_numpy(image).float().to(accelerator.device)
 
-            # match behavior cloning preprocessing (see train_behavior_clone_babyai.py)
-            image_tensor = torch.clamp(image_tensor / 255.0, min=0.0, max=1.0)
-            mean = torch.tensor([0.485, 0.456, 0.406], device=image_tensor.device)
-            std = torch.tensor([0.229, 0.224, 0.225], device=image_tensor.device)
-            image_tensor = (image_tensor - mean) / std
-
             if use_resnet:
-                # add sequence dimension; keep channels last, TransformerWithResnet.visual_encode handles encoding
+                image_tensor = torch.clamp(image_tensor / 255.0, min=0.0, max=1.0)
+                mean = torch.tensor([0.485, 0.456, 0.406], device=image_tensor.device)
+                std = torch.tensor([0.229, 0.224, 0.225], device=image_tensor.device)
+                image_tensor = (image_tensor - mean) / std
                 image_tensor = rearrange(image_tensor, 'b h w c -> b 1 h w c')
             else:
-                # flatten spatial and channel dims into a single state vector
                 image_tensor = rearrange(image_tensor, 'b h w c -> b 1 (h w c)')
+                # image_tensor = symlog(image_tensor)
 
             if torch.is_tensor(past_action_id):
                 past_action_id = past_action_id.long()
@@ -336,7 +344,6 @@ def main(
             iteration_latent_actions.append(grpo_data.action)
 
             next_state, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
-            next_state['image'] = transform_to_symbolic(next_state['image'])
 
             reward_tensor = torch.from_numpy(reward).float().to(accelerator.device)
             iteration_rewards.append(rearrange(reward_tensor, 'b -> b 1'))
@@ -426,7 +433,9 @@ def main(
             group_latent_actions,
             group_advantages,
             group_switch_betas,
-            episode_lens = episode_lens
+            episode_lens = episode_lens,
+            kl_loss_weight=kl_loss_weight,
+            eps_clip=(0.2, 0.28)
         )
 
         accelerator.backward(loss)
@@ -459,7 +468,7 @@ def main(
         if gradient_step % save_steps == 0:
             store_checkpoint(gradient_step)
 
-        if gradient_step % eval_steps == 0:
+        if gradient_step % eval_steps == 0 and gradient_step > 0:
             visualize_switch_betas(
                 switch_betas = group_switch_betas,
                 episode_lens = episode_lens,
