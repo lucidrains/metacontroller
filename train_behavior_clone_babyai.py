@@ -15,6 +15,9 @@
 # ]
 # ///
 
+import os
+os.environ["JAX_PLATFORMS"] = "cpu"
+
 import fire
 from tqdm import tqdm
 from pathlib import Path
@@ -445,7 +448,7 @@ def train(
                 states = batch['state'].float()
                 # flatten state: (B, T, 7, 7, 3) -> (B, T, 147)
                 states = rearrange(states, 'b t ... -> b t (...)')
-                states = symlog(states.float())
+                # states = symlog(states.float())
 
             actions = batch['action'].long()
             episode_lens = batch.get('_lens')

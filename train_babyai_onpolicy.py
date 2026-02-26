@@ -29,6 +29,10 @@ import wandb
 
 from einops import rearrange
 
+def symlog(x):
+    """Applies symmetric log transformation."""
+    return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
+
 from torch_einops_utils import pad_sequence, pad_sequence_and_cat, lens_to_mask
 
 from accelerate import Accelerator
@@ -44,8 +48,6 @@ from metacontroller.transformer_with_resnet import TransformerWithResnet
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
 from torch.nn.parallel import DistributedDataParallel
 from functools import partial
-
-torch.manual_seed(456)
 
 # Patch x_transformers so checkpoint config can unpickle (Identity was removed/moved in some versions)
 try:
@@ -149,12 +151,13 @@ def visualize_switch_betas(
 # main
 
 def main(
-    seed: int | None = None,
+    seed: int | None = 456,
     npy_seedfile = None,
     env_name = 'BabyAI-BossLevel-v0',
     num_episodes = int(10e6),
     max_timesteps = 500,
     render_every_eps = 1_000,
+    kl_loss_weight = 0.01,
     video_folder = None,
     transformer_weights_path: str | None = None,
     meta_controller_weights_path: str | None = None,
@@ -173,6 +176,8 @@ def main(
     env_shared_memory = True,
     env_context = 'fork'
 ):
+
+    torch.manual_seed(seed)
 
     if not exists(max_grad_norm): max_grad_norm = float('inf')
 
@@ -312,6 +317,7 @@ def main(
                 image_tensor = rearrange(image_tensor, 'b h w c -> b 1 h w c')
             else:
                 image_tensor = rearrange(image_tensor, 'b h w c -> b 1 (h w c)')
+                # image_tensor = symlog(image_tensor)
 
             if torch.is_tensor(past_action_id):
                 past_action_id = past_action_id.long()
@@ -427,7 +433,9 @@ def main(
             group_latent_actions,
             group_advantages,
             group_switch_betas,
-            episode_lens = episode_lens
+            episode_lens = episode_lens,
+            kl_loss_weight=kl_loss_weight,
+            eps_clip=(0.2, 0.28)
         )
 
         accelerator.backward(loss)
@@ -460,7 +468,7 @@ def main(
         if gradient_step % save_steps == 0:
             store_checkpoint(gradient_step)
 
-        if gradient_step % eval_steps == 0:
+        if gradient_step % eval_steps == 0 and gradient_step > 0:
             visualize_switch_betas(
                 switch_betas = group_switch_betas,
                 episode_lens = episode_lens,
