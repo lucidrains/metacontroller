@@ -277,6 +277,7 @@ def train(
     streaming_rl_val_max = 50.,
     streaming_rl_num_bins = 64,
     streaming_rl_entropy_weight = 0.01,
+    streaming_rl_update_only_on_switch = True,
 ):
     # accelerator
 
@@ -342,6 +343,7 @@ def train(
             ('SRL Val Max', streaming_rl_val_max),
             ('SRL Bins', streaming_rl_num_bins),
             ('SRL Entropy', streaming_rl_entropy_weight),
+            ('SRL Update Sw.', streaming_rl_update_only_on_switch),
         ]
     elif evo_phase:
         params += [
@@ -469,13 +471,19 @@ def train(
 
         critic_mlp = MLP(dim, dim_latent, dim_latent, dim_latent, norm_elementwise_affine = False, activate_last = True)
 
+        # Determine the correct dimension from the loaded meta controller
+        if use_binary_mapper:
+            actual_dim_latent = getattr(meta_controller, 'num_codes', 2 ** dim_code_bits)
+        else:
+            actual_dim_latent = getattr(meta_controller, 'dim_latent', dim_latent)
+
         streaming_agent = StreamingACLambda(
             actor = actor_mlp,
             critic = critic_mlp,
             dim_state = dim,
             dim_actor = dim,
             dim_critic = dim_latent,
-            num_continuous_actions = dim_code_bits if use_binary_mapper else dim_latent,
+            num_continuous_actions = actual_dim_latent,
             val_min = streaming_rl_val_min,
             val_max = streaming_rl_val_max,
             num_bins = streaming_rl_num_bins,
@@ -600,12 +608,6 @@ def train(
                 state = torch.cat((state, next_state), dim = -1)
 
                 grpo_data_list = [extract_grpo_data(meta_controller, cache)]
-                rl_states = []
-                rl_actions = []
-
-                if streaming_rl_phase:
-                    rl_states.append(cache.prev_hiddens.meta_controller.input_residual_stream[:, -1])
-                    rl_actions.append(next_state[:, -1])
 
                 for _ in range(sample_num_times - 1):
                     out, next_cache = model(
@@ -624,10 +626,6 @@ def train(
                     next_state = model.action_readout.sample(action_dist[:, -1:], temperature = 1.)
                     state = torch.cat((state, next_state), dim = -1)
 
-                    if streaming_rl_phase:
-                        rl_states.append(next_cache.prev_hiddens.meta_controller.input_residual_stream[:, -1])
-                        rl_actions.append(next_state[:, -1])
-
                     cache = next_cache
 
             # Extract generated text and calculate reward
@@ -644,10 +642,14 @@ def train(
             mean_reward = rewards_tensor.mean().item()
             max_reward = rewards_tensor.max().item()
 
-            if streaming_rl_phase:
+            # Grpo tensors
+            states, actions, log_probs, switch_betas = zip(*grpo_data_list)
+            group_states = torch.cat(states, dim = 1) # (G, T, D)
+            group_actions = torch.cat(actions, dim = 1) # (G, T, D_latent)
+            group_log_probs = torch.cat(log_probs, dim = 1) # (G, T, D_latent)
+            group_switch_betas = torch.cat(switch_betas, dim = 1) # (G, T)
 
-                group_states = torch.stack(rl_states, dim = 1)
-                group_actions = torch.stack(rl_actions, dim = 1)
+            if streaming_rl_phase:
                 num_samples, num_steps, _ = group_states.shape
 
                 for s in range(num_samples):
@@ -655,6 +657,11 @@ def train(
 
                     for t in range(num_steps):
                         is_last = (t == num_steps - 1)
+                        is_switch = group_switch_betas[s, t] > 0.5
+
+                        # temporal compression: optionally only update on switches or last step
+                        if streaming_rl_update_only_on_switch and not (is_switch or is_last):
+                            continue
 
                         metrics = streaming_agent.update(
                             state = group_states[s, t],
@@ -670,13 +677,6 @@ def train(
             else:
                 # GRPO Phase
                 advantages = z_score(rewards_tensor)
-
-                # Grpo tensors
-                states, actions, log_probs, switch_betas = zip(*grpo_data_list)
-                group_states = torch.cat(states, dim = 1) # (G, T, D)
-                group_actions = torch.cat(actions, dim = 1) # (G, T, D_latent)
-                group_log_probs = torch.cat(log_probs, dim = 1) # (G, T, D_latent)
-                group_switch_betas = torch.cat(switch_betas, dim = 1) # (G, T)
 
                 # Policy loss
                 loss = meta_controller.policy_loss(
@@ -767,7 +767,7 @@ def train(
             if accelerator.is_main_process:
                 import wandb
                 if exists(wandb.run):
-                    wandb.log({'evo_fitness': fitness})
+                    wandb.log(dict(evo_fitness = fitness))
 
             return fitness
 
