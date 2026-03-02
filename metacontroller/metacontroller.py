@@ -408,15 +408,15 @@ class MetaController(Module):
         self.register_buffer('kl_loss_step_count', tensor(0.))
 
         self.apply_kl_loss_weight = apply_kl_loss_weight
-        
+
         self.ratio_loss_final_weight = ratio_loss_final_weight
         self.ratio_loss_warmdown_steps = ratio_loss_warmdown_steps
 
         self.compact_sequence_embedding = compact_sequence_embedding
-        
+
         dim_meta = default(dim_meta_controller, dim_model)
 
-        # the linear that brings from model dimension 
+        # the linear that brings from model dimension
 
         self.summary_gru = GRU(dim_model, dim_model) # eq (12)
 
@@ -428,7 +428,7 @@ class MetaController(Module):
 
         if not self.compact_sequence_embedding and isinstance(internal_sequence_embedder, dict):
             embedder_klass = BidirectionalSequenceEmbedder if bidirectional else CausalSequenceEmbedder
-            
+
             if bidirectional:
                 internal_sequence_embedder['pool'] = pool_embedded_sequence
 
@@ -751,7 +751,7 @@ class MetaController(Module):
             resolved_hard_switch = default(hard_switch, self.hard_switch, not discovery_phase)
 
             # call jax
-            
+
             sequential_selection_output = perform_sequential_action_selection(
                 self.switching_unit,
                 self.to_switching_unit_beta,
@@ -763,7 +763,7 @@ class MetaController(Module):
                 self.switch_temperature,
                 resolved_hard_switch
             )
-            
+
             switch_beta = sequential_selection_output.switch_beta
             gated_action = sequential_selection_output.gated_action
             next_switching_unit_gru_hidden = sequential_selection_output.next_switching_unit_gru_hidden
@@ -792,7 +792,7 @@ class MetaController(Module):
                 ), dim = -1)
 
                 switching_unit_gru_out, next_switching_unit_gru_hidden = self.switching_unit(
-                    switch_input, 
+                    switch_input,
                     prev_switching_unit_gru_hidden
                 )
 
@@ -965,7 +965,7 @@ class Transformer(Module):
 
         # meta controller
 
-        self.meta_controller = meta_controller 
+        self.meta_controller = meta_controller
 
         # detaching the target state for the state loss - for the visual encoder based latent state ar prediction
 
@@ -974,7 +974,7 @@ class Transformer(Module):
         self.register_buffer('zero', tensor(0.), persistent = False)
 
         # ensure devices match
-        
+
         if exists(self.meta_controller): self._ensure_consistent_device(self.meta_controller)
 
     def meta_controller_maybe_increment_kl_loss_step(self):

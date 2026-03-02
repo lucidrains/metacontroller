@@ -33,9 +33,9 @@ class CompactSequenceEmbedder(Module):
             )
 
         _, h = self.gru(x)
-        
+
         # take last hidden state (B, D)
         last_h = h[-1]
-        
+
         # repeat to match sequence length (B, L, D)
         return repeat(last_h, 'b d -> b n d', n = seq_len)

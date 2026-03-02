@@ -190,11 +190,11 @@ def main(
     # load model
 
     assert exists(transformer_weights_path), "Transformer weights must be provided"
-    
+
     # lazy import to avoid unnecessary dependencies if not used
     from metacontroller.transformer_with_resnet import TransformerWithResnet as TransformerResnet
     transformer_klass = TransformerResnet if use_resnet else Transformer
-    
+
     model = transformer_klass.init_and_load(transformer_weights_path, strict = False)
     model.eval()
 
@@ -205,7 +205,7 @@ def main(
     assert exists(model.meta_controller), "MetaController must be present for evolution"
 
     # setup environment
-    
+
     babyai_env = BabyAIEnvironment(
         env_id = env_id,
         video_folder = video_folder,

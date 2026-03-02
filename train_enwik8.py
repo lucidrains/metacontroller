@@ -6,7 +6,7 @@ from __future__ import annotations
 #   "accelerate",
 #   "fire",
 #   "torch",
-#   "torch-einops-utils>=0.0.30",  
+#   "torch-einops-utils>=0.0.30",
 #   "einops",
 #   "tqdm",
 #   "numpy<2",
@@ -260,7 +260,7 @@ def train(
     grpo_phase = False,
     num_grpo_batches = 1000,
     grpo_group_size = 32,
-    grpo_learning_rate = 1e-5,
+    grpo_learning_rate = 1e-4,
     grpo_reward_var_threshold = 0.0,
     grpo_hard_switch = True,
     grpo_reward_type = 'exclamation',
@@ -287,14 +287,14 @@ def train(
 
     if (grpo_phase or evo_phase or streaming_rl_phase) and accelerator.is_main_process:
         import wandb
-        
+
         if streaming_rl_phase:
             wandb_name = "streaming_rl"
         elif grpo_phase:
             wandb_name = "grpo"
         else:
             wandb_name = "evo"
-            
+
         wandb.init(project="metacontroller-enwik8", name=wandb_name)
 
     # ensure checkpoint directory exists
@@ -426,19 +426,19 @@ def train(
 
     if grpo_phase or evo_phase or streaming_rl_phase:
         discovery_checkpoint_path = str(Path(checkpoint_path).with_stem(f"{Path(checkpoint_path).stem}-discovery"))
-        
+
         load_path = discovery_checkpoint_path
-            
+
         if exists(load_path):
             accelerator.print(f"loading meta controller checkpoint from {load_path}")
             meta_controller = meta_controller_klass.init_and_load(load_path, strict = False)
         else:
             accelerator.print(f"error: refinement phase requested but no base checkpoint found")
             return
-        
+
         # for backbone, if loading from discovery, we might want to also load the backbone that was saved at discovery end
         # (though currently discovery only saves mc, but it's safer to check)
-        
+
         if Path(checkpoint_path).exists():
             accelerator.print(f"loading backbone checkpoint from {checkpoint_path}")
             model = Transformer.init_and_load(checkpoint_path, strict = False)
@@ -459,9 +459,9 @@ def train(
     discovery_optim = AdamW(meta_controller.discovery_parameters(), lr = discovery_learning_rate)
 
     grpo_optim = AdamW(meta_controller.internal_rl_parameters(), lr = grpo_learning_rate)
-    
+
     # streaming RL initialization
-    
+
     if streaming_rl_phase:
         # simple MLP actor for streaming RL (replaces the transformer action proposer)
 
@@ -502,7 +502,7 @@ def train(
     model, meta_controller, bc_optim, discovery_optim, grpo_optim, train_loader, val_loader = accelerator.prepare(
         model, meta_controller, bc_optim, discovery_optim, grpo_optim, train_loader, val_loader
     )
-    
+
     if streaming_rl_phase:
         streaming_agent = accelerator.prepare(streaming_agent)
 
@@ -549,7 +549,7 @@ def train(
             rewarder = SentimentRewarder(device = accelerator.device)
         else:
             rewarder = ExclamationRewarder()
-        
+
         # validation sanity check from discovery checkpoint
 
         model.eval()
@@ -557,7 +557,7 @@ def train(
             valid_data = next(val_loader)
             state = valid_data[:, :-1]
             actions = valid_data[:, 1:]
-            
+
             outputs = model(
                 state = state,
                 actions = actions,
@@ -565,9 +565,9 @@ def train(
                 return_meta_controller_output = True,
                 meta_controller = meta_controller
             )
-            
+
             discovery_losses, meta_output = outputs
-            
+
             segmented_str = visualize_segments(valid_data[0], meta_output.switch_beta[0], threshold = 0.5)
             accelerator.print(f"\n\n[START VALIDATION] SEGMENTED: {segmented_str}\n")
 
@@ -607,7 +607,12 @@ def train(
                 next_state = model.action_readout.sample(action_dist[:, -1:], temperature = 1.)
                 state = torch.cat((state, next_state), dim = -1)
 
-                grpo_data_list = [extract_grpo_data(meta_controller, cache)]
+                def last(t):
+                    return t[:, -1:]
+
+                first_grpo_data = extract_grpo_data(meta_controller, cache)
+                first_grpo_data = type(first_grpo_data)(*map(last, first_grpo_data))
+                grpo_data_list = [first_grpo_data]
 
                 for _ in range(sample_num_times - 1):
                     out, next_cache = model(
@@ -673,7 +678,7 @@ def train(
                         )
 
                 loss_val = metrics.td_error if exists(metrics) else 0.
-            
+
             else:
                 # GRPO Phase
                 advantages = z_score(rewards_tensor)
@@ -688,16 +693,27 @@ def train(
                 )
 
                 accelerator.backward(loss)
-                accelerator.clip_grad_norm_(meta_controller.parameters(), 0.5)
+                accelerator.clip_grad_norm_(meta_controller.internal_rl_parameters(), 0.5)
                 grpo_optim.step()
                 grpo_optim.zero_grad()
 
                 loss_val = loss.item()
 
+            # calculate hard switch density for logging
+
+            with torch.no_grad():
+                switch_density = (group_switch_betas > 0.5).float().mean().item()
+
             if accelerator.is_main_process:
                 import wandb
                 if exists(wandb.run):
-                    log_dict = dict(loss = loss_val, mean_reward = mean_reward, max_reward = max_reward, reward_var = reward_var.item())
+                    log_dict = dict(
+                        loss = loss_val,
+                        mean_reward = mean_reward,
+                        max_reward = max_reward,
+                        reward_var = reward_var.item(),
+                        switch_density = switch_density
+                    )
 
                     if streaming_rl_phase and exists(metrics):
                         log_dict.update(metrics._asdict())
@@ -739,7 +755,7 @@ def train(
         @torch.no_grad()
         def sentiment_env(transformer):
             transformer.eval()
-            
+
             # handle x_evolution Noisable wrapper
             mc = getattr(transformer, 'meta_controller', None)
             if not exists(mc):
@@ -761,9 +777,9 @@ def train(
 
             texts = [decode_tokens(t.tolist()) for t in generated]
             rewards = rewarder(texts, batch_size = num_eval_samples)
-            
+
             fitness = np.mean(rewards)
-            
+
             if accelerator.is_main_process:
                 import wandb
                 if exists(wandb.run):
@@ -772,9 +788,9 @@ def train(
             return fitness
 
         accelerator.print(f"starting ES optimization for {num_evo_generations} generations...")
-        
+
         model.meta_controller = meta_controller
-        
+
         model.evolve(
             num_generations = num_evo_generations,
             environment = sentiment_env,
@@ -812,7 +828,7 @@ def train(
 
         for _ in range(grad_accum_every):
             data = next(train_loader)
-            
+
             state = data[:, :-1]
             actions = data[:, 1:]
 
@@ -837,7 +853,7 @@ def train(
             if is_discovering:
                 discovery_losses, meta_output = outputs
                 obs_loss, action_recon_loss, kl_loss, ratio_loss = discovery_losses
-                
+
                 entropy_loss = binary_entropy(meta_output.switch_beta).mean()
                 entropy_loss = (entropy_loss - discovery_entropy_loss_threshold).relu()
 
@@ -855,7 +871,7 @@ def train(
                        kl_loss + \
                        entropy_loss * entropy_weight + \
                        ratio_loss
-                
+
                 last_state_loss = obs_loss.item()
                 last_action_loss = action_recon_loss.item()
                 last_switch_density = (meta_output.switch_beta > 0.5).float().mean().item()
@@ -867,7 +883,7 @@ def train(
                 state_loss, action_loss = outputs
                 loss = (action_loss + 0.5) * bc_action_loss_weight + \
                        (state_loss + 0.5) * bc_state_loss_weight
-                
+
                 last_state_loss = state_loss.item()
                 last_action_loss = action_loss.item()
 
@@ -885,7 +901,7 @@ def train(
             action_loss_key = 'action_recon' if is_discovering else 'action'
 
             log_str = f"{i}: loss: {last_loss:.3f} ({phase}) state: {last_state_loss:.3f} {action_loss_key}: {last_action_loss:.3f}"
-            
+
             if is_discovering:
                 log_str += f" density: {last_switch_density:.3f} kl: {last_kl_loss:.3f} kl_weight: {last_kl_weight:.3f} entropy: {last_entropy_loss:.3f} ratio: {last_ratio_loss:.3f}"
                 pbar.set_postfix(state=f"{last_state_loss:.3f}", action_recon=f"{last_action_loss:.3f}", density=f"{last_switch_density:.3f}", kl=f"{last_kl_loss:.3f}", kl_weight=f"{last_kl_weight:.3f}")
@@ -902,7 +918,7 @@ def train(
 
                 state = valid_data[:, :-1]
                 actions = valid_data[:, 1:]
-                
+
                 outputs = model(
                     state = state,
                     actions = actions,
@@ -911,11 +927,11 @@ def train(
                     return_meta_controller_output = is_discovering,
                     meta_controller = meta_controller
                 )
-                
+
                 if is_discovering:
                     discovery_losses, meta_output = outputs
                     loss_val = discovery_losses.action_recon + discovery_losses.state_pred
-                    
+
                     segmented_str = visualize_segments(valid_data[0], meta_output.switch_beta[0], threshold = 0.5)
                     accelerator.print(f"\n\nSEGMENTED: {segmented_str}\n")
                 else:
@@ -933,7 +949,7 @@ def train(
 
             prompt = inp[None, ...]
             sampled = sample(model, prompt, generate_length, meta_controller = meta_controller)
-            
+
             output = decode_tokens(sampled[0])
             accelerator.print(f"\nGENERATED: {output}\n")
 

@@ -81,13 +81,13 @@ class GRUSwitchingUnit(Module):
         prev_hidden = None
     ):
         switch_input = cat((residual_stream, meta_embed_prev, sampled_codes_prev), dim = -1)
-        
+
         gru_out, next_hidden = self.gru(switch_input, prev_hidden)
-        
+
         beta_logit = self.to_beta(gru_out)
         beta = (beta_logit / self.switch_temperature).sigmoid()
         beta = rearrange(beta, '... 1 -> ...')
-        
+
         return beta, next_hidden
 
 @save_load()
@@ -438,11 +438,11 @@ class MetaControllerWithBinaryMapper(Module):
         if seq_len > 1 and not is_ablating_switch:
 
             # resolve hard switch
-            
+
             resolved_hard_switch = default(hard_switch, self.hard_switch, not discovery_phase)
 
             # call jax
-            
+
             sequential_selection_output = perform_sequential_action_selection(
                 self.switching_unit.gru,
                 self.switching_unit.to_beta,
@@ -454,7 +454,7 @@ class MetaControllerWithBinaryMapper(Module):
                 self.switch_temperature,
                 resolved_hard_switch
             )
-            
+
             switch_beta = sequential_selection_output.switch_beta
             gated_codes = sequential_selection_output.gated_action
             next_switching_unit_hidden = sequential_selection_output.next_switching_unit_gru_hidden

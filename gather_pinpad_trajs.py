@@ -68,67 +68,67 @@ class PinPad(GoToSeq):
         """
         assert num_objects <= len(ALLOWED_TYPES) * len(ALLOWED_COLORS), \
             f"Max distinct objects is {len(ALLOWED_TYPES) * len(ALLOWED_COLORS)}"
-        
+
         # Validate obj_indices
         assert len(obj_seq) >= 1, "obj_seq must have at least 1 element"
         assert all(0 <= idx < num_objects for idx in obj_seq), \
             f"All indices in obj_seq must be in [0, {num_objects - 1}]"
-        
+
         self.num_objects = num_objects
         self.obj_seq = obj_seq
-        
+
         # Generate all possible (type, color) combinations and sample
         all_combinations = list(itertools.product(ALLOWED_TYPES, ALLOWED_COLORS))
-        
+
         if seed is not None:
             rng = random.Random(seed)
             self.object_specs = rng.sample(all_combinations, num_objects)
         else:
             # sample the first num_objects
             self.object_specs = all_combinations[:num_objects]
-        
+
         # Create mapping: (type, color) -> object_index (0 to num_objects-1)
         self.obj_to_idx = {spec: idx for idx, spec in enumerate(self.object_specs)}
-        
+
         # One-hot channels:
         # 0: empty cell, 1: agent, 2: wall cell, 3+: distinct objects
         self.num_channels = 3 + num_objects
-        
+
         super().__init__(
-            room_size=room_size, 
-            num_rows=num_rows, 
-            num_cols=num_cols, 
+            room_size=room_size,
+            num_rows=num_rows,
+            num_cols=num_cols,
             num_dists=0,  # We handle objects ourselves
             **kwargs
         )
 
     def gen_mission(self):
         self.place_agent()
-    
+
         # Place all objects in the room (not just the ones in the task sequence)
         for idx in range(self.num_objects):
             obj_type, color = self.object_specs[idx]
             obj = OBJ_CONSTRUCTORS[obj_type](color)
             self.place_in_room(0, 0, obj)
-        
+
         # Build instruction based on obj_indices (which objects to visit and in what order)
         def make_goto(obj_idx):
             t, c = self.object_specs[obj_idx]
             return GoToInstr(ObjDesc(t, c))
-        
+
         # number of objects to visit (i.e. subgoals)
         num_to_visit = len(self.obj_seq)
-        
+
         if num_to_visit == 1:
             self.instrs = make_goto(self.obj_seq[0])
-        
+
         elif num_to_visit == 2:
             # "go to A, then go to B"
             self.instrs = BeforeInstr(
-                make_goto(self.obj_seq[0]), 
+                make_goto(self.obj_seq[0]),
                 make_goto(self.obj_seq[1])
             )
-        
+
         elif num_to_visit == 3:
             # "go to A and go to B, then go to C"
 
@@ -139,7 +139,7 @@ class PinPad(GoToSeq):
                 AndInstr(make_goto(self.obj_seq[0]), make_goto(self.obj_seq[1])),
                 make_goto(self.obj_seq[2])
             )
-        
+
         elif num_to_visit == 4:
             # "go to A and go to B, then go to C and go to D"
 
@@ -150,62 +150,62 @@ class PinPad(GoToSeq):
                 AndInstr(make_goto(self.obj_seq[0]), make_goto(self.obj_seq[1])),
                 AndInstr(make_goto(self.obj_seq[2]), make_goto(self.obj_seq[3]))
             )
-        
+
         else:
             raise ValueError(f"Max 4 objects supported for sequenced missions, got {num_to_visit}")
 
 class OneHotFullyObsWrapper(ObservationWrapper):
     """
     One-hot encoding of the fully observable grid.
-    
+
     Channels:
         0: empty space (None cells)
         1: agent
         2: wall
         3+: distinct objects (indexed by environment's obj_to_idx)
     """
-    
+
     def __init__(self, env):
         super().__init__(env)
-        
+
         # Get num_channels from the unwrapped environment
         unwrapped = self.env.unwrapped
         assert hasattr(unwrapped, 'num_channels'), \
             "Environment must have 'num_channels' attribute (use PinPidEnv)"
-        
+
         self.num_channels = unwrapped.num_channels
         self.obj_to_idx = unwrapped.obj_to_idx
-        
+
         width = unwrapped.width
         height = unwrapped.height
-        
+
         new_image_space = spaces.Box(
             low=0,
             high=1,
             shape=(width, height, self.num_channels),
             dtype="uint8",
         )
-        
+
         self.observation_space = spaces.Dict({
             **self.observation_space.spaces,
             "one_hot": new_image_space,
         })
-    
+
     def observation(self, obs):
         env = self.unwrapped
         width, height = env.width, env.height
-        
+
         # Get full grid encoding: [object_type, color, state]
         full_grid = env.grid.encode()
-        
+
         # Initialize one-hot: (width, height, num_channels)
         one_hot = np.zeros((width, height, self.num_channels), dtype=np.uint8)
-        
+
         for x in range(width):
             for y in range(height):
                 obj_type_id = full_grid[x, y, 0]
                 color_id = full_grid[x, y, 1]
-                
+
                 if obj_type_id == OBJECT_TO_IDX["unseen"] or obj_type_id == 0:
                     # Empty / unseen -> channel 0
                     one_hot[x, y, 0] = 1
@@ -216,10 +216,10 @@ class OneHotFullyObsWrapper(ObservationWrapper):
                     # Distinct object -> look up by (type, color)
                     idx_to_type = {v: k for k, v in OBJECT_TO_IDX.items()}
                     idx_to_color = {v: k for k, v in COLOR_TO_IDX.items()}
-                    
+
                     obj_type = idx_to_type[obj_type_id]
                     color = idx_to_color[color_id]
-                    
+
                     if (obj_type, color) in self.obj_to_idx:
                         obj_idx = self.obj_to_idx[(obj_type, color)]
                         one_hot[x, y, 3 + obj_idx] = 1
@@ -229,12 +229,12 @@ class OneHotFullyObsWrapper(ObservationWrapper):
                 else:
                     # Other (door, goal, lava, etc.) -> treat as empty for now
                     one_hot[x, y, 0] = 1
-        
+
         # Agent position -> channel 1
         agent_x, agent_y = env.agent_pos
         one_hot[agent_x, agent_y, :] = 0  # Clear any other channel
         one_hot[agent_x, agent_y, 1] = 1  # Set agent channel
-        
+
         return {**obs, "one_hot": one_hot}
 
 # helpers
@@ -280,7 +280,7 @@ class BabyAIBotEpsilonGreedy:
 def collect_single_episode(env_id, obj_seq, seed, num_steps, random_action_prob, state_shape, one_hot=False, visualize=False, num_actions=None):
     """
     Collect a single episode of demonstrations.
-    
+
     Args:
         env_id: registered environment ID
         obj_seq: sequence of object indices to visit
@@ -288,7 +288,7 @@ def collect_single_episode(env_id, obj_seq, seed, num_steps, random_action_prob,
         num_steps: max steps per episode
         random_action_prob: probability of taking random action
         state_shape: shape of state observations
-    
+
     Returns:
         tuple of (episode_state, episode_action, success, episode_length)
     """
@@ -302,7 +302,7 @@ def collect_single_episode(env_id, obj_seq, seed, num_steps, random_action_prob,
 
     try:
         state_obs, _ = env.reset(seed=seed)
-        
+
         episode_state = np.zeros((num_steps, *state_shape), dtype=np.float32)
         episode_action = np.zeros(num_steps, dtype=np.float32)
         episode_label = -np.ones(num_steps, dtype=np.float32)     # these are the per-step subgoal labels (i.e. object indices)
@@ -323,7 +323,7 @@ def collect_single_episode(env_id, obj_seq, seed, num_steps, random_action_prob,
                     # each entry in self.expert.stack is a SubGoal instance
                     # current subgoal is the last entry in the stack
                     subgoal = expert.expert.stack[-1]
-                    
+
                     if subgoal.reason == "Explore":
                         obj_idx = -1   # -1 indicates explore
                     else:
@@ -344,7 +344,7 @@ def collect_single_episode(env_id, obj_seq, seed, num_steps, random_action_prob,
 
             state_obs, reward, terminated, truncated, info = env.step(action)
 
-            if visualize: 
+            if visualize:
                 frames.append(env.render())
 
             if terminated:
@@ -363,7 +363,7 @@ def collect_demonstrations(
     num_objects = 4,            # number of distinct objects (across episodes)
     room_size = 8,              # size of each room (width and height)
     num_rows = 1,               # number of rows of rooms
-    num_cols = 1,               # number of columns of rooms    
+    num_cols = 1,               # number of columns of rooms
     obj_seqs = [[0,1,2]],     # list of object sequences to visit
     seeds = None,               # list of seeds (if None, uses range(num_seeds))
     num_seeds = 100,            # number of seeds (ignored if seeds is provided)
@@ -377,25 +377,25 @@ def collect_demonstrations(
 ):
     """
     Collect demonstrations using BabyAI Bot for the PinPad environment.
-    
+
     For each (obj_seq, seed) pair, collects one episode.
     Total episodes = len(obj_seqs) * len(seeds)
-    
+
     Parallelized using ProcessPoolExecutor.
     """
 
     # Register the environment
     if env_id in gym.envs.registry:
         del gym.envs.registry[env_id]
-    
+
     register(
         id=env_id,
         entry_point=PinPad,
         kwargs={
-            "num_objects": num_objects, 
+            "num_objects": num_objects,
             "obj_seq": obj_seqs[0],  # placeholder, will be overridden at gym.make
-            "room_size": room_size, 
-            "num_rows": num_rows, 
+            "room_size": room_size,
+            "num_rows": num_rows,
             "num_cols": num_cols
         },
     )
@@ -428,7 +428,7 @@ def collect_demonstrations(
     # Build list of seeds
     if seeds is None:
         seeds = list(range(num_seeds))
-    
+
     # Create all (obj_seq, seed) pairs
     all_tasks = [(obj_seq, seed) for obj_seq in obj_seqs for seed in seeds]
     total_episodes = len(all_tasks)
@@ -467,7 +467,7 @@ def collect_demonstrations(
             if exists(task):
                 obj_seq, seed = task
                 future = executor.submit(
-                    collect_single_episode, env_id, obj_seq, seed, 
+                    collect_single_episode, env_id, obj_seq, seed,
                     num_steps, random_action_prob, state_shape, one_hot, visualize, num_actions
                 )
                 futures[future] = task
@@ -493,7 +493,7 @@ def collect_demonstrations(
                         assert frames is not None
                         frames_path = output_folder / f"episode_{successful}.gif"
                         imageio.mimsave(frames_path, frames, fps=3)
-                    
+
                     successful += 1
 
                 progressbar.update(1)
@@ -532,7 +532,7 @@ if __name__ == "__main__":
     # How to run this script in terminal:
 
     python gather_pinpad_trajs.py \
-        --num_objects 4 \   
+        --num_objects 4 \
         --obj_seqs "[[0,1,2],[0,2,1],[2,3,1],[0,2,3]]" \     # tasks i.e. list of object sequences to visit
         --room_size 8 \
         --num_rows 1 \

@@ -66,7 +66,7 @@ def create_pinpad_env(env_id, num_objects, obj_seq, room_size, num_rows, num_col
     """Register and create a PinPad environment."""
     if env_id in gym.envs.registry:
         del gym.envs.registry[env_id]
-    
+
     register(
         id=env_id,
         entry_point=PinPad,
@@ -78,7 +78,7 @@ def create_pinpad_env(env_id, num_objects, obj_seq, room_size, num_rows, num_col
             "num_cols": num_cols
         },
     )
-    
+
     env = gym.make(env_id, obj_seq=obj_seq)
     #env = OneHotFullyObsWrapper(env)
     env = FullyObsWrapper(env)
@@ -97,48 +97,48 @@ def visualize_switch_betas_vs_labels(
     Logs a single stacked figure to wandb.
     """
     B, T_minus_1 = switch_betas.shape
-    
+
     # randomly sample sequences from the batch
     num_samples = min(num_samples, B)
     sample_indices = np.random.choice(B, size=num_samples, replace=False)
-    
+
     # create figure with 2 * num_samples subplots (labels + switch_betas for each sample)
     fig, axes = plt.subplots(2 * num_samples, 1, figsize=(12, 3 * num_samples), sharex=False)
     fig.suptitle(f'Step {gradient_step} | Note: -1 in labels = explore (no specific subgoal)', fontsize=10)
-    
+
     for i, idx in enumerate(sample_indices):
         # get episode length for this sample (if available)
         if episode_lens is not None:
             ep_len = int(episode_lens[idx].item())
         else:
             ep_len = T_minus_1
-        
+
         # extract data for this sample
         sample_switch_betas = switch_betas[idx, :ep_len-1].detach().cpu()  # (T-1,)
         sample_labels = labels[idx, :ep_len].cpu()  # (T,)
-        
+
         # get axes for this sample pair
         ax1 = axes[2 * i]      # labels
         ax2 = axes[2 * i + 1]  # switch betas
-        
+
         # top plot: labels (align with switch_betas by using labels[:-1])
         ax1.plot(sample_labels[:-1].numpy(), label=f'labels (sample {idx})', color='red')
         ax1.set_ylabel('labels')
         ax1.legend(loc='upper right')
-        
+
         # bottom plot: switch betas
         ax2.plot(sample_switch_betas.numpy(), label='switch betas', linewidth=2)
         ax2.set_xlabel('timesteps')
         ax2.set_ylabel('switch betas')
         ax2.legend(loc='upper right')
-    
+
     plt.tight_layout()
-    
+
     # log to wandb
     wandb.log({
         f"switch_betas_vs_labels/step_{gradient_step}": wandb.Image(fig)
     }, step=gradient_step)
-    
+
     plt.close(fig)
 
 
@@ -335,7 +335,7 @@ def train(
             states = batch['state'].float()
             states = torch.clamp(states / 255.0, min=0.0, max=1.0)
             states = (states - torch.tensor([0.485, 0.456, 0.406]).to(states.device)) / torch.tensor([0.229, 0.224, 0.225]).to(states.device)
-            
+
             actions = batch['action'].long()
             labels = batch.get('label')
             if labels is not None:
@@ -347,7 +347,7 @@ def train(
             else:
                 mission_embeddings = None
 
-            if use_resnet: 
+            if use_resnet:
                 states = model.visual_encode(states)
             else: # flatten state: (B, T, 7, 7, 3) -> (B, T, 147)
                 states = rearrange(states, 'b t ... -> b t (...)')
@@ -365,7 +365,7 @@ def train(
 
                 if is_discovering:
                     obs_loss, action_recon_loss, kl_loss, ratio_loss = losses
- 
+
                     loss = (
                         obs_loss * discovery_obs_loss_weight +
                         action_recon_loss * discovery_action_recon_loss_weight +
@@ -413,13 +413,13 @@ def train(
                     optim.zero_grad()
 
             # log
-            
+
             for key, value in log.items():
                 total_losses[key] += value
 
-            if is_discovering: 
+            if is_discovering:
                 prefix = "discovery_phase"
-            else: 
+            else:
                 prefix = "behavior_cloning"
 
             accelerator.log({
@@ -431,7 +431,7 @@ def train(
             progress_bar.set_postfix(**log)
             gradient_step += 1
 
-            # checkpoint 
+            # checkpoint
 
             if gradient_step % save_steps == 0:
                 accelerator.wait_for_everyone()

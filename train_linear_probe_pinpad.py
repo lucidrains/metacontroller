@@ -69,7 +69,7 @@ def create_pinpad_env(env_id, num_objects, obj_seq, room_size, num_rows, num_col
     """Register and create a PinPad environment."""
     if env_id in gym.envs.registry:
         del gym.envs.registry[env_id]
-    
+
     register(
         id=env_id,
         entry_point=PinPad,
@@ -81,7 +81,7 @@ def create_pinpad_env(env_id, num_objects, obj_seq, room_size, num_rows, num_col
             "num_cols": num_cols
         },
     )
-    
+
     env = gym.make(env_id, obj_seq=obj_seq)
     #env = OneHotFullyObsWrapper(env)
     env = RGBImgObsWrapper(env)
@@ -111,48 +111,48 @@ def visualize_switch_betas_vs_labels(
     Logs a single stacked figure to wandb.
     """
     B, T_minus_1 = switch_betas.shape
-    
+
     # randomly sample sequences from the batch
     num_samples = min(num_samples, B)
     sample_indices = np.random.choice(B, size=num_samples, replace=False)
-    
+
     # create figure with 2 * num_samples subplots (labels + switch_betas for each sample)
     fig, axes = plt.subplots(2 * num_samples, 1, figsize=(12, 3 * num_samples), sharex=False)
     fig.suptitle(f'Step {gradient_step} | Note: -1 in labels = explore (no specific subgoal)', fontsize=10)
-    
+
     for i, idx in enumerate(sample_indices):
         # get episode length for this sample (if available)
         if episode_lens is not None:
             ep_len = int(episode_lens[idx].item())
         else:
             ep_len = T_minus_1
-        
+
         # extract data for this sample
         sample_switch_betas = switch_betas[idx, :ep_len-1].detach().cpu()  # (T-1,)
         sample_labels = labels[idx, :ep_len].cpu()  # (T,)
-        
+
         # get axes for this sample pair
         ax1 = axes[2 * i]      # labels
         ax2 = axes[2 * i + 1]  # switch betas
-        
+
         # top plot: labels (align with switch_betas by using labels[:-1])
         ax1.plot(sample_labels[:-1].numpy(), label=f'labels (sample {idx})', color='red')
         ax1.set_ylabel('labels')
         ax1.legend(loc='upper right')
-        
+
         # bottom plot: switch betas
         ax2.plot(sample_switch_betas.numpy(), label='switch betas', linewidth=2)
         ax2.set_xlabel('timesteps')
         ax2.set_ylabel('switch betas')
         ax2.legend(loc='upper right')
-    
+
     plt.tight_layout()
-    
+
     # log to wandb
     wandb.log({
         f"switch_betas_vs_labels/step_{gradient_step}": wandb.Image(fig)
     }, step=gradient_step)
-    
+
     plt.close(fig)
 
 
@@ -363,7 +363,7 @@ def train(
                 if labels is None:
                     progress_bar.set_postfix(probe_skip="no_labels")
                     continue
- 
+
                 with torch.no_grad():
                     _, residual_stream = model(
                         state=states,
@@ -446,7 +446,7 @@ def train(
                         within_episode = torch.arange(seq_len, device=action_logits.device)[None, :] < ep_len_eff[:, None]
                     else:
                         within_episode = torch.ones(action_logits.shape[0], seq_len, dtype=torch.bool, device=action_logits.device)
-                    
+
                     # modify the action accuracy s.t. only the predictions within each episode_length are considered
                     action_acc = (pred_actions[within_episode] == target_actions[within_episode]).float().mean().item()
                     #action_acc = (pred_actions[:, :episode_lens.min().item() - 1] == target_actions[:, :episode_lens.min().item() - 1]).float().mean().item()

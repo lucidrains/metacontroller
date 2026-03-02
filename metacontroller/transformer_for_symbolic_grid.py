@@ -112,13 +112,13 @@ class TransformerForSymbolicGrid(Transformer):
         super().__init__(dim = dim, **kwargs)
 
         self.symbolic_embed, self.symbolic_readout = self.state_embed, self.state_readout
-        
+
         self.spatial_processor = SpatialProcessor(
             dim,
             depth = spatial_processor_depth,
             kernel_size = convnext_kernel_size
         )
-        
+
         self.to_model_dim = Reduce('b t w h d -> b t d', 'mean')
 
         # override state_embed and state_readout to use symbolic pipeline

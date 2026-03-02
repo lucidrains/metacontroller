@@ -183,7 +183,7 @@ def test_metacontroller(
     # simulate a policy loss update over the entire group
 
     group_states, group_log_probs, group_switch_betas, group_latent_actions = map(partial(cat, dim = 0), zip(*all_episodes))
-    
+
     # parallel verification
 
     parallel_action_dist = meta_controller.get_action_dist_for_internal_rl(group_states)
@@ -240,13 +240,13 @@ def test_kl_loss_warmup_e2e():
     dim_model = 64
     kl_loss_weight = 0.2
     kl_loss_warmup_steps = 10
-    
+
     mc = MetaController(
         dim_model = dim_model,
         kl_loss_weight = kl_loss_weight,
         kl_loss_warmup_steps = kl_loss_warmup_steps
     )
-    
+
     transformer = Transformer(
         dim = dim_model,
         state_embed_readout = dict(num_continuous = dim_model),
@@ -255,24 +255,24 @@ def test_kl_loss_warmup_e2e():
         upper_body = dict(depth = 1),
         meta_controller = mc
     )
-    
+
     # Step 0
     state = torch.randn(1, 2, dim_model)
     actions = torch.randn(1, 2, dim_model)
-    
+
     _, output = transformer(state, actions, discovery_phase = True, return_meta_controller_output = True)
     assert output.kl_loss_weight == 0.0
     assert output.kl_loss == 0.0
-    
+
     # Step 5
     for _ in range(5):
         transformer.meta_controller_maybe_increment_kl_loss_step()
-        
+
     assert transformer.meta_controller_current_kl_loss_weight == 0.1
-    
+
     _, output5 = transformer(state, actions, discovery_phase = True, return_meta_controller_output = True)
     assert output5.kl_loss_weight == 0.1
-    
+
     # Step 10
     for _ in range(5):
         transformer.meta_controller_maybe_increment_kl_loss_step()
@@ -303,7 +303,7 @@ def test_kl_loss_warmup_e2e():
         kl_loss_warmup_steps = 10,
         apply_kl_loss_weight = False
     )
-    
+
     transformer_no_weight = Transformer(
         dim = dim_model,
         state_embed_readout = dict(num_continuous = dim_model),
@@ -398,7 +398,7 @@ def test_transformer_bc_parity():
     # sequential forward
     sequential_logits = []
     cache = None
-    
+
     states = state.unbind(dim = 1)
     past_actions = [None, *actions[:, :-1].unbind(dim = 1)]
 
@@ -497,7 +497,7 @@ def test_switch_ablation():
     # test transformer discovery ablation
     state = torch.randn(batch, seq_len, dim)
     actions = torch.randn(batch, seq_len, dim)
-    
+
     losses, meta_output = transformer(
         state,
         actions = actions,
@@ -610,7 +610,7 @@ def test_jax_pytorch_parity():
         torch_jax_sequential_selection,
         HAS_JAX
     )
-    
+
     if not HAS_JAX:
         pytest.skip("JAX not installed")
 
@@ -625,10 +625,10 @@ def test_jax_pytorch_parity():
     sla = torch.randn(batch, seq_len, dim_latent, device = device)
     h0 = torch.randn(1, batch, dim_meta, device = device)
     z0 = torch.randn(batch, 1, dim_latent, device = device)
-    
+
     with torch.no_grad():
         pt_out = pytorch_sequential_action_selection(gru, to_beta, rs, me, sla, h0, z0, 1.0, False)
-        
+
         jax_beta, jax_action, jax_hidden = torch_jax_sequential_selection(
             gru.weight_ih_l0, gru.weight_hh_l0, gru.bias_ih_l0, gru.bias_hh_l0,
             to_beta.weight, to_beta.bias, rs, me, sla, h0.squeeze(0), z0.squeeze(1), 1.0, False
@@ -640,22 +640,22 @@ def test_jax_pytorch_parity():
 
 def test_compact_sequence_embedder():
     from metacontroller.compact_sequence_embedder import CompactSequenceEmbedder
-    
+
     dim = 64
     seq_len = 10
     batch = 2
-    
+
     embedder = CompactSequenceEmbedder(dim = dim)
-    
+
     x = torch.randn(batch, seq_len, dim)
     episode_lens = torch.tensor([5, 10])
-    
+
     out = embedder(x, episode_lens = episode_lens)
-    
+
     assert out.shape == (batch, seq_len, dim)
-    
+
     # manual check: last hidden of first sequence (len 5) should be repeated for out[0]
     _, h = embedder.gru(x[0:1, :5])
     expected0 = repeat(h[-1], '1 d -> n d', n = seq_len)
-    
+
     assert torch.allclose(out[0], expected0, atol = 1e-6)
