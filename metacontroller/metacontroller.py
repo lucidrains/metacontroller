@@ -729,7 +729,7 @@ class MetaController(Module):
 
         action_dist = readout(proposed_action_hidden)
 
-        sampled_latent_action = readout.sample(action_dist, temperature = temperature)
+        sampled_latent_action = readout.sample(action_dist, temperature = temperature, differentiable = True)
 
         # switching unit timer
 
