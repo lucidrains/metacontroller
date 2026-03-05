@@ -906,7 +906,8 @@ class Transformer(Module):
         state_loss_detach_target_state = True,
         embed_past_actions = True,
         normalize_state_action_losses = False,
-        loss_normalizer_beta = 0.999
+        loss_normalizer_beta = 0.999,
+        lower_transformer_post_norm = False
     ):
         super().__init__()
 
@@ -935,11 +936,12 @@ class Transformer(Module):
             )
 
         if isinstance(lower_body, dict):
-            lower_body = Decoder(dim = dim, pre_norm_has_final_norm = False, **transformer_kwargs, **lower_body)
-
-            # x_transformers passes condition into final_norm when need_condition; nn.Identity() rejects kwargs → use wrapper
-            # remove at later date, should be fixed in latest x-transformers
-            lower_body.final_norm = Identity()
+            lower_body = Decoder(
+                dim = dim,
+                pre_norm_has_final_norm = lower_transformer_post_norm,
+                **transformer_kwargs,
+                **lower_body
+            )
 
         if isinstance(upper_body, dict):
             upper_body = Decoder(dim = dim, **transformer_kwargs, **upper_body)
