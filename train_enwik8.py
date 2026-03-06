@@ -148,6 +148,7 @@ def sample(
     prompt: Tensor,
     seq_len: int,
     temperature = 1.,
+    force_behavior_cloning = False,
     meta_controller = None
 ):
     model.eval()
@@ -163,6 +164,7 @@ def sample(
         actions = action,
         return_cache = True,
         return_state_action_cache = True,
+        force_behavior_cloning = force_behavior_cloning,
         meta_controller = meta_controller
     )
 
@@ -177,6 +179,7 @@ def sample(
             actions = state[:, -1:],
             cache = cache,
             return_state_action_cache = True,
+            force_behavior_cloning = force_behavior_cloning,
             meta_controller = meta_controller
         )
 
@@ -217,8 +220,9 @@ class ActionProposerMLP(Module):
 # train function
 
 def train(
-    num_bc_batches = 5000,
-    num_discovery_batches = 5000,
+    bc_phase = False,
+    num_bc_batches = 10000,
+    num_discovery_batches = 10000,
     discovery_warmup_steps = 100,
     batch_size = 4,
     grad_accum_every = 4,
@@ -254,6 +258,7 @@ def train(
     switch_temperature = 0.1,
     discovery_phase = False,
     discovery_hard_switch = False,
+    metacontroller_residual_stream_dropout_prob = 0.1,
     cpu = False,
     checkpoint_path = './results-enwik8/train-enwik8.pt',
     enwik8_path = './data/enwik8.gz',
@@ -283,7 +288,7 @@ def train(
 
     accelerator = Accelerator(cpu = cpu)
 
-    assert sum([grpo_phase, evo_phase, streaming_rl_phase]) <= 1, 'only one of grpo_phase, evo_phase, or streaming_rl_phase can be active'
+    assert sum([bc_phase, discovery_phase, grpo_phase, evo_phase, streaming_rl_phase]) == 1, 'exactly one training phase must be active (bc, discovery, grpo, evo, or streaming_rl)'
 
     if (grpo_phase or evo_phase or streaming_rl_phase) and accelerator.is_main_process:
         import wandb
@@ -305,6 +310,7 @@ def train(
     # hyperparameter summary
 
     params = [
+        ('BC Phase', bc_phase),
         ('Discovery Phase', discovery_phase),
         ('BC Steps', num_bc_batches),
         ('Discovery Steps', num_discovery_batches),
@@ -417,6 +423,7 @@ def train(
         action_embed_readout = dict(num_discrete = 256),
         lower_body = dict(depth = depth, heads = heads, attn_dim_head = attn_dim_head),
         upper_body = dict(depth = depth, heads = heads, attn_dim_head = attn_dim_head),
+        lower_transformer_post_norm = True,
         meta_controller = None
     )
 
@@ -805,8 +812,13 @@ def train(
         unwrapped_meta_controller.save(evo_checkpoint_path)
         return
 
-    start_step = num_bc_batches if discovery_phase else 0
-    total_steps = num_bc_batches + num_discovery_batches
+    if bc_phase:
+        start_step = 0
+        total_steps = num_bc_batches
+    else:
+        start_step = num_bc_batches
+        total_steps = num_bc_batches + num_discovery_batches
+    
     pbar = tqdm.tqdm(range(start_step, total_steps), mininterval = 10.0, desc = "training")
 
     for i in pbar:
@@ -847,7 +859,8 @@ def train(
                 force_behavior_cloning = not is_discovering,
                 control_signal_multiplier = multiplier,
                 return_meta_controller_output = is_discovering,
-                meta_controller = meta_controller
+                meta_controller = meta_controller,
+                metacontroller_residual_stream_dropout = metacontroller_residual_stream_dropout_prob
             )
 
             if is_discovering:
@@ -948,7 +961,7 @@ def train(
             accelerator.print(f"\nPROMPT: {prime}")
 
             prompt = inp[None, ...]
-            sampled = sample(model, prompt, generate_length, meta_controller = meta_controller)
+            sampled = sample(model, prompt, generate_length, force_behavior_cloning = True, meta_controller = meta_controller)
 
             output = decode_tokens(sampled[0])
             accelerator.print(f"\nGENERATED: {output}\n")

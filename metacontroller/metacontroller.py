@@ -1109,7 +1109,8 @@ class Transformer(Module):
         ablate_switch_beta: Tensor | None = None,
         switch_beta_frequency: int | None = None,
         update_loss_ema: bool | None = None,
-        hard_switch: bool | None = None
+        hard_switch: bool | None = None,
+        metacontroller_residual_stream_dropout: float = 0.
     ):
 
         device = state.device
@@ -1228,6 +1229,9 @@ class Transformer(Module):
 
             if control_signal_multiplier != 1.0:
                 control_signal = control_signal * control_signal_multiplier
+
+            if metacontroller_residual_stream_dropout > 0.:
+                residual_stream = F.dropout(residual_stream, p = metacontroller_residual_stream_dropout, training = self.training)
 
             modified_residual_stream = residual_stream + control_signal
 
