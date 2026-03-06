@@ -310,7 +310,7 @@ def main(
     env_context = 'fork'
 ):
 
-    torch.manual_seed(seed)
+    torch.manual_seed(456)
 
     if not exists(max_grad_norm): max_grad_norm = float('inf')
 
@@ -329,14 +329,9 @@ def main(
         if npy_seedfile_seeds_limit != None:
             group_seeds = group_seeds[:npy_seedfile_seeds_limit]
         
-    seed_index = 0
-
     def get_next_seed():
-        nonlocal seed_index
         if group_seeds is not None:
-            s = group_seeds[seed_index % len(group_seeds)]
-            seed_index += 1
-            return s
+            return group_seeds[torch.randint(0, len(group_seeds), (1,)).item()]
         if exists(seed):
             return seed
         return torch.randint(0, 1000000, (1,)).item()
