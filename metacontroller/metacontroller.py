@@ -7,7 +7,7 @@ from loguru import logger
 
 import torch
 from torch import nn, cat, stack, tensor, is_tensor, Tensor
-from torch.nn import Module, GRU, Linear, Identity
+from torch.nn import Module, Linear, Identity, GRU, Parameter
 
 import torch.nn.functional as F
 
@@ -477,8 +477,14 @@ class MetaController(Module):
         self.has_ratio_loss = ratio_loss_weight > 0.
 
         self.ratio_loss_weight = ratio_loss_weight
+        use_layerscale = True
+
         self.ratio_loss_chunk_size = ratio_loss_chunk_size
         self.target_temporal_segment_len = target_temporal_segment_len
+
+        # control signal layerscale
+
+        self.layerscale = Parameter(torch.zeros(dim_model) - 2.) if use_layerscale else None
 
         # decoder
 
@@ -568,6 +574,11 @@ class MetaController(Module):
             *self.decoder.parameters(),
             *self.switch_gating.parameters()
         ]
+
+        if exists(self.layerscale):
+            params.append(self.layerscale)
+
+        return params
 
     def internal_rl_parameters(self):
         return [
@@ -847,6 +858,11 @@ class MetaController(Module):
         # generating the residual stream controlling signal
 
         control_signal = einsum(residual_stream, hypernetwork_weight, '... d1, ... d1 d2 -> ... d1')
+
+        # gate the control signal with a learnable softplus initialized small
+
+        if exists(self.layerscale):
+            control_signal = control_signal * F.softplus(self.layerscale)
 
         # maybe ratio loss
 
