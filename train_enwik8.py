@@ -35,6 +35,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 from einops import rearrange
 
 from metacontroller import MetaController, Transformer, binary_entropy
@@ -278,7 +279,8 @@ def train(
 ):
     # accelerator
 
-    accelerator = Accelerator(cpu = cpu)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(cpu = cpu, kwargs_handlers=[ddp_kwargs])
 
     assert sum([bc_phase, discovery_phase, grpo_phase, evo_phase, streaming_rl_phase]) == 1, 'exactly one training phase must be active (bc, discovery, grpo, evo, or streaming_rl)'
 

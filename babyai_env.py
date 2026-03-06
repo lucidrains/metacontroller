@@ -10,7 +10,7 @@ from gymnasium import spaces
 from gymnasium.core import Wrapper
 
 import minigrid
-from minigrid.wrappers import FullyObsWrapper, SymbolicObsWrapper
+from minigrid.wrappers import SymbolicObsWrapper, RGBImgPartialObsWrapper
 
 from sentence_transformers import SentenceTransformer
 
@@ -142,8 +142,7 @@ def create_env(
     render_mode = 'rgb_array',
     video_folder = None,
     render_every_eps = 1000,
-    use_symbolic = True,
-    fully_obs = True
+    use_symbolic = True
 ):
     # register minigrid environments if needed
     # minigrid.register_minigrid_envs()
@@ -151,11 +150,10 @@ def create_env(
     # environment
     env = gym.make(env_id, render_mode = render_mode)
 
-    if fully_obs:
-        env = FullyObsWrapper(env)
-
     if use_symbolic:
         env = SymbolicObsWrapper(env)
+    else:
+        env = RGBImgPartialObsWrapper(env)
 
     env = BabyAISharedMemoryWrapper(env)
 

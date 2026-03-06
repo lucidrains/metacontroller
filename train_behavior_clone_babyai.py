@@ -49,6 +49,10 @@ from babyai_env import get_mission_embedding
 import minigrid
 import gymnasium as gym
 
+MODALITY_RESNET_RGB = "resnet_rgb"
+MODALITY_RAW_RGB = "raw_rgb"
+MODALITY_SYMBOLIC = "symbolic"
+
 # helpers
 
 def symlog(x):
@@ -83,7 +87,8 @@ def visualize_switch_betas(
     switch_betas,      # (B, T-1)
     episode_lens,      # (B,) or None
     gradient_step,
-    num_samples = 3
+    num_samples = 3,
+    accelerator = None
 ):
     """
     Visualize switch betas for randomly sampled sequences in the batch.
@@ -124,23 +129,28 @@ def visualize_switch_betas(
     plt.tight_layout()
 
     # log to wandb
-    wandb.log({
-        f"switch_betas/step_{gradient_step}": wandb.Image(fig)
-    }, step=gradient_step)
-
+    if exists(accelerator):
+        tracker = accelerator.get_tracker("wandb")
+        if exists(tracker):
+            tracker.log({
+                f"switch_betas/step_{gradient_step}": wandb.Image(fig)
+            }, step=gradient_step)
+    
     plt.close(fig)
 
 def train(
     run_seed = 42,
     input_dir = None,
     env_id = None,
+    resnet_pretraining_epochs = 0,
+    modality = MODALITY_RAW_RGB,
     cloning_epochs = 10,
     discovery_epochs = 10,
     batch_size = 128,
     gradient_accumulation_steps = None,
     lr = 1e-4,
     discovery_lr = 1e-4,
-    lr_schedule = "cosine",  # "cosine" or "constant"; cosine decays LR to lr * lr_min_ratio over BC phase
+    lr_schedule = "constant",  # "cosine" or "constant"; cosine decays LR to lr * lr_min_ratio over BC phase
     weight_decay = 0.03,
     discovery_weight_decay = 0.03,
     dim = 512,
@@ -168,7 +178,7 @@ def train(
     discovery_kl_loss_warmup_steps = 2000,  # paper: linear ramp over first 2K steps (0 -> final alpha)
     normalize_state_action_losses = False,
     max_grad_norm = 1.,
-    use_resnet = False,
+    visual_recon_loss_weight = 1.0,
     condition_on_mission_embed = False,
     mission_embed_dim = 384,
     lr_min_ratio = 0.05,     # minimum LR as fraction of initial
@@ -249,7 +259,6 @@ def train(
                 "switch_temperature": switch_temperature,
                 "hypernetwork_low_rank": hypernetwork_low_rank if use_binary_mapper else None,
                 "target_temporal_segment_len": target_temporal_segment_len if use_binary_mapper else None,
-                "discovery_ratio_loss_weight": discovery_ratio_loss_weight,
                 "lr_min_ratio": lr_min_ratio if lr_schedule == "cosine" else None,
             }
         )
@@ -266,8 +275,10 @@ def train(
     # state: (B, T, H, W, C) or (B, T, D)
 
     state_shape = replay_buffer.shapes['state']
-    if use_resnet: state_dim = 256
-    else: state_dim = int(torch.tensor(state_shape).prod().item())
+    if modality == MODALITY_RESNET_RGB: 
+        state_dim = 256
+    elif modality == MODALITY_RAW_RGB or modality == MODALITY_SYMBOLIC: 
+        state_dim = int(torch.tensor(state_shape).prod().item())
 
     # deduce num_actions from the environment
 
@@ -307,8 +318,8 @@ def train(
         )
 
     # transformer
-
-    transformer_class = TransformerWithResnet if use_resnet else Transformer
+    
+    transformer_class = TransformerWithResnet if modality == MODALITY_RESNET_RGB else Transformer
 
     transformer_kwargs = dict(
         dim = dim,
@@ -323,8 +334,9 @@ def train(
         dim_condition = mission_embed_dim if condition_on_mission_embed else None,
         normalize_state_action_losses = normalize_state_action_losses
     )
-    if use_resnet: transformer_kwargs["use_layernorm"] = True # resnet won't suffer from grad. accum.
-
+    if modality == MODALITY_RESNET_RGB: 
+        transformer_kwargs["use_layernorm"] = True # resnet won't suffer from grad. accum.
+    
 
     model = transformer_class(**transformer_kwargs)
 
@@ -386,36 +398,102 @@ def train(
     discovery_step = 0
 
     gradient_step = 0
+    is_behavior_cloning = False
     is_discovering = False
-    for epoch in range(cloning_epochs + discovery_epochs):
+    is_pretraining_resnet = False
+
+    # total epochs
+
+    if load_transformer_weights_path != None:
+        cloning_epochs = 0
+    if modality != MODALITY_RESNET_RGB:
+        resnet_pretraining_epochs = 0
+
+    total_epochs = resnet_pretraining_epochs + cloning_epochs + discovery_epochs
+
+
+    def get_training_phase(epoch):
+        if modality == MODALITY_RESNET_RGB:
+            epoch_schedule = {
+                "resnet_pretrain": 0,
+                "behavior_cloning": resnet_pretraining_epochs,
+                "discovery_phase": resnet_pretraining_epochs + cloning_epochs
+            }
+        else:
+            epoch_schedule = {
+                "behavior_cloning": 0,
+                "discovery_phase": cloning_epochs
+            }
+        for k, v in epoch_schedule.items():
+            if epoch < v: break
+            phase = k
+        return phase
+    
+    for epoch in range(total_epochs):
+
+        current_training_phase = get_training_phase(epoch)
 
         total_losses = defaultdict(float)
 
         progress_bar = tqdm(dataloader, desc = f"Epoch {epoch}", disable = not accelerator.is_local_main_process)
 
-        # store checkpoint on switching
-        if cloning_epochs > 0 and not is_discovering and epoch >= cloning_epochs:
-            accelerator.wait_for_everyone()
-            store_checkpoint()
+        # setting training_phase & checkpointing
 
-        is_discovering = (epoch >= cloning_epochs) # discovery phase is BC with metacontroller tuning
+        if current_training_phase == "resnet_pretrain":
+            is_pretraining_resnet = True
+            is_discovering = False
+            is_behavior_cloning = False
 
-        # Paper: KL ramp over first 2K discovery steps; reset counter when entering discovery.
-        if is_discovering and epoch == cloning_epochs:
-            if isinstance(model, DistributedDataParallel):
-                model.module.meta_controller_reset_kl_loss_warmup()
-            else:
-                model.meta_controller_reset_kl_loss_warmup()
+            # enable only the visual backbones
+            if isinstance(model, DistributedDataParallel): 
+                set_requires_grad(model.module, False)
+                set_requires_grad(model.module.visual_encoder, True)
+                set_requires_grad(model.module.final_norm, True)
+                set_requires_grad(model.module.visual_decoder, True)
+            else: 
+                set_requires_grad(model, False)
+                set_requires_grad(model.visual_encoder, True)
+                set_requires_grad(model.final_norm, True)
+                set_requires_grad(model.visual_decoder, True)
 
-        # if is_discovering:
-        #     if isinstance(model, DistributedDataParallel):
-        #         model.module.train_discovery()
-        #     else:
-        #         model.train_discovery()
-        # else:
-        #     model.train()
+            # freeze meta controller
+            if isinstance(meta_controller, DistributedDataParallel): set_requires_grad(meta_controller.module, False)
+            else: set_requires_grad(meta_controller, False)
 
-        if is_discovering:
+        elif current_training_phase == "behavior_cloning":
+            if is_behavior_cloning == False:
+                accelerator.wait_for_everyone()
+                store_checkpoint()
+
+            is_pretraining_resnet = False
+            is_behavior_cloning = True
+            is_discovering = False
+
+            # enable transformer
+            if isinstance(model, DistributedDataParallel): 
+                set_requires_grad(model.module, True)
+                if modality == MODALITY_RESNET_RGB: 
+                    set_requires_grad(model.module.visual_encoder, False)
+                    set_requires_grad(model.module.visual_decoder, False)
+            else: 
+                set_requires_grad(model, True)
+                if modality == MODALITY_RESNET_RGB: 
+                    set_requires_grad(model.visual_encoder, False)
+                    set_requires_grad(model.visual_decoder, False)
+
+            # freeze meta controller
+            if isinstance(meta_controller, DistributedDataParallel): set_requires_grad(meta_controller.module, False)
+            else: set_requires_grad(meta_controller, False)
+
+        elif current_training_phase == "discovery_phase":
+            if is_discovering == False:
+                accelerator.wait_for_everyone()
+                store_checkpoint()
+                
+            is_pretraining_resnet = False
+            is_behavior_cloning = False
+            is_discovering = True
+
             # freeze transformer
             if isinstance(model, DistributedDataParallel): set_requires_grad(model.module, False)
             else: set_requires_grad(model, False)
@@ -424,54 +502,108 @@ def train(
             if isinstance(meta_controller, DistributedDataParallel): set_requires_grad(meta_controller.module, True)
             else: set_requires_grad(meta_controller, True)
 
-        else:
-            # enable transformer
-            if isinstance(model, DistributedDataParallel): set_requires_grad(model.module, True)
-            else: set_requires_grad(model, True)
+        # paper: KL ramp over first 2K discovery steps; reset counter when entering discovery.
 
-            # freeze meta controller
-            if isinstance(meta_controller, DistributedDataParallel): set_requires_grad(meta_controller.module, False)
-            else: set_requires_grad(meta_controller, False)
+        if is_discovering and epoch == cloning_epochs:
+            if isinstance(model, DistributedDataParallel):
+                model.module.meta_controller_reset_kl_loss_warmup()
+            else:
+                model.meta_controller_reset_kl_loss_warmup()
+                
+        # sequence processing
 
         optim = optim_model if not is_discovering else optim_meta_controller
 
         for batch in progress_bar:
-
-            # RGB normalization
-            if use_resnet:
+            
+            # rgb -> norm and multichannel, ready for resnet
+            if modality == MODALITY_RESNET_RGB:
                 states = batch['state'].float()
                 states = torch.clamp(states / 255.0, min=0.0, max=1.0)
                 states = (states - torch.tensor([0.485, 0.456, 0.406]).to(states.device)) / torch.tensor([0.229, 0.224, 0.225]).to(states.device)
 
-            # Symbolic obs values
-            else:
+            # raw rgb -> norm and flatten
+
+            elif modality == MODALITY_RAW_RGB:
                 states = batch['state'].float()
-                # flatten state: (B, T, 7, 7, 3) -> (B, T, 147)
+                states = torch.clamp(states / 255.0, min=0.0, max=1.0)
+                states = (states - torch.tensor([0.485, 0.456, 0.406]).to(states.device)) / torch.tensor([0.229, 0.224, 0.225]).to(states.device)
                 states = rearrange(states, 'b t ... -> b t (...)')
-                # states = symlog(states.float())
+            
+            # symbolic -> just flatten
+
+            elif modality == MODALITY_SYMBOLIC:
+                states = batch['state'].float()
+                states = rearrange(states, 'b t ... -> b t (...)')
+
 
             actions = batch['action'].long()
             episode_lens = batch.get('_lens')
-            mission_embeddings = batch.get('mission_embedding')
 
+            # deal with mission embedding, if provided
+
+            mission_embeddings = batch.get('mission_embedding')
             if condition_on_mission_embed and exists(mission_embeddings):
                 mission_embeddings = mission_embeddings.to(accelerator.device)
             else:
                 mission_embeddings = None
 
+            # deal with different losses in case of the resnet backbone
+
             with accelerator.accumulate(model):
+                visual_autoencoder_loss = None
+                if modality == MODALITY_RESNET_RGB:
+                    (losses, meta_controller_output), visual_autoencoder_loss = model(
+                        state=states,
+                        actions=actions,
+                        episode_lens = episode_lens,
+                        discovery_phase = is_discovering,
+                        force_behavior_cloning = not is_discovering,
+                        return_meta_controller_output = True,
+                        condition = mission_embeddings,
+                        return_visual_autoencoder_loss = True
+                    )
+                else:
+                    losses, meta_controller_output = model(
+                        state=states,
+                        actions=actions,
+                        episode_lens = episode_lens,
+                        discovery_phase = is_discovering,
+                        force_behavior_cloning = not is_discovering,
+                        return_meta_controller_output = True,
+                        condition = mission_embeddings
+                    )
 
-                losses, meta_controller_output = model(
-                    state=states,
-                    actions=actions,
-                    episode_lens = episode_lens,
-                    discovery_phase = is_discovering,
-                    force_behavior_cloning = not is_discovering,
-                    return_meta_controller_output = True,
-                    condition = mission_embeddings
-                )
+                # loss: resnet pretraining
 
-                if is_discovering:
+                if is_pretraining_resnet:
+
+                    loss = visual_autoencoder_loss * visual_recon_loss_weight
+
+                    log = dict(
+                        visual_autoencoder_loss = visual_autoencoder_loss.item(),
+                    )
+                    log["visual_autoencoder_loss"] = visual_autoencoder_loss.item()
+            
+                # loss: behavior cloning
+
+                elif is_behavior_cloning:
+                    
+                    state_loss, action_loss = losses
+
+                    loss = (
+                        state_loss * state_loss_weight +
+                        action_loss * action_loss_weight
+                    )
+
+                    log = dict(
+                        state_loss = state_loss.item(),
+                        action_loss = action_loss.item(),
+                    )
+
+                # loss: discovery phase
+
+                elif is_discovering:
                     obs_loss, action_recon_loss, kl_loss, ratio_loss = losses
 
                     switch_mask = maybe(lens_to_mask)(episode_lens, meta_controller_output.switch_beta.shape[1])
@@ -495,19 +627,18 @@ def train(
                         discovery_obs_loss_weight = old_discovery_obs_loss_weight
                         discovery_action_recon_loss_weight = old_discovery_action_recon_loss_weight
 
-                    if exists(discovery_ratio_loss_weight_end):
-                        frac = min(discovery_step / max(total_discovery_steps - 1, 1), 1.0)
-                        current_ratio_loss_weight = discovery_ratio_loss_weight + (discovery_ratio_loss_weight_end - discovery_ratio_loss_weight) * frac
-                    else:
-                        current_ratio_loss_weight = discovery_ratio_loss_weight
-
+                    # kl and ratio loss are weighted inside the metacontroller
+                    
                     loss = (
                         obs_loss * discovery_obs_loss_weight
                         + action_recon_loss * discovery_action_recon_loss_weight
-                        + kl_loss * meta_controller_output.kl_loss_weight
                         + entropy_loss * entropy_weight
-                        + ratio_loss * current_ratio_loss_weight
+                        + kl_loss
+                        + ratio_loss            
                     )
+
+                    if exists(visual_autoencoder_loss):
+                        loss = loss + visual_autoencoder_loss * visual_recon_loss_weight
 
                     discovery_step += 1
 
@@ -518,22 +649,12 @@ def train(
                         kl_loss_weight = meta_controller_output.kl_loss_weight,
                         entropy_loss = entropy_loss.item(),
                         ratio_loss = ratio_loss.item(),
-                        ratio_loss_weight = current_ratio_loss_weight,
                         hard_switch_density = last_hard_switch_density,
                         soft_switch_density = last_soft_switch_density,
                     )
-                else:
-                    state_loss, action_loss = losses
-
-                    loss = (
-                        state_loss * state_loss_weight +
-                        action_loss * action_loss_weight
-                    )
-
-                    log = dict(
-                        state_loss = state_loss.item(),
-                        action_loss = action_loss.item(),
-                    )
+                    if exists(visual_autoencoder_loss):
+                        log["visual_autoencoder_loss"] = visual_autoencoder_loss.item()
+                    
 
                 # gradient accumulation
 
@@ -605,7 +726,8 @@ def train(
                         switch_betas = meta_controller_output.switch_beta,
                         episode_lens = episode_lens,
                         gradient_step = gradient_step,
-                        num_samples = 3
+                        num_samples = 3,
+                        accelerator = accelerator
                     )
 
         avg_losses = {k: v / len(dataloader) for k, v in total_losses.items()}
