@@ -26,6 +26,8 @@ $ pip install metacontroller-pytorch
 
 - [Diego Calanzone](https://github.com/ddidacus) for identifying inconsistencies in the MetaController
 
+- [Diego Calanzone](https://github.com/ddidacus) for replicating interpretable temporal segmentation for the BabyAI gridworld task!
+
 ## Usage
 
 ```python
