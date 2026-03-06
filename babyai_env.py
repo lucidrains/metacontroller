@@ -82,15 +82,15 @@ _mission_cache = {}
 
 def get_missions_embeddings(missions: list[str], sbert: object = None, batch_size: int = 64):
     if not sbert: sbert = get_sbert()
-    
+
     # identify uncached missions
-    
+
     unique_missions = list(set(missions))
     uncached_missions = [m for m in unique_missions if m not in _mission_cache]
-    
+
     if len(uncached_missions) > 0:
         embeddings = sbert.encode(uncached_missions, convert_to_tensor=True, batch_size=batch_size, show_progress_bar=True)
-        
+
         for mission, embedding in zip(uncached_missions, embeddings):
             _mission_cache[mission] = embedding
 
@@ -106,18 +106,18 @@ def divisible_by(num, den):
 def transform_to_symbolic(images):
     # images: (..., W, H, 3) - assume last channel is (type, color, state)
     # as returned by FullyObsWrapper (which includes the agent)
-    
+
     # We want (..., W, H, 3) where:
     # ch 0: x coord
     # ch 1: y coord
     # ch 2: object type
-    
+
     *batch_dims, w, h, c = images.shape
-    
+
     grid_x, grid_y = np.mgrid[:w, :h]
-    
+
     # broadcast grid_x, grid_y to batch dims
-    
+
     for _ in range(len(batch_dims)):
         grid_x = np.expand_dims(grid_x, axis = 0)
         grid_y = np.expand_dims(grid_y, axis = 0)
@@ -132,7 +132,7 @@ def transform_to_symbolic(images):
     symbolic[..., 0] = grid_x
     symbolic[..., 1] = grid_y
     symbolic[..., 2] = np.where(images[..., 0] == 1, -1, images[..., 0]) # map empty (1) to -1
-    
+
     return symbolic
 
 # env creation

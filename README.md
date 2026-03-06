@@ -135,13 +135,13 @@ $ uv run pytest
 
 ```bibtex
 @misc{kobayashi2025emergenttemporalabstractionsautoregressive,
-    title   = {Emergent temporal abstractions in autoregressive models enable hierarchical reinforcement learning}, 
+    title   = {Emergent temporal abstractions in autoregressive models enable hierarchical reinforcement learning},
     author  = {Seijin Kobayashi and Yanick Schimpf and Maximilian Schlegel and Angelika Steger and Maciej Wolczyk and Johannes von Oswald and Nino Scherrer and Kaitlin Maile and Guillaume Lajoie and Blake A. Richards and Rif A. Saurous and James Manyika and Blaise Agüera y Arcas and Alexander Meulemans and João Sacramento},
     year    = {2025},
     eprint  = {2512.20605},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2512.20605}, 
+    url     = {https://arxiv.org/abs/2512.20605},
 }
 ```
 
@@ -170,25 +170,25 @@ $ uv run pytest
 
 ```bibtex
 @misc{fleuret2025freetransformer,
-    title     = {The Free Transformer}, 
+    title     = {The Free Transformer},
     author    = {François Fleuret},
     year      = {2025},
     eprint    = {2510.17558},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url       = {https://arxiv.org/abs/2510.17558}, 
+    url       = {https://arxiv.org/abs/2510.17558},
 }
 ```
 
 ```bibtex
 @misc{hafner2025trainingagentsinsidescalable,
-    title   = {Training Agents Inside of Scalable World Models}, 
+    title   = {Training Agents Inside of Scalable World Models},
     author  = {Danijar Hafner and Wilson Yan and Timothy Lillicrap},
     year    = {2025},
     eprint  = {2509.24527},
     archivePrefix = {arXiv},
     primaryClass = {cs.AI},
-    url     = {https://arxiv.org/abs/2509.24527}, 
+    url     = {https://arxiv.org/abs/2509.24527},
 }
 ```
 

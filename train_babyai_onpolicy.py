@@ -235,39 +235,39 @@ def visualize_switch_betas(
     Logs a single stacked figure to wandb.
     """
     B, T_minus_1 = switch_betas.shape
-    
+
     # randomly sample sequences from the batch
     num_samples = min(num_samples, B)
     sample_indices = np.random.choice(B, size=num_samples, replace=False)
-    
+
     # create figure with num_samples subplots
     fig, axes = plt.subplots(num_samples, 1, figsize=(12, 3 * num_samples))
     fig.suptitle(f'Step {gradient_step} | Switch Betas Visualization', fontsize=10)
-    
+
     # handle single subplot case
     if num_samples == 1:
         axes = [axes]
-    
+
     for i, idx in enumerate(sample_indices):
         # get episode length for this sample (if available)
         if episode_lens is not None:
             ep_len = int(episode_lens[idx].item())
         else:
             ep_len = T_minus_1
-        
+
         # extract data for this sample
         sample_switch_betas = switch_betas[idx, :ep_len-1].detach().cpu()  # (T-1,)
-        
+
         ax = axes[i]
-        
+
         # plot switch betas
         ax.plot(sample_switch_betas.numpy(), label='switch betas', linewidth=2)
         ax.set_xlabel('timesteps')
         ax.set_ylabel(f'switch betas (sample {idx})')
         ax.legend(loc='upper right')
-    
+
     plt.tight_layout()
-    
+
     # log to wandb
     if use_wandb and exists(accelerator):
         tracker = accelerator.get_tracker("wandb")
@@ -397,7 +397,7 @@ def main(
     num_batch_updates = num_episodes // batch_size
 
     pbar = tqdm(range(num_batch_updates), desc = 'training')
-    
+
     print("starting training")
     unwrapped_model.eval()
     unwrapped_meta_controller.train()
@@ -510,7 +510,7 @@ def main(
         group_log_probs = cur_log_probs
         group_switch_betas = cur_switch_betas
         group_latent_actions = cur_latent_actions
-        
+
         group_step_rewards = cur_rewards
 
         # mask rewards after done

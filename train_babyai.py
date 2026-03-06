@@ -126,7 +126,7 @@ def main(
     group_seeds = None
     if not exists(seed) and exists(npy_seedfile):
         group_seeds = np.load(npy_seedfile, allow_pickle=True).astype(int).tolist()
-        
+
     seed_index = 0
 
     def get_next_seed():
@@ -174,7 +174,7 @@ def main(
     if exists(transformer_weights_path):
         weights_path = Path(transformer_weights_path)
         assert weights_path.exists(), f"transformer weights not found at {weights_path}"
-        
+
         transformer_klass = TransformerWithResnet if use_resnet else Transformer
         model = transformer_klass.init_and_load(str(weights_path), strict = False)
         model.eval()
@@ -337,16 +337,16 @@ def main(
             all_episode_lens.append(episode_lens)
 
         # align all sequences across rollout iterations
- 
+
         group_states = pad_sequence_and_cat(all_states, dim = 1, dim_cat = 0)
         group_log_probs = pad_sequence_and_cat(all_log_probs, dim = 1, dim_cat = 0)
         group_switch_betas = pad_sequence_and_cat(all_switch_betas, dim = 1, dim_cat = 0)
         group_latent_actions = pad_sequence_and_cat(all_latent_actions, dim = 1, dim_cat = 0)
-        
+
         group_step_rewards = pad_sequence_and_cat(all_step_rewards, dim = 0, dim_cat = 1)
 
         episode_lens = cat(all_episode_lens, dim = 0).to(accelerator.device)
-        
+
         # mask rewards after done
 
         mask = lens_to_mask(episode_lens, group_step_rewards.shape[-1])
@@ -446,7 +446,7 @@ def main(
                         })
 
                     # checkpointing
-                    
+
                     if gradient_step % save_steps == 0:
                         store_checkpoint(gradient_step)
 

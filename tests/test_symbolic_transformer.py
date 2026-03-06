@@ -36,16 +36,16 @@ def test_symbolic_transformer():
 
     # Discovery testing
     discovery_losses = transformer(
-        state, 
-        actions = actions, 
+        state,
+        actions = actions,
         discovery_phase = True
     )
     (discovery_losses.state_pred + discovery_losses.action_recon).backward()
 
     # BC testing
     bc_losses = transformer(
-        state, 
-        actions = actions, 
+        state,
+        actions = actions,
         force_behavior_cloning = True
     )
     (bc_losses.state + bc_losses.action).backward()

@@ -95,39 +95,39 @@ def visualize_switch_betas(
     Logs a single stacked figure to wandb.
     """
     B, T_minus_1 = switch_betas.shape
-    
+
     # randomly sample sequences from the batch
     num_samples = min(num_samples, B)
     sample_indices = np.random.choice(B, size=num_samples, replace=False)
-    
+
     # create figure with num_samples subplots
     fig, axes = plt.subplots(num_samples, 1, figsize=(12, 3 * num_samples))
     fig.suptitle(f'Step {gradient_step} | Switch Betas Visualization', fontsize=10)
-    
+
     # handle single subplot case
     if num_samples == 1:
         axes = [axes]
-    
+
     for i, idx in enumerate(sample_indices):
         # get episode length for this sample (if available)
         if episode_lens is not None:
             ep_len = int(episode_lens[idx].item())
         else:
             ep_len = T_minus_1
-        
+
         # extract data for this sample
         sample_switch_betas = switch_betas[idx, :ep_len-1].detach().cpu()  # (T-1,)
-        
+
         ax = axes[i]
-        
+
         # plot switch betas
         ax.plot(sample_switch_betas.numpy(), label='switch betas', linewidth=2)
         ax.set_xlabel('timesteps')
         ax.set_ylabel(f'switch betas (sample {idx})')
         ax.legend(loc='upper right')
-    
+
     plt.tight_layout()
-    
+
     # log to wandb
     if exists(accelerator):
         tracker = accelerator.get_tracker("wandb")
@@ -147,7 +147,7 @@ def train(
     cloning_epochs = 10,
     discovery_epochs = 10,
     batch_size = 128,
-    gradient_accumulation_steps = None, 
+    gradient_accumulation_steps = None,
     lr = 1e-4,
     discovery_lr = 1e-4,
     lr_schedule = "constant",  # "cosine" or "constant"; cosine decays LR to lr * lr_min_ratio over BC phase
@@ -219,9 +219,9 @@ def train(
                 unwrapped_meta_controller.save(meta_controller_checkpoint_path_with_step)
                 accelerator.print(f"MetaController to {meta_controller_checkpoint_path_with_step}")
 
-            
+
     # check for yaml file
-    
+
 
     # accelerator
 
@@ -341,7 +341,7 @@ def train(
     model = transformer_class(**transformer_kwargs)
 
     # load pre-trained weights for fine-tuning if given / otherwise xavier init
-    
+
     if exists(load_transformer_weights_path):
         _path = Path(load_transformer_weights_path)
         assert _path.exists(), f"load_transformer_weights_path {load_transformer_weights_path} does not exist"
@@ -390,7 +390,7 @@ def train(
         accelerator.print(f"Using cosine LR schedule for BC: {num_bc_steps} steps, eta_min={lr * lr_min_ratio:.2e}")
 
     # training
-    
+
     old_discovery_obs_loss_weight = discovery_obs_loss_weight
     old_discovery_action_recon_loss_weight = discovery_action_recon_loss_weight
 
@@ -680,7 +680,7 @@ def train(
             # log on backprop
 
             if gradient_accumulation_steps is None or gradient_step % gradient_accumulation_steps == 0:
-            
+
                 for key, value in log.items():
                     total_losses[key] += value
 

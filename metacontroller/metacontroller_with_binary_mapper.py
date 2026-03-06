@@ -8,8 +8,8 @@ from collections import namedtuple
 from loguru import logger
 
 import torch
-from torch import nn, cat, stack, tensor, Tensor
-from torch.nn import Module, GRU, Linear, Identity, Parameter
+from torch import nn, cat, tensor, ones, zeros, Tensor
+from torch.nn import Module, Linear, GRU, Parameter
 import torch.nn.functional as F
 from torch.nn.functional import cosine_similarity, sigmoid
 
@@ -81,13 +81,13 @@ class GRUSwitchingUnit(Module):
         prev_hidden = None
     ):
         switch_input = cat((residual_stream, meta_embed_prev, sampled_codes_prev), dim = -1)
-        
+
         gru_out, next_hidden = self.gru(switch_input, prev_hidden)
-        
+
         beta_logit = self.to_beta(gru_out)
         beta = (beta_logit / self.switch_temperature).sigmoid()
         beta = rearrange(beta, '... 1 -> ...')
-        
+
         return beta, next_hidden
 
 @save_load()
@@ -127,7 +127,8 @@ class MetaControllerWithBinaryMapper(Module):
         apply_kl_loss_weight = True,
         ratio_loss_chunk_size = None,
         ratio_loss_final_weight = None,
-        ratio_loss_warmdown_steps = 0
+        ratio_loss_warmdown_steps = 0,
+        use_layerscale = True
     ):
         super().__init__()
         self.dim_model = dim_model
@@ -208,6 +209,10 @@ class MetaControllerWithBinaryMapper(Module):
         self.ratio_loss_final_weight = ratio_loss_final_weight
         self.ratio_loss_warmdown_steps = ratio_loss_warmdown_steps
 
+        # control signal layerscale
+
+        self.layerscale = Parameter(torch.zeros(dim_model) - 2.) if use_layerscale else None
+
         # decoder
 
         assert hypernetwork_low_rank < self.num_codes
@@ -278,6 +283,11 @@ class MetaControllerWithBinaryMapper(Module):
             *self.decoder.parameters(),
             *self.switch_gating.parameters()
         ]
+
+        if exists(self.layerscale):
+            params.append(self.layerscale)
+
+        return params
 
     def internal_rl_parameters(self):
         return [
@@ -438,11 +448,11 @@ class MetaControllerWithBinaryMapper(Module):
         if seq_len > 1 and not is_ablating_switch:
 
             # resolve hard switch
-            
+
             resolved_hard_switch = default(hard_switch, self.hard_switch, not discovery_phase)
 
             # call jax
-            
+
             sequential_selection_output = perform_sequential_action_selection(
                 self.switching_unit.gru,
                 self.switching_unit.to_beta,
@@ -454,7 +464,7 @@ class MetaControllerWithBinaryMapper(Module):
                 self.switch_temperature,
                 resolved_hard_switch
             )
-            
+
             switch_beta = sequential_selection_output.switch_beta
             gated_codes = sequential_selection_output.gated_action
             next_switching_unit_hidden = sequential_selection_output.next_switching_unit_gru_hidden
@@ -519,6 +529,11 @@ class MetaControllerWithBinaryMapper(Module):
         # generating the residual stream controlling signal
 
         control_signal = einsum(residual_stream, hypernetwork_weight, '... d1, ... d1 d2 -> ... d1')
+
+        # gate the control signal with a learnable softplus initialized small
+
+        if exists(self.layerscale):
+            control_signal = control_signal * F.softplus(self.layerscale)
 
         # maybe ratio loss
 
