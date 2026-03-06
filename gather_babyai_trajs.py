@@ -161,7 +161,7 @@ class BabyAIBotEpsilonGreedy:
 
 # functions
 
-def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_shape, num_actions=None, use_rgb_states = True):
+def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_shape, num_actions=None, use_rgb_states = False):
     """
     Collect a single episode of demonstrations.
     Returns tuple of (episode_state, episode_action, success, episode_length, seed)
@@ -190,7 +190,15 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
                 env.close()
                 return None, None, False, 0, seed
 
-            episode_state[_step] = state_obs["image"]
+            obs_image = state_obs["image"].copy()
+
+            if not use_rgb_states:
+                # SymbolicObsWrapper uses -1 for None grid cells (empty floor),
+                # which overflows to 255 in uint8. Map to "empty" (1).
+                obj_type_channel = obs_image[..., 2]
+                obj_type_channel[obj_type_channel > max(OBJECT_TO_IDX.values())] = OBJECT_TO_IDX["empty"]
+
+            episode_state[_step] = obs_image
 
             episode_action[_step] = action
 
@@ -208,7 +216,7 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
         return None, None, False, 0, seed
 
 def collect_demonstrations(
-    use_rgb_states = True,
+    use_rgb_states = False,
     env_id = "BabyAI-MiniBossLevel-v0",
     num_seeds = 100,
     num_episodes_per_seed = 100,

@@ -32,6 +32,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 from einops import rearrange
 
 from metacontroller import MetaController, Transformer, binary_entropy
@@ -246,7 +247,8 @@ def train(
 ):
     # accelerator
 
-    accelerator = Accelerator(cpu = cpu)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(cpu = cpu, kwargs_handlers=[ddp_kwargs])
 
     if (grpo_phase or evo_phase) and accelerator.is_main_process:
         import wandb
