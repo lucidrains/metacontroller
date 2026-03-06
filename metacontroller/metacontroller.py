@@ -1231,7 +1231,8 @@ class Transformer(Module):
                 control_signal = control_signal * control_signal_multiplier
 
             if metacontroller_residual_stream_dropout > 0.:
-                residual_stream = F.dropout(residual_stream, p = metacontroller_residual_stream_dropout, training = self.training)
+                is_training = meta_controller.training if exists(meta_controller) else self.training
+                residual_stream = F.dropout(residual_stream, p = metacontroller_residual_stream_dropout, training = is_training)
 
             modified_residual_stream = residual_stream + control_signal
 
