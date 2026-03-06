@@ -397,7 +397,7 @@ class MetaController(Module):
         apply_kl_loss_weight = True,
         ratio_loss_final_weight = None,
         ratio_loss_warmdown_steps = 0,
-
+        use_layerscale = False
     ):
         super().__init__()
         self.dim_model = dim_model
@@ -477,7 +477,6 @@ class MetaController(Module):
         self.has_ratio_loss = ratio_loss_weight > 0.
 
         self.ratio_loss_weight = ratio_loss_weight
-        use_layerscale = True
 
         self.ratio_loss_chunk_size = ratio_loss_chunk_size
         self.target_temporal_segment_len = target_temporal_segment_len

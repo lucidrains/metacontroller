@@ -128,7 +128,7 @@ class MetaControllerWithBinaryMapper(Module):
         ratio_loss_chunk_size = None,
         ratio_loss_final_weight = None,
         ratio_loss_warmdown_steps = 0,
-        use_layerscale = True
+        use_layerscale = False
     ):
         super().__init__()
         self.dim_model = dim_model
