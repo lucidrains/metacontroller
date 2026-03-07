@@ -251,7 +251,7 @@ def train(
     switch_temperature = 0.1,
     discovery_phase = False,
     discovery_hard_switch = False,
-    metacontroller_residual_stream_dropout_prob = 0.1,
+    metacontroller_residual_stream_dropout_prob = 0.,
     cpu = False,
     checkpoint_path = './results-enwik8/train-enwik8.pt',
     enwik8_path = './data/enwik8.gz',
