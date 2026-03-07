@@ -15,7 +15,7 @@ from x_transformers import Decoder
 from discrete_continuous_embed_readout import EmbedAndReadout, Readout
 from assoc_scan import AssocScan
 
-from torch_einops_utils import pad_left_at_dim, masked_mean, align_dims_left
+from torch_einops_utils import pad_left_at_dim, masked_mean, align_dims_left, lens_to_mask
 from torch_einops_utils.device import move_inputs_to_module_device
 from torch_einops_utils.save_load import save_load
 
@@ -41,16 +41,17 @@ def cosine_distance(x, y):
 def calculate_ratio_loss(
     switch_probs: Tensor,
     boundary_mask: Tensor,
-    target_avg_token_length: float
+    target_avg_token_length: float,
+    mask: Tensor | None = None
 ):
     N = target_avg_token_length
 
     F_soft = (switch_probs - 0.5).sigmoid()
-    F_mask = straight_through(F_soft, boundary_mask.float()).mean(dim = -1)
-    G = switch_probs.mean(dim = -1)
+    F_mask = straight_through(F_soft, boundary_mask.float())
+    G = switch_probs
 
-    ratio_loss = N / (N - 1) * ((N - 1) * F_mask * G + (1. - F_mask) * (1. - G))
-    return ratio_loss.mean()
+    ratio_loss_unreduced = N / (N - 1) * ((N - 1) * F_mask * G + (1. - F_mask) * (1. - G))
+    return masked_mean(ratio_loss_unreduced, mask)
 
 # named tuples
 
@@ -212,6 +213,7 @@ class TransformerWithMetacontroller(Module):
         self.residual_stream_dropout = nn.Dropout(residual_stream_dropout)
         self.residual_stream_drop_prob = residual_stream_drop_prob
         self.pred_loss_to_switch_weight = pred_loss_to_switch_weight
+        assert self.pred_loss_to_switch_weight < 1., 'pred_loss_to_switch_weight must be strictly less than 1. so predictive loss is never wholly responsible for switching'
 
         # upper body
 
@@ -250,12 +252,14 @@ class TransformerWithMetacontroller(Module):
         self,
         state,
         actions: Tensor | None = None,
+        episode_lens: Tensor | None = None,
         return_loss = True,
         cache: TransformerWithMetacontrollerCache | None = None,
         return_cache = False
     ):
         batch, seq_len, device = *state.shape[:2], state.device
 
+        mask = lens_to_mask(episode_lens, seq_len) if exists(episode_lens) else None
         target_state = target_actions = None
 
         if return_loss:
@@ -316,17 +320,20 @@ class TransformerWithMetacontroller(Module):
 
         if return_loss:
             per_token_latent_ar_loss = cosine_distance(pred_query[:, :-1], queries[:, 1:].detach())
-            latent_ar_loss = per_token_latent_ar_loss.mean()
+
+            # handle mask for loss (shift by 1 like targets)
+            loss_mask = mask[:, 1:] if exists(mask) else None
+            latent_ar_loss = masked_mean(per_token_latent_ar_loss, loss_mask)
 
         if self.pred_loss_to_switch_weight > 0.:
             if not exists(prev_pred_query):
                 _per_token_loss = cosine_distance(pred_query[:, :-1], queries[:, 1:].detach())
-                padded_per_token_loss = pad(_per_token_loss, (1, 0), value = 1.)
+                predictive_difficulty = pad(_per_token_loss, (1, 0), value = 1.)
             else:
                 pred_query_with_prev = cat((prev_pred_query, pred_query[:, :-1]), dim = 1)
-                padded_per_token_loss = cosine_distance(pred_query_with_prev, queries.detach())
+                predictive_difficulty = cosine_distance(pred_query_with_prev, queries.detach())
 
-            switch_probs = switch_probs.lerp(padded_per_token_loss.detach(), self.pred_loss_to_switch_weight)
+            switch_probs = switch_probs.lerp(predictive_difficulty.detach(), self.pred_loss_to_switch_weight)
 
         next_prev_pred_query = pred_query[:, -1:] if exists(pred_query) else None
 
@@ -360,8 +367,8 @@ class TransformerWithMetacontroller(Module):
         dropped_residual_stream = self.residual_stream_dropout(residual_stream)
 
         if self.training and self.residual_stream_drop_prob > 0.:
-            mask = torch.rand(batch, device = device) > self.residual_stream_drop_prob
-            dropped_residual_stream = einx.where('b, b n d, -> b n d', mask, dropped_residual_stream, self.zero)
+            drop_mask = torch.rand(batch, device = device) > self.residual_stream_drop_prob
+            dropped_residual_stream = einx.where('b, b n d, -> b n d', drop_mask, dropped_residual_stream, self.zero)
 
         modified_residual_stream = self.modified_residual_stream_norm(dropped_residual_stream + control_signal)
 
@@ -391,9 +398,11 @@ class TransformerWithMetacontroller(Module):
         bc_state_loss = bc_action_loss = ratio_loss = None
 
         if return_loss:
-            bc_state_loss = self.state_readout.calculate_loss(state_dist_params, target_state)
-            bc_action_loss = self.action_readout.calculate_loss(dist_params, target_actions)
-            ratio_loss = calculate_ratio_loss(switch_probs, boundary_mask, self.target_avg_token_length)
+            loss_mask = mask[:, 1:] if exists(mask) else None
+
+            bc_state_loss = self.state_readout.calculate_loss(state_dist_params, target_state, mask = loss_mask)
+            bc_action_loss = self.action_readout.calculate_loss(dist_params, target_actions, mask = loss_mask)
+            ratio_loss = calculate_ratio_loss(switch_probs, boundary_mask, self.target_avg_token_length, mask = mask)
 
         meta_output = MetaControllerOutput(
             prev_hiddens = None,
@@ -416,5 +425,24 @@ class TransformerWithMetacontroller(Module):
             return (*ret, next_cache)
 
         return ret
+
+    # GRPO methods
+
+    @property
+    def replay_buffer_field_dict(self):
+        return dict(
+            state = 'float',
+            action = 'float',
+            log_prob = 'float',
+            switch_beta = 'float'
+        )
+
+    def get_action_dist_for_internal_rl(self, residual_stream):
+        emitter_out, _ = self.emitter_decoder(residual_stream, return_hiddens = True)
+        action_dist = self.latent_readout(emitter_out)
+        return action_dist
+
+    def log_prob(self, action_dist, latent_action):
+        return self.latent_readout.log_prob(action_dist, latent_action)
 
 TransformerWithMetacontroller.policy_loss = policy_loss

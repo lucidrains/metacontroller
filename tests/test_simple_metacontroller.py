@@ -1,17 +1,16 @@
-import tempfile
-import shutil
-from functools import partial
-
 import torch
 from torch import cat
 
-from memmap_replay_buffer import ReplayBuffer
-from metacontroller.simple_metacontroller import TransformerWithMetacontroller, extract_grpo_data, policy_loss, z_score
+from torch_einops_utils import pad_sequence_and_cat
 
-# helpers
+from metacontroller.simple_metacontroller import (
+    TransformerWithMetacontroller,
+    extract_grpo_data,
+    policy_loss,
+    z_score
+)
 
-def exists(v):
-    return v is not None
+# constants
 
 MODEL_KWARGS = dict(
     dim = 128,
@@ -25,6 +24,8 @@ MODEL_KWARGS = dict(
     target_avg_token_length = 4.,
     pred_loss_to_switch_weight = 0.5,
 )
+
+# tests
 
 def test_caching_parity():
     model = TransformerWithMetacontroller(**MODEL_KWARGS)
@@ -51,12 +52,11 @@ def test_caching_parity():
             return_loss = False
         )
 
-        # sequential
+        # sequential with cache
 
         dist_params_seq = []
         switch_betas_seq = []
         action_dist_seq = []
-
         cache = None
 
         for i in range(seq_len - 1):
@@ -86,76 +86,79 @@ def test_grpo_parity():
 
     model = TransformerWithMetacontroller(**MODEL_KWARGS)
 
-    test_folder = tempfile.mkdtemp()
+    one_state = torch.randint(0, 256, (1, seq_len))
+    actions = torch.randint(0, 256, (1, seq_len))
 
-    try:
-        replay_buffer = ReplayBuffer(
-            test_folder,
-            max_episodes = num_rollouts,
-            max_timesteps = seq_len * 2,
-            circular = True,
-            fields = model.replay_buffer_field_dict,
-            meta_fields = dict(advantages = 'float')
+    all_episodes = []
+    all_rewards = []
+    all_episode_lens = []
+
+    # simulate variable length rollouts
+
+    with torch.no_grad():
+        for _ in range(num_rollouts):
+            cache = None
+            grpo_data_list = []
+
+            ep_len = torch.randint(5, seq_len + 1, (1,)).item()
+            all_episode_lens.append(ep_len)
+
+            for i in range(ep_len - 1):
+                _, meta_output, cache = model(
+                    state = one_state[:, i:i+1],
+                    actions = actions[:, i:i+1],
+                    cache = cache,
+                    return_loss = False,
+                    return_cache = True
+                )
+
+                grpo_data_list.append(extract_grpo_data(model, meta_output))
+
+            states, latent_actions, log_probs, switch_betas = zip(*grpo_data_list)
+
+            all_episodes.append((
+                cat(states, dim = 1),
+                cat(log_probs, dim = 1),
+                cat(switch_betas, dim = 1),
+                cat(latent_actions, dim = 1)
+            ))
+
+            all_rewards.append(torch.randn(1))
+
+    # pad variable length episodes and concatenate
+
+    rewards = cat(all_rewards)
+    group_advantages = z_score(rewards)
+
+    list_states, list_log_probs, list_switch_betas, list_latent_actions = zip(*all_episodes)
+
+    group_states = pad_sequence_and_cat(list_states, dim_cat = 0, dim = 1, value = 0.)
+    group_log_probs = pad_sequence_and_cat(list_log_probs, dim_cat = 0, dim = 1, value = 0.)
+    group_latent_actions = pad_sequence_and_cat(list_latent_actions, dim_cat = 0, dim = 1, value = 0.)
+
+    group_episode_lens = torch.tensor(all_episode_lens) - 1
+
+    # verify parallel log probs match sequential within valid lengths
+
+    parallel_action_dist = model.get_action_dist_for_internal_rl(group_states)
+    parallel_log_probs = model.log_prob(parallel_action_dist, group_latent_actions)
+
+    for i, ep_len in enumerate(group_episode_lens):
+        assert torch.allclose(
+            parallel_log_probs[i, :ep_len],
+            group_log_probs[i, :ep_len],
+            atol = 1e-4
         )
 
-        one_state = torch.randint(0, 256, (1, seq_len))
-        actions = torch.randint(0, 256, (1, seq_len))
+    # verify policy loss backward with episode masking
 
-        all_episodes = []
-        all_rewards = []
+    loss = policy_loss(
+        model,
+        group_states,
+        group_log_probs,
+        group_latent_actions,
+        group_advantages,
+        episode_lens = group_episode_lens
+    )
 
-        # simulate rollouts
-
-        with torch.no_grad():
-            for _ in range(num_rollouts):
-                cache = None
-                grpo_data_list = []
-
-                for i in range(seq_len - 1):
-                    _, meta_output, cache = model(
-                        state = one_state[:, i:i+1],
-                        actions = actions[:, i:i+1],
-                        cache = cache,
-                        return_loss = False,
-                        return_cache = True
-                    )
-
-                    grpo_data_list.append(extract_grpo_data(model, meta_output))
-
-                states, latent_actions, log_probs, switch_betas = zip(*grpo_data_list)
-
-                all_episodes.append((
-                    cat(states, dim = 1),
-                    cat(log_probs, dim = 1),
-                    cat(switch_betas, dim = 1),
-                    cat(latent_actions, dim = 1)
-                ))
-
-                all_rewards.append(torch.randn(1))
-
-        # verify parallel log probs match sequential
-
-        rewards = cat(all_rewards)
-        group_advantages = z_score(rewards)
-
-        group_states, group_log_probs, group_switch_betas, group_latent_actions = map(partial(cat, dim = 0), zip(*all_episodes))
-
-        parallel_action_dist = model.get_action_dist_for_internal_rl(group_states)
-        parallel_log_probs = model.log_prob(parallel_action_dist, group_latent_actions)
-
-        assert torch.allclose(parallel_log_probs, group_log_probs, atol = 1e-4)
-
-        # verify policy loss backward
-
-        loss = policy_loss(
-            model,
-            group_states,
-            group_log_probs,
-            group_latent_actions,
-            group_advantages
-        )
-
-        loss.backward()
-
-    finally:
-        shutil.rmtree(test_folder)
+    loss.backward()
