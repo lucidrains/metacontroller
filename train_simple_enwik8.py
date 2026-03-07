@@ -149,7 +149,7 @@ def train(
     kl_loss_weight = 1.,
     heads = 8,
     attn_dim_head = 64,
-    switch_entropy_quantile = 0.9,
+    switch_entropy_quantile = 0.85,
     target_avg_token_length = 8.,
     temporal_sequence_embed_prob = 0.25,
     residual_stream_dropout = 0.,
@@ -219,7 +219,8 @@ def train(
     train_loader = cycle(train_loader)
     val_loader = cycle(val_loader)
 
-    pbar = tqdm.tqdm(range(num_batches), mininterval = 10.0, desc = "training jointly")
+    method_desc = f"Entropy ({switch_entropy_quantile*100:.0f}%)" if switch_entropy_quantile is not None else "QK"
+    pbar = tqdm.tqdm(range(num_batches), mininterval = 10.0, desc = f"training jointly | {method_desc}")
 
     for i in pbar:
         model.train()

@@ -322,7 +322,8 @@ class TransformerWithMetacontroller(Module):
         return_loss = True,
         cache: TransformerWithMetacontrollerCache | None = None,
         return_cache = False,
-        use_temporal_sequence_embed: bool | None = None
+        use_temporal_sequence_embed: bool | None = None,
+        update_entropy_quantile: bool | None = None
     ):
         batch, seq_len, device = *state.shape[:2], state.device
 
@@ -373,10 +374,17 @@ class TransformerWithMetacontroller(Module):
         if exists(self.switch_entropy_quantile):
             entropy_threshold = self.running_entropy_quantile.item()
             switch_probs = (latent_pred_entropy > entropy_threshold).float()
-            if self.training:
+
+            should_update_entropy_quantile = default(update_entropy_quantile, self.training)
+
+            if should_update_entropy_quantile:
                 with torch.no_grad():
                     flat_entropy = latent_pred_entropy.detach().reshape(-1)
-                    prop_below = (flat_entropy < entropy_threshold).float().mean()
+
+                    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                        gathered_entropy = [torch.zeros_like(flat_entropy) for _ in range(torch.distributed.get_world_size())]
+                        torch.distributed.all_gather(gathered_entropy, flat_entropy)
+                        flat_entropy = torch.cat(gathered_entropy)
 
                     # Calculate the explicit quantile for this batch
                     batch_quantile = torch.quantile(flat_entropy, self.switch_entropy_quantile)
