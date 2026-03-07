@@ -24,7 +24,6 @@ MODEL_KWARGS = dict(
     emitter_decoder = dict(depth = 1, heads = 4, attn_dim_head = 16),
     dim_queries_keys = 64,
     target_avg_token_length = 4.,
-    pred_loss_to_switch_weight = 0.5,
 )
 
 # tests
@@ -63,6 +62,7 @@ def test_caching_parity():
         dist_params_seq = []
         switch_betas_seq = []
         action_dist_seq = []
+        latent_pred_entropies_seq = []
         cache = None
 
         for i in range(seq_len - 1):
@@ -77,14 +77,17 @@ def test_caching_parity():
             dist_params_seq.append(dist_params)
             switch_betas_seq.append(meta_output.switch_beta)
             action_dist_seq.append(meta_output.action_dist)
+            latent_pred_entropies_seq.append(meta_output.latent_pred_entropy)
 
         dist_params_seq = cat(dist_params_seq, dim = 1)
         switch_betas_seq = cat(switch_betas_seq, dim = 1)
         action_dist_seq = cat(action_dist_seq, dim = 1)
+        latent_pred_entropies_seq = cat(latent_pred_entropies_seq, dim = 1)
 
         assert torch.allclose(dist_params_parallel, dist_params_seq, atol = 1e-5)
         assert torch.allclose(meta_output_parallel.switch_beta, switch_betas_seq, atol = 1e-5)
         assert torch.allclose(meta_output_parallel.action_dist, action_dist_seq, atol = 1e-5)
+        assert torch.allclose(meta_output_parallel.latent_pred_entropy, latent_pred_entropies_seq, atol = 1e-5)
 
 def test_grpo_parity():
     seq_len = 16
@@ -141,12 +144,13 @@ def test_grpo_parity():
     group_states = pad_sequence_and_cat(list_states, dim_cat = 0, dim = 1, value = 0.)
     group_log_probs = pad_sequence_and_cat(list_log_probs, dim_cat = 0, dim = 1, value = 0.)
     group_latent_actions = pad_sequence_and_cat(list_latent_actions, dim_cat = 0, dim = 1, value = 0.)
+    group_switch_betas = pad_sequence_and_cat(list_switch_betas, dim_cat = 0, dim = 1, value = 0.)
 
     group_episode_lens = torch.tensor(all_episode_lens) - 1
 
     # verify parallel log probs match sequential within valid lengths
 
-    parallel_action_dist = model.get_action_dist_for_internal_rl(group_states)
+    parallel_action_dist = model.get_action_dist_for_internal_rl(group_states, switch_betas = group_switch_betas)
     parallel_log_probs = model.log_prob(parallel_action_dist, group_latent_actions)
 
     for i, ep_len in enumerate(group_episode_lens):
@@ -164,7 +168,35 @@ def test_grpo_parity():
         group_log_probs,
         group_latent_actions,
         group_advantages,
+        switch_betas = group_switch_betas,
         episode_lens = group_episode_lens
     )
 
     loss.backward()
+
+def test_switch_entropy_quantile():
+    model = TransformerWithMetacontroller(
+        **{**MODEL_KWARGS, 'switch_entropy_quantile': 0.9, 'switch_entropy_quantile_lr': 0.1}
+    )
+
+    assert not hasattr(model, 'to_queries_keys')
+    assert not hasattr(model, 'start_key_token')
+    assert hasattr(model, 'running_entropy_quantile')
+
+    batch_size = 2
+    seq_len = 16
+
+    state = torch.randint(0, 256, (batch_size, seq_len))
+    actions = torch.randint(0, 256, (batch_size, seq_len))
+
+    model.train()
+    assert model.running_entropy_quantile.item() == 10.
+
+    _, meta_output = model(
+        state = state,
+        actions = actions,
+        return_loss = True
+    )
+
+    # the quantile tracker should update based on initialized values and shift
+    assert model.running_entropy_quantile.item() != 10.

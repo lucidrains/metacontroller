@@ -149,11 +149,11 @@ def train(
     kl_loss_weight = 1.,
     heads = 8,
     attn_dim_head = 64,
+    switch_entropy_quantile = 0.9,
     target_avg_token_length = 8.,
     temporal_sequence_embed_prob = 0.25,
     residual_stream_dropout = 0.,
     residual_stream_drop_prob = 0.,
-    pred_loss_to_switch_weight = 0.,
     cpu = False,
     checkpoint_path = './results-simple-enwik8/train-enwik8.pt',
     enwik8_path = './data/enwik8.gz',
@@ -193,7 +193,7 @@ def train(
         dim_code_bits = dim_code_bits,
         lower_body = dict(depth = depth, heads = heads, attn_dim_head = attn_dim_head),
         upper_body = dict(depth = depth, heads = heads, attn_dim_head = attn_dim_head),
-        emitter_decoder = dict(depth = 1, heads = heads, attn_dim_head = attn_dim_head),
+        emitter_decoder = dict(depth = 2, heads = heads, attn_dim_head = attn_dim_head),
         dim_queries_keys = 256,
         target_avg_token_length = target_avg_token_length,
         temporal_sequence_embed_prob = temporal_sequence_embed_prob,
@@ -202,9 +202,9 @@ def train(
             heads = heads,
             attn_dim_head = attn_dim_head
         ),
+        switch_entropy_quantile = switch_entropy_quantile,
         residual_stream_dropout = residual_stream_dropout,
         residual_stream_drop_prob = residual_stream_drop_prob,
-        pred_loss_to_switch_weight = pred_loss_to_switch_weight,
         kl_loss_weight = kl_loss_weight
     )
 
@@ -288,8 +288,10 @@ def train(
                 v_bc_state, v_bc_action, v_ratio, v_latent_ar, v_kl_loss = losses
                 loss_val = (v_bc_state + 0.5) * bc_state_loss_weight + (v_bc_action + 0.5) * bc_action_loss_weight + v_ratio * ratio_loss_weight + v_latent_ar * latent_ar_loss_weight + v_kl_loss * kl_loss_weight
 
+                # base segmentation using standard switch prob
                 segmented_str = visualize_segments(val_state[0], meta_output.switch_beta[0], threshold = 0.5)
                 accelerator.print(f"\n\nSEGMENTED: {segmented_str}\n")
+
                 accelerator.print(f"{i}: validation loss: {loss_val.item():.3f} (bc: {v_bc_action.item():.3f})")
 
         if divisible_by(i, generate_every):
