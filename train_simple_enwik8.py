@@ -80,7 +80,8 @@ def sample(
         state = state,
         actions = action,
         return_loss = False,
-        return_cache = True
+        return_cache = True,
+        use_temporal_sequence_embed = False
     )
 
     next_state = model.action_readout.sample(action_dist[:, -1:], temperature = temperature)
@@ -95,7 +96,8 @@ def sample(
             actions = action,
             return_loss = False,
             cache = cache,
-            return_cache = True
+            return_cache = True,
+            use_temporal_sequence_embed = False
         )
 
         all_switch_betas.append(meta_output.switch_beta[:, -1:])
@@ -134,7 +136,7 @@ def train(
     learning_rate = 2e-4,
     bc_state_loss_weight = 1.,
     bc_action_loss_weight = 1.,
-    ratio_loss_weight = 2.0,
+    ratio_loss_weight = 4.0,
     latent_ar_loss_weight = 0.1,
     validate_every = 100,
     generate_every = 250,
@@ -142,14 +144,16 @@ def train(
     generate_length = 160,
     seq_len = 128,
     dim = 512,
-    dim_latent = 64,
+    dim_code_bits = 8,
     depth = 3,
+    kl_loss_weight = 1.,
     heads = 8,
-    attn_dim_head = 48,
+    attn_dim_head = 64,
     target_avg_token_length = 8.,
-    residual_stream_dropout = 0.25,
-    residual_stream_drop_prob = 0.05,
-    pred_loss_to_switch_weight = 0.1,
+    temporal_sequence_embed_prob = 0.25,
+    residual_stream_dropout = 0.,
+    residual_stream_drop_prob = 0.,
+    pred_loss_to_switch_weight = 0.,
     cpu = False,
     checkpoint_path = './results-simple-enwik8/train-enwik8.pt',
     enwik8_path = './data/enwik8.gz',
@@ -186,15 +190,22 @@ def train(
         dim = dim,
         state_embed_readout = dict(num_discrete = 256),
         action_embed_readout = dict(num_discrete = 256),
-        dim_latent = dim_latent,
+        dim_code_bits = dim_code_bits,
         lower_body = dict(depth = depth, heads = heads, attn_dim_head = attn_dim_head),
         upper_body = dict(depth = depth, heads = heads, attn_dim_head = attn_dim_head),
         emitter_decoder = dict(depth = 1, heads = heads, attn_dim_head = attn_dim_head),
         dim_queries_keys = 256,
         target_avg_token_length = target_avg_token_length,
+        temporal_sequence_embed_prob = temporal_sequence_embed_prob,
+        temporal_sequence_embedder = dict(
+            depth = 1,
+            heads = heads,
+            attn_dim_head = attn_dim_head
+        ),
         residual_stream_dropout = residual_stream_dropout,
         residual_stream_drop_prob = residual_stream_drop_prob,
-        pred_loss_to_switch_weight = pred_loss_to_switch_weight
+        pred_loss_to_switch_weight = pred_loss_to_switch_weight,
+        kl_loss_weight = kl_loss_weight
     )
 
     # optimize jointly
@@ -218,6 +229,7 @@ def train(
         last_bc_state_loss = 0.
         last_ratio_loss = 0.
         last_latent_ar_loss = 0.
+        last_kl_loss = 0.
         last_switch_density = 0.
 
         for _ in range(grad_accum_every):
@@ -231,15 +243,19 @@ def train(
                 return_loss = True
             )
 
-            bc_state_loss, bc_action_loss, ratio_loss, latent_ar_loss = losses
+            bc_state_loss, bc_action_loss, ratio_loss, latent_ar_loss, kl_loss = losses
 
-            loss = (bc_state_loss + 0.5) * bc_state_loss_weight + (bc_action_loss + 0.5) * bc_action_loss_weight + ratio_loss * ratio_loss_weight + latent_ar_loss * latent_ar_loss_weight
+            loss = (bc_state_loss + 0.5) * bc_state_loss_weight + (bc_action_loss + 0.5) * bc_action_loss_weight + ratio_loss * ratio_loss_weight + latent_ar_loss * latent_ar_loss_weight + kl_loss * kl_loss_weight
 
             last_loss = loss.item()
             last_bc_state_loss = bc_state_loss.item()
             last_bc_action_loss = bc_action_loss.item()
             last_ratio_loss = ratio_loss.item()
             last_latent_ar_loss = latent_ar_loss.item()
+            if isinstance(kl_loss, torch.Tensor):
+                last_kl_loss = kl_loss.item()
+            else:
+                last_kl_loss = kl_loss
             last_switch_density = (meta_output.switch_beta > 0.5).float().mean().item()
 
             accelerator.backward(loss / grad_accum_every)
@@ -251,9 +267,9 @@ def train(
         # logging
 
         if divisible_by(i, 10):
-            log_str = f"{i}: loss: {last_loss:.3f} bc_action: {last_bc_action_loss:.3f} bc_state: {last_bc_state_loss:.3f} ratio: {last_ratio_loss:.3f} latent_ar: {last_latent_ar_loss:.3f} density: {last_switch_density:.3f}"
+            log_str = f"{i}: loss: {last_loss:.3f} bc_action: {last_bc_action_loss:.3f} bc_state: {last_bc_state_loss:.3f} ratio: {last_ratio_loss:.3f} latent_ar: {last_latent_ar_loss:.3f} kl: {last_kl_loss:.3f} density: {last_switch_density:.3f}"
             tqdm.tqdm.write(log_str)
-            pbar.set_postfix(bc_action = f"{last_bc_action_loss:.3f}", density = f"{last_switch_density:.3f}")
+            pbar.set_postfix(bc_action = f"{last_bc_action_loss:.3f}", kl = f"{last_kl_loss:.3f}", density = f"{last_switch_density:.3f}")
 
         if divisible_by(i, validate_every):
             model.eval()
@@ -265,11 +281,12 @@ def train(
                 losses, meta_output = model(
                     state = val_state,
                     actions = val_actions,
-                    return_loss = True
+                    return_loss = True,
+                    use_temporal_sequence_embed = False
                 )
 
-                v_bc_state, v_bc_action, v_ratio, v_latent_ar = losses
-                loss_val = (v_bc_state + 0.5) * bc_state_loss_weight + (v_bc_action + 0.5) * bc_action_loss_weight + v_ratio * ratio_loss_weight + v_latent_ar * latent_ar_loss_weight
+                v_bc_state, v_bc_action, v_ratio, v_latent_ar, v_kl_loss = losses
+                loss_val = (v_bc_state + 0.5) * bc_state_loss_weight + (v_bc_action + 0.5) * bc_action_loss_weight + v_ratio * ratio_loss_weight + v_latent_ar * latent_ar_loss_weight + v_kl_loss * kl_loss_weight
 
                 segmented_str = visualize_segments(val_state[0], meta_output.switch_beta[0], threshold = 0.5)
                 accelerator.print(f"\n\nSEGMENTED: {segmented_str}\n")

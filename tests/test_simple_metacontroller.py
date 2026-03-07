@@ -16,9 +16,11 @@ MODEL_KWARGS = dict(
     dim = 128,
     state_embed_readout = dict(num_discrete = 256),
     action_embed_readout = dict(num_discrete = 256),
-    dim_latent = 32,
+    dim_code_bits = 8,
     lower_body = dict(depth = 1, heads = 4, attn_dim_head = 16),
     upper_body = dict(depth = 1, heads = 4, attn_dim_head = 16),
+    temporal_sequence_embedder = dict(depth = 1, heads = 4, attn_dim_head = 16),
+    temporal_sequence_embed_prob = 1.,
     emitter_decoder = dict(depth = 1, heads = 4, attn_dim_head = 16),
     dim_queries_keys = 64,
     target_avg_token_length = 4.,
@@ -39,7 +41,11 @@ def test_caching_parity():
 
         # deterministic sampling for parity
 
-        model.latent_readout.sample = lambda dist, **kwargs: dist.unbind(dim = -1)[0]
+        orig_forward = model.binary_mapper.forward
+        def mock_binary_mapper(logits, *args, **kwargs):
+            return orig_forward(logits * 1e4, *args, **kwargs)
+
+        model.binary_mapper.forward = mock_binary_mapper
 
         state = x[:, :-1]
         actions = x[:, 1:]

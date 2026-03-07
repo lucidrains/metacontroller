@@ -1,19 +1,20 @@
 from __future__ import annotations
-from collections import namedtuple
+from typing import NamedTuple
 
 import torch
 from torch import nn, cat, tensor, is_tensor, Tensor, arange
 from torch.nn import Module, Linear, Parameter, RMSNorm, LayerNorm
-from torch.nn.functional import cosine_similarity, pad
+from torch.nn.functional import cosine_similarity, pad, logsigmoid
 
 import einx
 from einx import multiply
 from einops import rearrange, repeat, reduce
 
-from x_transformers import Decoder
+from x_transformers import Decoder, Encoder
 
-from discrete_continuous_embed_readout import EmbedAndReadout, Readout
+from discrete_continuous_embed_readout import EmbedAndReadout
 from assoc_scan import AssocScan
+from vector_quantize_pytorch import BinaryMapper
 
 from torch_einops_utils import pad_left_at_dim, masked_mean, align_dims_left, lens_to_mask
 from torch_einops_utils.device import move_inputs_to_module_device
@@ -55,31 +56,30 @@ def calculate_ratio_loss(
 
 # named tuples
 
-MetaControllerOutput = namedtuple('MetaControllerOutput', (
-    'prev_hiddens',
-    'input_residual_stream',
-    'action_dist',
-    'actions',
-    'switch_beta',
-    'ratio_loss'
-))
+class MetaControllerOutput(NamedTuple):
+    prev_hiddens: Tensor | None
+    input_residual_stream: Tensor
+    action_dist: Tensor
+    actions: Tensor
+    switch_beta: Tensor
+    ratio_loss: Tensor | None
+    kl_loss: Tensor | float
+    kl_loss_weight: float | Tensor
 
-GRPOOutput = namedtuple('GRPOOutput', (
-    'state',
-    'action',
-    'log_prob',
-    'switch_beta'
-))
+class GRPOOutput(NamedTuple):
+    state: Tensor
+    action: Tensor
+    log_prob: Tensor
+    switch_beta: Tensor
 
-TransformerWithMetacontrollerCache = namedtuple('TransformerWithMetacontrollerCache', (
-    'lower_body',
-    'emitter_decoder',
-    'upper_body',
-    'prev_key',
-    'prev_pred_residual_stream',
-    'prev_gated_action',
-    'cache_steps'
-))
+class TransformerWithMetacontrollerCache(NamedTuple):
+    lower_body: Tensor | None
+    emitter_decoder: Tensor | None
+    upper_body: Tensor | None
+    prev_key: Tensor | None
+    prev_pred_residual_stream: Tensor | None
+    prev_gated_action: Tensor | None
+    cache_steps: int
 
 # grpo helpers
 
@@ -143,20 +143,27 @@ class TransformerWithMetacontroller(Module):
         state_embed_readout: dict,
         action_embed_readout: dict,
         embed_past_actions = True,
-        dim_latent = 128,
+        dim_code_bits = 4,
         emitter_decoder: dict = dict(),
         lower_body: dict = dict(),
         upper_body: dict = dict(),
+        temporal_sequence_embedder: dict | None = None,
+        dim_sequence_summary_embed: int = 32,
+        temporal_sequence_embed_prob: float = 1.,
         dim_queries_keys = 256,
         target_avg_token_length = 8.,
         residual_stream_dropout = 0.,
         residual_stream_drop_prob = 0.,
         pred_loss_to_switch_weight = 0.,
+        kl_loss_weight = 1.,
+        kl_loss_threshold = 0.,
         assoc_scan_kwargs: dict = dict()
     ):
         super().__init__()
         self.dim_model = dim
-        self.dim_latent = dim_latent
+        self.dim_code_bits = dim_code_bits
+
+        self.kl_loss_weight = kl_loss_weight
 
         # embeddings
 
@@ -183,6 +190,24 @@ class TransformerWithMetacontroller(Module):
             **emitter_decoder
         )
 
+        # temporal sequence embedder
+
+        self.temporal_embedder = None
+        if exists(temporal_sequence_embedder):
+            self.temporal_embedder = Encoder(
+                dim = dim,
+                use_rmsnorm = True,
+                polar_pos_emb = True,
+                **temporal_sequence_embedder
+            )
+
+            self.to_sequence_summary_embed = nn.Sequential(
+                Linear(dim, dim_sequence_summary_embed),
+                Linear(dim_sequence_summary_embed, dim)
+            )
+
+        self.temporal_sequence_embed_prob = temporal_sequence_embed_prob
+
         # qk switching unit
 
         self.to_queries_keys = nn.Sequential(
@@ -198,9 +223,15 @@ class TransformerWithMetacontroller(Module):
         self.start_key_token = Parameter(torch.randn(dim_queries_keys) * 1e-2)
         self.target_avg_token_length = target_avg_token_length
 
-        # latent readout
+        # binary mapper
 
-        self.latent_readout = Readout(dim, num_continuous = dim_latent)
+        self.emitter_to_binary_logits = Linear(dim, dim_code_bits, bias=False)
+
+        self.binary_mapper = BinaryMapper(
+            bits = dim_code_bits,
+            kl_loss_threshold = kl_loss_threshold
+        )
+        self.num_codes = self.binary_mapper.num_codes
 
         # associative scan
 
@@ -208,7 +239,7 @@ class TransformerWithMetacontroller(Module):
 
         # latent to control signal
 
-        self.to_control_signal = Linear(dim_latent, dim, bias = False)
+        self.to_control_signal = Linear(self.num_codes, dim, bias = False)
 
         self.residual_stream_dropout = nn.Dropout(residual_stream_dropout)
         self.residual_stream_drop_prob = residual_stream_drop_prob
@@ -234,17 +265,36 @@ class TransformerWithMetacontroller(Module):
     def replay_buffer_field_dict(self):
         return dict(
             states = ('float', self.dim_model),
-            log_probs = 'float',
+            log_probs = ('float', self.dim_code_bits),
             switch_betas = 'float',
-            latent_actions = ('float', self.dim_latent)
+            latent_actions = ('float', self.num_codes)
         )
 
-    def get_action_dist_for_internal_rl(self, residual_stream):
+    def get_action_dist_for_internal_rl(self, residual_stream, return_kl_loss=False):
         emitter_out = self.emitter_decoder(residual_stream)
-        return self.latent_readout(emitter_out)
+        binary_logits = self.emitter_to_binary_logits(emitter_out)
+        if not return_kl_loss:
+            return binary_logits
+        return binary_logits, self.calculate_kl_loss(binary_logits)
+
+    def calculate_kl_loss(self, binary_logits):
+        _, kl_loss = self.binary_mapper(binary_logits, reduce_aux_kl_loss=False)
+        return kl_loss
 
     def log_prob(self, dist_params, actions):
-        return self.latent_readout.log_prob(dist_params, actions)
+        log_probs = torch.stack((
+            logsigmoid(dist_params),
+            logsigmoid(-dist_params)
+        ), dim = -1)
+
+        indices = actions.argmax(dim = -1)
+        codes = self.binary_mapper.codes[indices].long()
+
+        codes = rearrange(codes, '... -> ... 1')
+        action_log_probs = log_probs.gather(-1, codes)
+        action_log_probs = rearrange(action_log_probs, '... 1 -> ...')
+
+        return action_log_probs
 
     # forward
 
@@ -255,7 +305,8 @@ class TransformerWithMetacontroller(Module):
         episode_lens: Tensor | None = None,
         return_loss = True,
         cache: TransformerWithMetacontrollerCache | None = None,
-        return_cache = False
+        return_cache = False,
+        use_temporal_sequence_embed: bool | None = None
     ):
         batch, seq_len, device = *state.shape[:2], state.device
 
@@ -291,7 +342,27 @@ class TransformerWithMetacontroller(Module):
 
         # derive switching probabilities from qk cosine similarity
 
-        queries, keys = self.to_queries_keys(residual_stream).chunk(2, dim = -1)
+        qk_input = residual_stream
+        
+        should_use_temporal_embed = default(use_temporal_sequence_embed, return_loss)
+
+        if should_use_temporal_embed and exists(self.temporal_embedder):
+            temporal_encoded = self.temporal_embedder(residual_stream, mask=mask)
+            temporal_pooled = masked_mean(temporal_encoded, mask, dim=1)
+            temporal_bottlenecked = self.to_sequence_summary_embed(temporal_pooled)
+
+            if self.training and self.temporal_sequence_embed_prob < 1.:
+                batch_prob_mask = torch.rand(batch, device=device) < self.temporal_sequence_embed_prob
+                temporal_bottlenecked = torch.where(
+                    rearrange(batch_prob_mask, 'b -> b 1'),
+                    temporal_bottlenecked,
+                    self.zero
+                )
+            
+            temporal_repeated = repeat(temporal_bottlenecked, 'b d -> b n d', n=seq_len)
+            qk_input = qk_input + temporal_repeated
+
+        queries, keys = self.to_queries_keys(qk_input).chunk(2, dim = -1)
 
         if not exists(prev_key):
             start_keys = repeat(self.start_key_token, 'd -> b 1 d', b = batch)
@@ -343,8 +414,9 @@ class TransformerWithMetacontroller(Module):
         # obtain latents from emitter + readout
 
         emitter_out, next_emitter_decoder_cache = self.emitter_decoder(residual_stream, cache = emitter_decoder_cache, return_hiddens = True)
-        action_dist = self.latent_readout(emitter_out)
-        sampled_latent_action = self.latent_readout.sample(action_dist, differentiable = True)
+        binary_logits = self.emitter_to_binary_logits(emitter_out)
+        
+        sampled_latent_action, kl_loss = self.binary_mapper(binary_logits, reduce_aux_kl_loss=False)
 
         # gated action via associative scan
 
@@ -403,21 +475,31 @@ class TransformerWithMetacontroller(Module):
             bc_state_loss = self.state_readout.calculate_loss(state_dist_params, target_state, mask = loss_mask)
             bc_action_loss = self.action_readout.calculate_loss(dist_params, target_actions, mask = loss_mask)
             ratio_loss = calculate_ratio_loss(switch_probs, boundary_mask, self.target_avg_token_length, mask = mask)
+            
+            if kl_loss.ndim == 3:
+                kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
+
+            kl_loss = masked_mean(kl_loss, mask)
+
+        else:
+            kl_loss = self.zero
 
         meta_output = MetaControllerOutput(
             prev_hiddens = None,
             input_residual_stream = residual_stream,
-            action_dist = action_dist,
+            action_dist = binary_logits,
             actions = sampled_latent_action,
             switch_beta = switch_probs,
-            ratio_loss = ratio_loss
+            ratio_loss = ratio_loss,
+            kl_loss = kl_loss,
+            kl_loss_weight = self.kl_loss_weight
         )
 
         if not return_loss:
             ret = (dist_params, meta_output)
         else:
             ret = (
-                (bc_state_loss, bc_action_loss, ratio_loss, latent_ar_loss),
+                (bc_state_loss, bc_action_loss, ratio_loss, latent_ar_loss, kl_loss),
                 meta_output
             )
 
