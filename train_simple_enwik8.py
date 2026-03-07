@@ -135,6 +135,7 @@ def train(
     bc_state_loss_weight = 1.,
     bc_action_loss_weight = 1.,
     ratio_loss_weight = 2.0,
+    latent_ar_loss_weight = 0.1,
     validate_every = 100,
     generate_every = 250,
     prime_length = 16,
@@ -146,8 +147,9 @@ def train(
     heads = 8,
     attn_dim_head = 48,
     target_avg_token_length = 8.,
-    residual_stream_dropout = 0.5,
-    residual_stream_drop_prob = 0.1,
+    residual_stream_dropout = 0.25,
+    residual_stream_drop_prob = 0.05,
+    pred_loss_to_switch_weight = 0.1,
     cpu = False,
     checkpoint_path = './results-simple-enwik8/train-enwik8.pt',
     enwik8_path = './data/enwik8.gz',
@@ -192,6 +194,7 @@ def train(
         target_avg_token_length = target_avg_token_length,
         residual_stream_dropout = residual_stream_dropout,
         residual_stream_drop_prob = residual_stream_drop_prob,
+        pred_loss_to_switch_weight = pred_loss_to_switch_weight,
     )
 
     # optimize jointly
@@ -214,6 +217,7 @@ def train(
         last_bc_action_loss = 0.
         last_bc_state_loss = 0.
         last_ratio_loss = 0.
+        last_latent_ar_loss = 0.
         last_switch_density = 0.
 
         for _ in range(grad_accum_every):
@@ -227,14 +231,15 @@ def train(
                 return_loss = True
             )
 
-            bc_state_loss, bc_action_loss, ratio_loss = losses
+            bc_state_loss, bc_action_loss, ratio_loss, latent_ar_loss = losses
 
-            loss = (bc_state_loss + 0.5) * bc_state_loss_weight + (bc_action_loss + 0.5) * bc_action_loss_weight + ratio_loss * ratio_loss_weight
+            loss = (bc_state_loss + 0.5) * bc_state_loss_weight + (bc_action_loss + 0.5) * bc_action_loss_weight + ratio_loss * ratio_loss_weight + latent_ar_loss * latent_ar_loss_weight
 
             last_loss = loss.item()
             last_bc_state_loss = bc_state_loss.item()
             last_bc_action_loss = bc_action_loss.item()
             last_ratio_loss = ratio_loss.item()
+            last_latent_ar_loss = latent_ar_loss.item()
             last_switch_density = (meta_output.switch_beta > 0.5).float().mean().item()
 
             accelerator.backward(loss / grad_accum_every)
@@ -246,7 +251,7 @@ def train(
         # logging
 
         if divisible_by(i, 10):
-            log_str = f"{i}: loss: {last_loss:.3f} bc_action: {last_bc_action_loss:.3f} bc_state: {last_bc_state_loss:.3f} ratio: {last_ratio_loss:.3f} density: {last_switch_density:.3f}"
+            log_str = f"{i}: loss: {last_loss:.3f} bc_action: {last_bc_action_loss:.3f} bc_state: {last_bc_state_loss:.3f} ratio: {last_ratio_loss:.3f} latent_ar: {last_latent_ar_loss:.3f} density: {last_switch_density:.3f}"
             tqdm.tqdm.write(log_str)
             pbar.set_postfix(bc_action = f"{last_bc_action_loss:.3f}", density = f"{last_switch_density:.3f}")
 
@@ -263,8 +268,8 @@ def train(
                     return_loss = True
                 )
 
-                v_bc_state, v_bc_action, v_ratio = losses
-                loss_val = (v_bc_state + 0.5) * bc_state_loss_weight + (v_bc_action + 0.5) * bc_action_loss_weight + v_ratio * ratio_loss_weight
+                v_bc_state, v_bc_action, v_ratio, v_latent_ar = losses
+                loss_val = (v_bc_state + 0.5) * bc_state_loss_weight + (v_bc_action + 0.5) * bc_action_loss_weight + v_ratio * ratio_loss_weight + v_latent_ar * latent_ar_loss_weight
 
                 segmented_str = visualize_segments(val_state[0], meta_output.switch_beta[0], threshold = 0.5)
                 accelerator.print(f"\n\nSEGMENTED: {segmented_str}\n")

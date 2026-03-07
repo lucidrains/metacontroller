@@ -101,6 +101,7 @@ class TransformerWithMetacontroller(Module):
         target_avg_token_length = 8.,
         residual_stream_dropout = 0.,
         residual_stream_drop_prob = 0.,
+        pred_loss_to_switch_weight = 0.,
         assoc_scan_kwargs: dict = dict()
     ):
         super().__init__()
@@ -137,6 +138,11 @@ class TransformerWithMetacontroller(Module):
             Linear(dim, dim_queries_keys * 2, bias = False)
         )
 
+        self.to_pred_query = nn.Sequential(
+            RMSNorm(dim),
+            Linear(dim, dim_queries_keys, bias = False)
+        )
+
         self.start_key_token = Parameter(torch.randn(dim_queries_keys) * 1e-2)
         self.target_avg_token_length = target_avg_token_length
 
@@ -157,6 +163,7 @@ class TransformerWithMetacontroller(Module):
 
         self.residual_stream_dropout = nn.Dropout(residual_stream_dropout)
         self.residual_stream_drop_prob = residual_stream_drop_prob
+        self.pred_loss_to_switch_weight = pred_loss_to_switch_weight
 
         # upper body
 
@@ -225,10 +232,24 @@ class TransformerWithMetacontroller(Module):
         cosine_sim = cosine_similarity(queries, keys_with_prev[:, :-1], dim = -1)
         switch_probs = (1. - cosine_sim) * 0.5
 
-        boundary_mask = switch_probs > 0.5
-
         if cache_steps == 0:
-            boundary_mask[:, 0] = True
+            switch_probs = torch.where(
+                arange(seq_len, device = device) == 0,
+                1.,
+                switch_probs
+            )
+
+        latent_ar_loss = None
+        if return_loss:
+            pred_query = self.to_pred_query(residual_stream)
+            per_token_latent_ar_loss = 1. - cosine_similarity(pred_query[:, :-1], queries[:, 1:].detach(), dim = -1)
+            latent_ar_loss = per_token_latent_ar_loss.mean()
+
+            if self.pred_loss_to_switch_weight > 0.:
+                padded_per_token_loss = pad_left_at_dim(per_token_latent_ar_loss, 1, dim = 1)
+                switch_probs = switch_probs.lerp(padded_per_token_loss.detach(), self.pred_loss_to_switch_weight)
+
+        boundary_mask = switch_probs > 0.5
 
         switch_probs_hard = straight_through(switch_probs, boundary_mask.float())
 
@@ -309,7 +330,13 @@ class TransformerWithMetacontroller(Module):
             ratio_loss = ratio_loss
         )
 
-        ret = (dist_params, meta_output) if not return_loss else ((bc_state_loss, bc_action_loss, ratio_loss), meta_output)
+        if not return_loss:
+            ret = (dist_params, meta_output)
+        else:
+            ret = (
+                (bc_state_loss, bc_action_loss, ratio_loss, latent_ar_loss),
+                meta_output
+            )
 
         if return_cache:
             return (*ret, next_cache)
