@@ -76,7 +76,7 @@ TransformerWithMetacontrollerCache = namedtuple('TransformerWithMetacontrollerCa
     'emitter_decoder',
     'upper_body',
     'prev_key',
-    'prev_pred_query',
+    'prev_pred_residual_stream',
     'prev_gated_action',
     'cache_steps'
 ))
@@ -190,9 +190,9 @@ class TransformerWithMetacontroller(Module):
             Linear(dim, dim_queries_keys * 2, bias = False)
         )
 
-        self.to_pred_query = nn.Sequential(
+        self.to_pred_residual_stream = nn.Sequential(
             RMSNorm(dim),
-            Linear(dim, dim_queries_keys, bias = False)
+            Linear(dim, dim, bias = False)
         )
 
         self.start_key_token = Parameter(torch.randn(dim_queries_keys) * 1e-2)
@@ -272,7 +272,7 @@ class TransformerWithMetacontroller(Module):
             if seq_len == actions.shape[1]:
                 actions = actions[:, :-1]
 
-        lower_body_cache, emitter_decoder_cache, upper_body_cache, prev_key, prev_pred_query, prev_gated_action, cache_steps = default(cache, (None,) * 6 + (0,))
+        lower_body_cache, emitter_decoder_cache, upper_body_cache, prev_key, prev_pred_residual_stream, prev_gated_action, cache_steps = default(cache, (None,) * 6 + (0,))
 
         # embed and process through lower body
 
@@ -313,29 +313,29 @@ class TransformerWithMetacontroller(Module):
         # latent ar loss + optional predictive switch blending
 
         latent_ar_loss = None
-        pred_query = None
+        pred_residual_stream = None
 
         if return_loss or self.pred_loss_to_switch_weight > 0.:
-            pred_query = self.to_pred_query(residual_stream)
+            pred_residual_stream = self.to_pred_residual_stream(residual_stream)
 
         if return_loss:
-            per_token_latent_ar_loss = cosine_distance(pred_query[:, :-1], queries[:, 1:].detach())
+            per_token_latent_ar_loss = cosine_distance(pred_residual_stream[:, :-1], residual_stream[:, 1:].detach())
 
             # handle mask for loss (shift by 1 like targets)
             loss_mask = mask[:, 1:] if exists(mask) else None
             latent_ar_loss = masked_mean(per_token_latent_ar_loss, loss_mask)
 
         if self.pred_loss_to_switch_weight > 0.:
-            if not exists(prev_pred_query):
-                _per_token_loss = cosine_distance(pred_query[:, :-1], queries[:, 1:].detach())
+            if not exists(prev_pred_residual_stream):
+                _per_token_loss = cosine_distance(pred_residual_stream[:, :-1], residual_stream[:, 1:].detach())
                 predictive_difficulty = pad(_per_token_loss, (1, 0), value = 1.)
             else:
-                pred_query_with_prev = cat((prev_pred_query, pred_query[:, :-1]), dim = 1)
-                predictive_difficulty = cosine_distance(pred_query_with_prev, queries.detach())
+                pred_residual_stream_with_prev = cat((prev_pred_residual_stream, pred_residual_stream[:, :-1]), dim = 1)
+                predictive_difficulty = cosine_distance(pred_residual_stream_with_prev, residual_stream.detach())
 
-            switch_probs = switch_probs.lerp(predictive_difficulty.detach(), self.pred_loss_to_switch_weight)
+            switch_probs = switch_probs.lerp(predictive_difficulty, self.pred_loss_to_switch_weight)
 
-        next_prev_pred_query = pred_query[:, -1:] if exists(pred_query) else None
+        next_prev_pred_residual_stream = pred_residual_stream[:, -1:] if exists(pred_residual_stream) else None
 
         boundary_mask = switch_probs > 0.5
         switch_probs_hard = straight_through(switch_probs, boundary_mask.float())
@@ -358,11 +358,11 @@ class TransformerWithMetacontroller(Module):
 
         confidence = torch.where(boundary_mask, switch_probs, 1. - switch_probs)
         confidence_scale = straight_through(confidence, 1.)
-        scanned_latent_action = multiply('b n d, b n', scanned_latent_action, confidence_scale)
 
         # latent to control signal
 
         control_signal = self.to_control_signal(scanned_latent_action)
+        control_signal = multiply('b n d, b n', control_signal, confidence_scale)
 
         dropped_residual_stream = self.residual_stream_dropout(residual_stream)
 
@@ -388,7 +388,7 @@ class TransformerWithMetacontroller(Module):
             emitter_decoder = next_emitter_decoder_cache,
             upper_body = next_upper_body_cache,
             prev_key = next_prev_key,
-            prev_pred_query = next_prev_pred_query,
+            prev_pred_residual_stream = next_prev_pred_residual_stream,
             prev_gated_action = next_prev_gated_action,
             cache_steps = cache_steps + seq_len
         )
@@ -425,24 +425,5 @@ class TransformerWithMetacontroller(Module):
             return (*ret, next_cache)
 
         return ret
-
-    # GRPO methods
-
-    @property
-    def replay_buffer_field_dict(self):
-        return dict(
-            state = 'float',
-            action = 'float',
-            log_prob = 'float',
-            switch_beta = 'float'
-        )
-
-    def get_action_dist_for_internal_rl(self, residual_stream):
-        emitter_out, _ = self.emitter_decoder(residual_stream, return_hiddens = True)
-        action_dist = self.latent_readout(emitter_out)
-        return action_dist
-
-    def log_prob(self, action_dist, latent_action):
-        return self.latent_readout.log_prob(action_dist, latent_action)
 
 TransformerWithMetacontroller.policy_loss = policy_loss

@@ -55,7 +55,7 @@ def visualize_segments(
         if switch:
             segments.append(delimiter)
 
-        segments.append(decode_tokens([token]))
+        segments.append(decode_token(token))
 
     return ''.join(segments)
 
@@ -194,7 +194,7 @@ def train(
         target_avg_token_length = target_avg_token_length,
         residual_stream_dropout = residual_stream_dropout,
         residual_stream_drop_prob = residual_stream_drop_prob,
-        pred_loss_to_switch_weight = pred_loss_to_switch_weight,
+        pred_loss_to_switch_weight = pred_loss_to_switch_weight
     )
 
     # optimize jointly

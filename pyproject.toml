@@ -1,6 +1,6 @@
 [project]
 name = "metacontroller-pytorch"
-version = "0.2.35"
+version = "0.2.36"
 description = "Transformer Metacontroller"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
