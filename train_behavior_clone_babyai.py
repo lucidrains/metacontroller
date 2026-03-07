@@ -135,7 +135,7 @@ def visualize_switch_betas(
             tracker.log({
                 f"switch_betas/step_{gradient_step}": wandb.Image(fig)
             }, step=gradient_step)
-    
+
     plt.close(fig)
 
 def train(
@@ -275,9 +275,9 @@ def train(
     # state: (B, T, H, W, C) or (B, T, D)
 
     state_shape = replay_buffer.shapes['state']
-    if modality == MODALITY_RESNET_RGB: 
+    if modality == MODALITY_RESNET_RGB:
         state_dim = 256
-    elif modality == MODALITY_RAW_RGB or modality == MODALITY_SYMBOLIC: 
+    elif modality == MODALITY_RAW_RGB or modality == MODALITY_SYMBOLIC:
         state_dim = int(torch.tensor(state_shape).prod().item())
 
     # deduce num_actions from the environment
@@ -318,7 +318,7 @@ def train(
         )
 
     # transformer
-    
+
     transformer_class = TransformerWithResnet if modality == MODALITY_RESNET_RGB else Transformer
 
     transformer_kwargs = dict(
@@ -334,9 +334,9 @@ def train(
         dim_condition = mission_embed_dim if condition_on_mission_embed else None,
         normalize_state_action_losses = normalize_state_action_losses
     )
-    if modality == MODALITY_RESNET_RGB: 
+    if modality == MODALITY_RESNET_RGB:
         transformer_kwargs["use_layernorm"] = True # resnet won't suffer from grad. accum.
-    
+
 
     model = transformer_class(**transformer_kwargs)
 
@@ -428,7 +428,7 @@ def train(
             if epoch < v: break
             phase = k
         return phase
-    
+
     for epoch in range(total_epochs):
 
         current_training_phase = get_training_phase(epoch)
@@ -445,12 +445,12 @@ def train(
             is_behavior_cloning = False
 
             # enable only the visual backbones
-            if isinstance(model, DistributedDataParallel): 
+            if isinstance(model, DistributedDataParallel):
                 set_requires_grad(model.module, False)
                 set_requires_grad(model.module.visual_encoder, True)
                 set_requires_grad(model.module.final_norm, True)
                 set_requires_grad(model.module.visual_decoder, True)
-            else: 
+            else:
                 set_requires_grad(model, False)
                 set_requires_grad(model.visual_encoder, True)
                 set_requires_grad(model.final_norm, True)
@@ -470,14 +470,14 @@ def train(
             is_discovering = False
 
             # enable transformer
-            if isinstance(model, DistributedDataParallel): 
+            if isinstance(model, DistributedDataParallel):
                 set_requires_grad(model.module, True)
-                if modality == MODALITY_RESNET_RGB: 
+                if modality == MODALITY_RESNET_RGB:
                     set_requires_grad(model.module.visual_encoder, False)
                     set_requires_grad(model.module.visual_decoder, False)
-            else: 
+            else:
                 set_requires_grad(model, True)
-                if modality == MODALITY_RESNET_RGB: 
+                if modality == MODALITY_RESNET_RGB:
                     set_requires_grad(model.visual_encoder, False)
                     set_requires_grad(model.visual_decoder, False)
 
@@ -489,7 +489,7 @@ def train(
             if is_discovering == False:
                 accelerator.wait_for_everyone()
                 store_checkpoint()
-                
+
             is_pretraining_resnet = False
             is_behavior_cloning = False
             is_discovering = True
@@ -509,13 +509,13 @@ def train(
                 model.module.meta_controller_reset_kl_loss_warmup()
             else:
                 model.meta_controller_reset_kl_loss_warmup()
-                
+
         # sequence processing
 
         optim = optim_model if not is_discovering else optim_meta_controller
 
         for batch in progress_bar:
-            
+
             # rgb -> norm and multichannel, ready for resnet
             if modality == MODALITY_RESNET_RGB:
                 states = batch['state'].float()
@@ -529,7 +529,7 @@ def train(
                 states = torch.clamp(states / 255.0, min=0.0, max=1.0)
                 states = (states - torch.tensor([0.485, 0.456, 0.406]).to(states.device)) / torch.tensor([0.229, 0.224, 0.225]).to(states.device)
                 states = rearrange(states, 'b t ... -> b t (...)')
-            
+
             # symbolic -> just flatten
 
             elif modality == MODALITY_SYMBOLIC:
@@ -584,11 +584,11 @@ def train(
                         visual_autoencoder_loss = visual_autoencoder_loss.item(),
                     )
                     log["visual_autoencoder_loss"] = visual_autoencoder_loss.item()
-            
+
                 # loss: behavior cloning
 
                 elif is_behavior_cloning:
-                    
+
                     state_loss, action_loss = losses
 
                     loss = (
@@ -628,13 +628,13 @@ def train(
                         discovery_action_recon_loss_weight = old_discovery_action_recon_loss_weight
 
                     # kl and ratio loss are weighted inside the metacontroller
-                    
+
                     loss = (
                         obs_loss * discovery_obs_loss_weight
                         + action_recon_loss * discovery_action_recon_loss_weight
                         + entropy_loss * entropy_weight
                         + kl_loss
-                        + ratio_loss            
+                        + ratio_loss
                     )
 
                     if exists(visual_autoencoder_loss):
@@ -654,7 +654,7 @@ def train(
                     )
                     if exists(visual_autoencoder_loss):
                         log["visual_autoencoder_loss"] = visual_autoencoder_loss.item()
-                    
+
 
                 # gradient accumulation
 

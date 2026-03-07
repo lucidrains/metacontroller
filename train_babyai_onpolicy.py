@@ -275,7 +275,7 @@ def visualize_switch_betas(
             tracker.log({
                 f"switch_betas/step_{gradient_step}": wandb.Image(fig)
             }, step=gradient_step)
-    
+
     plt.close(fig)
 
 
@@ -328,7 +328,7 @@ def main(
         group_seeds = np.load(npy_seedfile, allow_pickle=True).astype(int).tolist()
         if npy_seedfile_seeds_limit != None:
             group_seeds = group_seeds[:npy_seedfile_seeds_limit]
-        
+
     def get_next_seed():
         if group_seeds is not None:
             return group_seeds[torch.randint(0, len(group_seeds), (1,)).item()]
@@ -451,7 +451,7 @@ def main(
                 image_tensor = torch.clamp(image_tensor / 255.0, min=0.0, max=1.0)
                 image_tensor = (image_tensor - torch.tensor([0.485, 0.456, 0.406]).to(image_tensor.device)) / torch.tensor([0.229, 0.224, 0.225]).to(image_tensor.device)
                 image_tensor = rearrange(image_tensor, 'b h w c -> b 1 (h w c)')
-            
+
             # symbolic -> just flatten
 
             elif modality == MODALITY_SYMBOLIC:
@@ -580,7 +580,7 @@ def main(
         )
 
         loss = (
-            policy_loss 
+            policy_loss
             + kl_loss
         )
 

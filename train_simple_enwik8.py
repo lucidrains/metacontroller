@@ -86,10 +86,10 @@ def sample(
     next_state = model.action_readout.sample(action_dist[:, -1:], temperature = temperature)
     state = torch.cat((state, next_state), dim = -1)
     action = next_state
-    
-    all_switch_betas = [meta_output.switch_beta[:, -1:]]
 
-    for _ in range(sample_num_times - 1):
+    all_switch_betas = []
+
+    for i in range(sample_num_times):
         action_dist, meta_output, next_cache = model(
             state = state[:, -1:],
             actions = action,
@@ -97,14 +97,15 @@ def sample(
             cache = cache,
             return_cache = True
         )
-        
-        next_state = model.action_readout.sample(action_dist[:, -1:], temperature = temperature)
 
-        state = torch.cat((state, next_state), dim = -1)
-        action = next_state
-        
         all_switch_betas.append(meta_output.switch_beta[:, -1:])
         cache = next_cache
+
+        if i < (sample_num_times - 1):
+            next_state = model.action_readout.sample(action_dist[:, -1:], temperature = temperature)
+
+            state = torch.cat((state, next_state), dim = -1)
+            action = next_state
 
     return state[:, prompt_seq_len:], torch.cat(all_switch_betas, dim = -1)
 
@@ -133,7 +134,7 @@ def train(
     learning_rate = 2e-4,
     bc_state_loss_weight = 1.,
     bc_action_loss_weight = 1.,
-    ratio_loss_weight = 4.0,
+    ratio_loss_weight = 2.0,
     validate_every = 100,
     generate_every = 250,
     prime_length = 16,
@@ -145,6 +146,8 @@ def train(
     heads = 8,
     attn_dim_head = 48,
     target_avg_token_length = 8.,
+    residual_stream_dropout = 0.5,
+    residual_stream_drop_prob = 0.1,
     cpu = False,
     checkpoint_path = './results-simple-enwik8/train-enwik8.pt',
     enwik8_path = './data/enwik8.gz',
@@ -187,6 +190,8 @@ def train(
         emitter_decoder = dict(depth = 1, heads = heads, attn_dim_head = attn_dim_head),
         dim_queries_keys = 256,
         target_avg_token_length = target_avg_token_length,
+        residual_stream_dropout = residual_stream_dropout,
+        residual_stream_drop_prob = residual_stream_drop_prob,
     )
 
     # optimize jointly
@@ -221,9 +226,9 @@ def train(
                 actions = actions,
                 return_loss = True
             )
-            
+
             bc_state_loss, bc_action_loss, ratio_loss = losses
-            
+
             loss = (bc_state_loss + 0.5) * bc_state_loss_weight + (bc_action_loss + 0.5) * bc_action_loss_weight + ratio_loss * ratio_loss_weight
 
             last_loss = loss.item()
@@ -257,7 +262,7 @@ def train(
                     actions = val_actions,
                     return_loss = True
                 )
-                
+
                 v_bc_state, v_bc_action, v_ratio = losses
                 loss_val = (v_bc_state + 0.5) * bc_state_loss_weight + (v_bc_action + 0.5) * bc_action_loss_weight + v_ratio * ratio_loss_weight
 
@@ -286,7 +291,7 @@ def train(
             accelerator.wait_for_everyone()
             unwrapped_model = accelerator.unwrap_model(model)
             unwrapped_model.save(checkpoint_path)
-            
+
     # final save
 
     accelerator.print(f"saving final checkpoint to {checkpoint_path}")

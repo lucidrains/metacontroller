@@ -48,14 +48,17 @@ def binary_entropy(p):
     eps = 1e-8
     return -((p * (p + eps).log()) + (1. - p) * ((1. - p + eps).log()))
 
-def calculate_ratio_loss(switch_probs: Tensor, target_avg_token_length: float):
+def calculate_ratio_loss(
+    switch_probs: Tensor,
+    boundary_mask: Tensor,
+    target_avg_token_length: float
+):
     N = target_avg_token_length
-    boundary_mask = switch_probs > 0.5
-    
+
     F_soft = (switch_probs - 0.5).sigmoid()
     F_mask = straight_through(F_soft, boundary_mask.float()).mean(dim = -1)
     G = switch_probs.mean(dim = -1)
-    
+
     ratio_loss = N / (N - 1) * ((N - 1) * F_mask * G + (1. - F_mask) * (1. - G))
     return ratio_loss.mean()
 
@@ -95,19 +98,20 @@ class TransformerWithMetacontroller(Module):
         lower_body: dict = dict(),
         upper_body: dict = dict(),
         dim_queries_keys = 256,
-        switch_temperature = 0.1,
         target_avg_token_length = 8.,
+        residual_stream_dropout = 0.,
+        residual_stream_drop_prob = 0.,
         assoc_scan_kwargs: dict = dict()
     ):
         super().__init__()
-        
+
         # embeddings
 
         self.state_embed, self.state_readout = EmbedAndReadout(dim, **state_embed_readout)
         action_embed, self.action_readout = EmbedAndReadout(dim, **action_embed_readout)
-        
+
         self.action_embed = action_embed if embed_past_actions else None
-        
+
         # lower body
 
         self.lower_body = Decoder(
@@ -116,16 +120,16 @@ class TransformerWithMetacontroller(Module):
             polar_pos_emb = True,
             **lower_body
         )
-        
+
         # emitter decoder
 
         self.emitter_decoder = Decoder(
-            dim = dim, 
+            dim = dim,
             use_rmsnorm = True,
             polar_pos_emb = True,
             **emitter_decoder
         )
-        
+
         # qk module
 
         self.to_queries_keys = nn.Sequential(
@@ -135,25 +139,24 @@ class TransformerWithMetacontroller(Module):
 
         self.start_key_token = Parameter(torch.randn(dim_queries_keys) * 1e-2)
         self.target_avg_token_length = target_avg_token_length
-        
+
         # latent space (simple gaussian)
 
         self.latent_readout = Readout(
-            dim, 
+            dim,
             num_continuous = dim_latent
         )
-        
+
         # associative scan for sequence chunking
 
         self.assoc_scan = AssocScan(**assoc_scan_kwargs)
-        
+
         # latent to control signal
 
         self.to_control_signal = Linear(dim_latent, dim, bias = False)
-        
-        # switch temperature
 
-        self.switch_temperature = switch_temperature
+        self.residual_stream_dropout = nn.Dropout(residual_stream_dropout)
+        self.residual_stream_drop_prob = residual_stream_drop_prob
 
         # upper body
 
@@ -163,7 +166,7 @@ class TransformerWithMetacontroller(Module):
             polar_pos_emb = True,
             **upper_body
         )
-        
+
         self.modified_residual_stream_norm = LayerNorm(dim, bias = False)
 
         self.register_buffer('zero', tensor(0.), persistent = False)
@@ -177,84 +180,104 @@ class TransformerWithMetacontroller(Module):
         return_cache = False
     ):
         batch, seq_len, device = *state.shape[:2], state.device
-        
+
         target_state = target_actions = None
 
         if return_loss:
             target_state = state[:, 1:]
-            
+
             assert exists(actions), '`actions` cannot be empty when turning on return_loss'
-            
+
             target_actions = actions
-            
+
             if seq_len == actions.shape[1]:
                 actions = actions[:, :-1]
-            
+
         lower_body_cache, emitter_decoder_cache, upper_body_cache, prev_key, prev_gated_action, cache_steps = default(cache, (None,) * 5 + (0,))
 
         # embed and process through lower body
 
         state_embed = self.state_embed(state)
         action_embed_out = 0.
-        
+
         if exists(actions) and exists(self.action_embed):
             action_embed_out = self.action_embed(actions)
-            
+
         if is_tensor(action_embed_out) and action_embed_out.shape[1] == (seq_len - 1):
             action_embed_out = pad_left_at_dim(action_embed_out, 1, dim = 1)
-            
+
         embed = state_embed + action_embed_out
-        
+
         residual_stream, next_lower_body_cache = self.lower_body(embed, cache = lower_body_cache, return_hiddens = True)
-        
+
         # derive switching probabilities from qk module
 
         queries, keys = self.to_queries_keys(residual_stream).chunk(2, dim = -1)
-        
+
         if not exists(prev_key):
             start_keys = repeat(self.start_key_token, 'd -> b 1 d', b = batch)
             keys_with_prev = cat((start_keys, keys), dim = 1)
         else:
             keys_with_prev = cat((prev_key, keys), dim = 1)
-            
+
         next_prev_key = keys_with_prev[:, -1:]
-        
+
         cosine_sim = cosine_similarity(queries, keys_with_prev[:, :-1], dim = -1)
-        switch_probs = (-cosine_sim / self.switch_temperature).sigmoid()
-        
+        switch_probs = (1. - cosine_sim) * 0.5
+
+        boundary_mask = switch_probs > 0.5
+
+        if cache_steps == 0:
+            boundary_mask[:, 0] = True
+
+        switch_probs_hard = straight_through(switch_probs, boundary_mask.float())
+
         # obtain latents from emitter + readout
 
         emitter_out, next_emitter_decoder_cache = self.emitter_decoder(residual_stream, cache = emitter_decoder_cache, return_hiddens = True)
         action_dist = self.latent_readout(emitter_out)
-        
+
         sampled_latent_action = self.latent_readout.sample(action_dist, differentiable = True)
-        
+
         # gated action and associative scan for sequence chunking
 
-        gated_sampled_latent_action = multiply('b n d, b n', sampled_latent_action, switch_probs)
-        forget_gate = 1. - switch_probs
-        
+        gated_sampled_latent_action = multiply('b n d, b n', sampled_latent_action, switch_probs_hard)
+        forget_gate = 1. - switch_probs_hard
+
         scanned_latent_action = self.assoc_scan(forget_gate, gated_sampled_latent_action, prev = prev_gated_action)
         next_prev_gated_action = scanned_latent_action[:, -1:]
-        
+
+        # confidence scaling to route gradients as in sect 2.2 eq (12)
+
+        confidence = torch.where(boundary_mask, switch_probs, 1. - switch_probs)
+        confidence_scale = straight_through(confidence, 1.)
+        scanned_latent_action = multiply('b n d, b n', scanned_latent_action, confidence_scale)
+
         # latent to control signal
 
         control_signal = self.to_control_signal(scanned_latent_action)
-        modified_residual_stream = residual_stream + control_signal
-        
+
+        dropped_residual_stream = self.residual_stream_dropout(residual_stream)
+
+        if self.training and self.residual_stream_drop_prob > 0.:
+            mask = torch.rand(batch, device = device) > self.residual_stream_drop_prob
+            dropped_residual_stream = einx.where('b, b n d, -> b n d', mask, dropped_residual_stream, self.zero)
+
+        modified_residual_stream = dropped_residual_stream + control_signal
+
         # apply layernorm without bias
 
         modified_residual_stream = self.modified_residual_stream_norm(modified_residual_stream)
-        
+
         # process sequence upper body
 
         attended, next_upper_body_cache = self.upper_body(modified_residual_stream, cache = upper_body_cache, return_hiddens = True)
         dist_params = self.action_readout(attended)
-        
+
         state_dist_params = None
         if return_loss:
             state_dist_params = self.state_readout(attended[:, :-1])
-        
+
         next_cache_steps = cache_steps + seq_len
         next_cache = TransformerWithMetacontrollerCache(
             lower_body = next_lower_body_cache,
@@ -264,7 +287,7 @@ class TransformerWithMetacontroller(Module):
             prev_gated_action = next_prev_gated_action,
             cache_steps = next_cache_steps
         )
-        
+
         # losses
 
         bc_state_loss = bc_action_loss = ratio_loss = None
@@ -273,10 +296,10 @@ class TransformerWithMetacontroller(Module):
             # a. bc loss
             bc_state_loss = self.state_readout.calculate_loss(state_dist_params, target_state)
             bc_action_loss = self.action_readout.calculate_loss(dist_params, target_actions)
-            
-            # b. ratio loss (from dynamicsequencechunker)
-            ratio_loss = calculate_ratio_loss(switch_probs, self.target_avg_token_length)
-        
+
+            # b. ratio loss
+            ratio_loss = calculate_ratio_loss(switch_probs, boundary_mask, self.target_avg_token_length)
+
         meta_output = MetaControllerOutput(
             prev_hiddens = None,
             input_residual_stream = residual_stream,
@@ -285,7 +308,7 @@ class TransformerWithMetacontroller(Module):
             switch_beta = switch_probs,
             ratio_loss = ratio_loss
         )
-        
+
         ret = (dist_params, meta_output) if not return_loss else ((bc_state_loss, bc_action_loss, ratio_loss), meta_output)
 
         if return_cache:

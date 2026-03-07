@@ -326,7 +326,7 @@ class TransformerWithResnet(Transformer):
 
         self.final_norm = nn.LayerNorm(self.resnet_dim) if norm_final_encoding else nn.Identity()
 
-        # transformer 
+        # transformer
         self.attn = None
         if exists(encoder_kwargs):
             assert 'dim' not in encoder_kwargs

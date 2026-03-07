@@ -813,7 +813,7 @@ def train(
     else:
         start_step = num_bc_batches
         total_steps = num_bc_batches + num_discovery_batches
-    
+
     pbar = tqdm.tqdm(range(start_step, total_steps), mininterval = 10.0, desc = "training")
 
     for i in pbar:
