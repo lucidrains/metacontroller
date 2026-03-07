@@ -82,14 +82,15 @@ def visualize_segments(
     threshold = 0.5
 ):
     tokens_list = tokens.tolist()
-    switches = (switch_betas >= threshold).tolist()
+    switches = (switch_betas.flatten() >= threshold).tolist()
 
     segments = []
 
-    for i in range(len(switches)):
-        if switches[i]:
+    for token, switch in zip(tokens_list, switches):
+        if switch:
             segments.append(delimiter)
-        segments.append(decode_tokens([tokens_list[i]]))
+
+        segments.append(decode_tokens([token]))
 
     return ''.join(segments)
 
