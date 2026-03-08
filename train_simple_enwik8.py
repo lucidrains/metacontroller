@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import gzip
 import random
@@ -375,23 +377,24 @@ def train(
 
             if max_reward > best_reward_seen_so_far:
                 best_reward_seen_so_far = max_reward
-                if accelerator.is_main_process and i > 0:
+                if accelerator.is_main_process:
                     best_idx = rewards_tensor.argmax().item()
                     accelerator.print(f"\n*** NEW BEST REWARD: {best_reward_seen_so_far:.3f} ***")
                     accelerator.print(f"PROMPT: {decode_tokens(prompt[best_idx].tolist())}")
                     accelerator.print(f"GENERATED: {texts[best_idx]}\n")
 
-            # Grpo tensors
-            states, actions, log_probs, switch_betas = zip(*grpo_data_list)
-            group_states = torch.cat(states, dim = 1) # (G, T, D)
-            group_actions = torch.cat(actions, dim = 1) # (G, T, D_latent)
-            group_log_probs = torch.cat(log_probs, dim = 1) # (G, T, D_latent)
-            group_switch_betas = torch.cat(switch_betas, dim = 1) # (G, T)
+            # grpo tensors
 
-            # GRPO Phase
+            states, actions, log_probs, switch_betas = zip(*grpo_data_list)
+            group_states = torch.cat(states, dim = 1)
+            group_actions = torch.cat(actions, dim = 1)
+            group_log_probs = torch.cat(log_probs, dim = 1)
+            group_switch_betas = torch.cat(switch_betas, dim = 1)
+
+            # policy loss
+
             advantages = z_score(rewards_tensor)
 
-            # Policy loss
             model.train()
             
             # policy_loss function expects `switch_betas` mask
