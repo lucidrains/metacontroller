@@ -377,7 +377,7 @@ def train(
                 best_reward_seen_so_far = max_reward
                 if accelerator.is_main_process and i > 0:
                     best_idx = rewards_tensor.argmax().item()
-                    accelerator.print(f"\n*** NEW SOTA REWARD: {best_reward_seen_so_far:.3f} ***")
+                    accelerator.print(f"\n*** NEW BEST REWARD: {best_reward_seen_so_far:.3f} ***")
                     accelerator.print(f"PROMPT: {decode_tokens(prompt[best_idx].tolist())}")
                     accelerator.print(f"GENERATED: {texts[best_idx]}\n")
 
