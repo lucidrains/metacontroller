@@ -273,12 +273,18 @@ class TransformerWithMetacontroller(Module):
 
     @property
     def replay_buffer_field_dict(self):
-        return dict(
-            states = ('float', self.dim_model),
-            log_probs = ('float', self.dim_code_bits),
-            switch_betas = 'float',
-            latent_actions = ('float', self.num_codes)
-        )
+        return {
+            'state': self.dim_model,
+            'action': self.dim_code_bits,
+            'log_prob': (),
+            'switch_beta': ()
+        }
+
+    def internal_metacontroller_parameters(self):
+        return [
+            *self.emitter_decoder.parameters(),
+            *self.emitter_to_binary_logits.parameters()
+        ]
 
     def get_action_dist_for_internal_rl(self, residual_stream, switch_betas=None, return_kl_loss=False):
         emitter_input = residual_stream

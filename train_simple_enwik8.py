@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
-from metacontroller.simple_metacontroller import TransformerWithMetacontroller
+from metacontroller.simple_metacontroller import TransformerWithMetacontroller, extract_grpo_data, z_score, policy_loss
 
 # helpers
 
@@ -58,6 +58,46 @@ def visualize_segments(
         segments.append(decode_token(token))
 
     return ''.join(segments)
+
+# exclamation rewarding
+
+class ExclamationRewarder:
+    def __init__(self, cap = 10):
+        self.cap = cap
+
+    def __call__(self, texts: list[str], batch_size = 32) -> list[float]:
+        return [float(min(self.cap, text.count('!'))) for text in texts]
+
+# sentiment rewarding
+
+SENTIMENT_MODEL_NAME = "arnabdhar/tinybert-imdb"
+
+class SentimentRewarder:
+    def __init__(self, device: str | None = None):
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+        self.device = device
+        self.tokenizer = AutoTokenizer.from_pretrained(SENTIMENT_MODEL_NAME)
+        self.model = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL_NAME)
+        self.model.to(device)
+        self.model.eval()
+
+    @torch.no_grad()
+    def __call__(self, texts: list[str], batch_size = 32) -> list[float]:
+        results = []
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i : i + batch_size]
+            inputs = self.tokenizer(
+                batch_texts,
+                padding = True,
+                truncation = True,
+                return_tensors = "pt"
+            ).to(self.device)
+
+            outputs = self.model(**inputs)
+            probs = torch.softmax(outputs.logits, dim = -1)
+            results.extend(probs[:, 1].tolist())
+
+        return results
 
 @torch.no_grad()
 def sample(
@@ -157,11 +197,23 @@ def train(
     cpu = False,
     checkpoint_path = './results-simple-enwik8/train-enwik8.pt',
     enwik8_path = './data/enwik8.gz',
+    grpo_phase = False,
+    num_grpo_batches = 10000,
+    grpo_group_size = 32,
+    grpo_beta = 0.04,
+    grpo_eps_clip = (0.2, 0.28), # DAPO epsilon
+    grpo_learning_rate = 1e-4,
+    grpo_reward_var_threshold = 0.0,
+    grpo_reward_type = 'exclamation',
 ):
     # accelerator
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters = True)
     accelerator = Accelerator(cpu = cpu, kwargs_handlers = [ddp_kwargs])
+
+    if grpo_phase and accelerator.is_main_process:
+        import wandb
+        wandb.init(project="metacontroller-simple-enwik8", name="grpo")
 
     # ensure checkpoint directory exists
 
@@ -212,12 +264,210 @@ def train(
 
     optim = AdamW(model.parameters(), lr = learning_rate)
 
-    model, optim, train_loader, val_loader = accelerator.prepare(
-        model, optim, train_loader, val_loader
+    grpo_parameters = model.internal_metacontroller_parameters()
+    grpo_optim = AdamW(grpo_parameters, lr = grpo_learning_rate)
+
+    model, optim, grpo_optim, train_loader, val_loader = accelerator.prepare(
+        model, optim, grpo_optim, train_loader, val_loader
     )
 
     train_loader = cycle(train_loader)
     val_loader = cycle(val_loader)
+
+    if grpo_phase:
+        # load pretrained checkpoint from BC + Discovery phase
+        pretrained_path = Path(checkpoint_path)
+        assert pretrained_path.exists(), f"pretrained checkpoint not found at {pretrained_path}"
+        accelerator.print(f"loading pretrained checkpoint from {pretrained_path}")
+        accelerator.unwrap_model(model).load(str(pretrained_path))
+
+        if grpo_reward_type == 'sentiment':
+            rewarder = SentimentRewarder(device = accelerator.device)
+        else:
+            rewarder = ExclamationRewarder()
+
+        # validation sanity check from discovery checkpoint
+
+        model.eval()
+        with torch.no_grad():
+            valid_data = next(val_loader)
+            state = valid_data[:, :-1]
+            actions = valid_data[:, 1:]
+
+            outputs, meta_output = model(
+                state = state,
+                actions = actions,
+                return_loss = True
+            )
+
+            segmented_str = visualize_segments(valid_data[0], meta_output.switch_beta[0], threshold = 0.5)
+            accelerator.print(f"\n\n[START VALIDATION] SEGMENTED: {segmented_str}\n")
+
+        best_reward_seen_so_far = 0.
+        
+        pbar = tqdm.tqdm(total = num_grpo_batches, mininterval = 10.0, desc = "grpo")
+        i = 0
+
+        while i < num_grpo_batches:
+            model.eval()
+
+            # 1. Sample prompt
+            data = next(train_loader)
+            prompt = data[0:1, :prime_length] # (1, prime_length)
+
+            prompt = prompt.to(accelerator.device).repeat(grpo_group_size, 1)
+
+            prompt_seq_len = prompt.shape[-1]
+            sample_num_times = max(2, generate_length - prompt_seq_len)
+
+            state = prompt
+            action = prompt[:, 1:]
+
+            with torch.no_grad():
+                action_dist, meta_output, cache = model(
+                    state = state,
+                    actions = action,
+                    return_loss = False,
+                    return_cache = True,
+                    use_temporal_sequence_embed = False
+                )
+
+                next_state = model.action_readout.sample(action_dist[:, -1:], temperature = 1.)
+                state = torch.cat((state, next_state), dim = -1)
+
+                def last(t):
+                    return t[:, -1:]
+
+                first_grpo_data = extract_grpo_data(model, meta_output)
+                first_grpo_data = type(first_grpo_data)(*map(last, first_grpo_data))
+                grpo_data_list = [first_grpo_data]
+
+                for _ in range(sample_num_times - 1):
+                    action_dist, meta_output, next_cache = model(
+                        state = state[:, -1:],
+                        actions = state[:, -1:],
+                        cache = cache,
+                        return_loss = False,
+                        return_cache = True,
+                        use_temporal_sequence_embed = False
+                    )
+
+                    grpo_data_list.append(extract_grpo_data(model, meta_output))
+
+                    next_state = model.action_readout.sample(action_dist[:, -1:], temperature = 1.)
+                    state = torch.cat((state, next_state), dim = -1)
+
+                    cache = next_cache
+
+            # Extract generated text and calculate reward
+            generated = state[:, prompt_seq_len:]
+            texts = [decode_tokens(t.tolist()) for t in generated]
+
+            rewards = rewarder(texts, batch_size = grpo_group_size)
+            rewards_tensor = torch.tensor(rewards, device = accelerator.device, dtype = torch.float32)
+
+            reward_var = rewards_tensor.var()
+            if reward_var <= grpo_reward_var_threshold:
+                continue
+
+            mean_reward = rewards_tensor.mean().item()
+            max_reward = rewards_tensor.max().item()
+
+            if max_reward > best_reward_seen_so_far:
+                best_reward_seen_so_far = max_reward
+                if accelerator.is_main_process and i > 0:
+                    best_idx = rewards_tensor.argmax().item()
+                    accelerator.print(f"\n*** NEW SOTA REWARD: {best_reward_seen_so_far:.3f} ***")
+                    accelerator.print(f"PROMPT: {decode_tokens(prompt[best_idx].tolist())}")
+                    accelerator.print(f"GENERATED: {texts[best_idx]}\n")
+
+            # Grpo tensors
+            states, actions, log_probs, switch_betas = zip(*grpo_data_list)
+            group_states = torch.cat(states, dim = 1) # (G, T, D)
+            group_actions = torch.cat(actions, dim = 1) # (G, T, D_latent)
+            group_log_probs = torch.cat(log_probs, dim = 1) # (G, T, D_latent)
+            group_switch_betas = torch.cat(switch_betas, dim = 1) # (G, T)
+
+            # GRPO Phase
+            advantages = z_score(rewards_tensor)
+
+            # Policy loss
+            model.train()
+            
+            # policy_loss function expects `switch_betas` mask
+            loss = policy_loss(
+                model,
+                state = group_states,
+                old_log_probs = group_log_probs,
+                actions = group_actions,
+                advantages = advantages,
+                switch_betas = group_switch_betas,
+                mask = (group_switch_betas > 0.5),
+                eps_clip = grpo_eps_clip
+            )
+
+            _, kl_loss = model.get_action_dist_for_internal_rl(
+                group_states, 
+                switch_betas=group_switch_betas, 
+                return_kl_loss=True
+            )
+            
+            switch_mask = (group_switch_betas > 0.5).float()
+            kl_loss = (kl_loss * switch_mask).sum() / switch_mask.sum().clamp(min = 1e-5)
+            
+            total_loss = loss + kl_loss * grpo_beta
+
+            accelerator.backward(total_loss)
+            accelerator.clip_grad_norm_(model.parameters(), 0.5)
+            grpo_optim.step()
+            grpo_optim.zero_grad()
+
+            loss_val = loss.item()
+
+            # calculate hard switch density for logging
+
+            with torch.no_grad():
+                switch_density = (group_switch_betas > 0.5).float().mean().item()
+
+            if accelerator.is_main_process:
+                import wandb
+                if exists(wandb.run):
+                    log_dict = dict(
+                        loss = loss_val,
+                        kl_loss = kl_loss.item(),
+                        mean_reward = mean_reward,
+                        max_reward = max_reward,
+                        best_reward_seen_so_far = best_reward_seen_so_far,
+                        reward_var = reward_var.item(),
+                        switch_density = switch_density
+                    )
+
+                    if divisible_by(i, generate_every):
+                        table = wandb.Table(columns = ['Prompt', 'Generated', 'Reward'])
+                        table.add_data(decode_tokens(prompt[0].tolist()), texts[0], rewards[0])
+                        log_dict['samples'] = table
+
+                    wandb.log(log_dict)
+
+            if divisible_by(i, 10):
+                pbar.set_postfix(loss = f"{loss_val:.3f}", kl = f"{kl_loss.item():.3f}", reward = f"{mean_reward:.3f}")
+                tqdm.tqdm.write(f"{i}: loss: {loss_val:.3f} reward: {mean_reward:.3f} max: {max_reward:.3f}")
+
+            # save checkpoint
+            if divisible_by(i, 1000) and i > 0:
+                accelerator.print(f"saving GRPO checkpoint to {checkpoint_path}")
+                accelerator.wait_for_everyone()
+                unwrapped_model = accelerator.unwrap_model(model)
+                unwrapped_model.save(str(Path(checkpoint_path).with_stem(f"{Path(checkpoint_path).stem}-grpo")))
+
+            i += 1
+            pbar.update(1)
+
+        accelerator.print(f"saving final GRPO checkpoint to {checkpoint_path}")
+        accelerator.wait_for_everyone()
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.save(str(Path(checkpoint_path).with_stem(f"{Path(checkpoint_path).stem}-grpo")))
+        return
 
     method_desc = f"Entropy ({switch_entropy_quantile*100:.0f}%)" if switch_entropy_quantile is not None else "QK"
     pbar = tqdm.tqdm(range(num_batches), mininterval = 10.0, desc = f"training jointly | {method_desc}")
