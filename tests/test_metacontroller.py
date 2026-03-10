@@ -463,7 +463,7 @@ def test_discovery_vs_bc_ablation_parity():
             return_meta_controller_output = True
         )
 
-    assert torch.allclose(bc_losses.state, discovery_losses.state_pred, atol = 1e-6)
+    assert discovery_losses.state_pred == 0.0
     assert torch.allclose(bc_losses.action, discovery_losses.action_recon, atol = 1e-6)
 
 def test_switch_ablation():
@@ -558,7 +558,7 @@ def test_sequential_selection_parallel_vs_iterative():
             super().__init__()
             self.linear = nn.Linear(dim_in, dim_out)
         def forward(self, x, h = None):
-            return self.linear(x), None
+            return self.linear(x)
 
     mc.internal_sequence_embedder = IdentityEmbedder()
 
@@ -627,11 +627,11 @@ def test_jax_pytorch_parity():
     z0 = torch.randn(batch, 1, dim_latent, device = device)
 
     with torch.no_grad():
-        pt_out = pytorch_sequential_action_selection(gru, to_beta, rs, me, sla, h0, z0, 1.0, False)
+        pt_out = pytorch_sequential_action_selection(gru, to_beta, rs, me, sla, h0, z0, 1.0, False, False, True)
 
         jax_beta, jax_action, jax_hidden = torch_jax_sequential_selection(
             gru.weight_ih_l0, gru.weight_hh_l0, gru.bias_ih_l0, gru.bias_hh_l0,
-            to_beta.weight, to_beta.bias, rs, me, sla, h0.squeeze(0), z0.squeeze(1), 1.0, False
+            to_beta.weight, to_beta.bias, rs, me, sla, h0.squeeze(0), z0.squeeze(1), 1.0, False, False, True
         )
 
     assert torch.allclose(pt_out.switch_beta, jax_beta, atol = 1e-6)

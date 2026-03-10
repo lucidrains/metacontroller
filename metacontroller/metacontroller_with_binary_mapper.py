@@ -42,8 +42,11 @@ GRU = partial(GRU, batch_first = True)
 
 # helper functions
 
-def exists(v):
-    return v is not None
+def exists(val):
+    return val is not None
+
+def compact(iterable):
+    return tuple(filter(exists, iterable))
 
 def default(*args):
     for arg in args:
@@ -122,6 +125,7 @@ class MetaControllerWithBinaryMapper(Module):
         pool_embedded_sequence = True,
         dim_sequence_summary_embed = 32,
         hard_switch = None,
+        hard_switch_straight_through = False,
         kl_loss_weight = 1.,
         kl_loss_warmup_steps = 0,
         apply_kl_loss_weight = True,
@@ -132,6 +136,7 @@ class MetaControllerWithBinaryMapper(Module):
         super().__init__()
         self.dim_model = dim_model
         self.hard_switch = hard_switch
+        self.hard_switch_straight_through = hard_switch_straight_through
 
         self.kl_loss_weight = kl_loss_weight
         self.kl_loss_warmup_steps = kl_loss_warmup_steps
@@ -157,7 +162,12 @@ class MetaControllerWithBinaryMapper(Module):
 
         self.to_sequence_summary_embed = Linear(dim_model, dim_sequence_summary_embed)
 
-        self.emitter = GRU(dim_meta + dim_model + dim_sequence_summary_embed, dim_meta * 2)
+        self.emitter = Feedforwards(
+            dim_in = dim_meta + dim_model + dim_sequence_summary_embed,
+            dim = dim_meta * 2,
+            dim_out = dim_meta * 2,
+            depth = 2
+        )
         self.emitter_to_binary_logits = Linear(dim_meta * 2, dim_code_bits)
 
         # internal rl phase substitutes the acausal + emitter with a causal ssm
@@ -284,7 +294,8 @@ class MetaControllerWithBinaryMapper(Module):
     def internal_rl_parameters(self):
         return [
             *self.action_proposer.parameters(),
-            *self.proposer_to_binary_logits.parameters()
+            *self.proposer_to_binary_logits.parameters(),
+            *self.summary_gru.parameters()
         ]
 
     def train_internal_rl(self, eval_rest = False):
@@ -341,7 +352,8 @@ class MetaControllerWithBinaryMapper(Module):
         residual_stream,
         cache: MetaControllerOutput | None = None,
         discovery_phase = False,
-        hard_switch = None,
+        hard_switch: bool | None = None,
+        hard_switch_straight_through: bool | None = None,
         ablate_switch_beta: Tensor | None = None,
         switch_beta_frequency: int | None = None,
         ablate_offset = 0,
@@ -400,7 +412,7 @@ class MetaControllerWithBinaryMapper(Module):
                 summarized_sequence_embed
             ), dim = -1)
 
-            proposed_action_hidden, _ = self.emitter(emitter_input)
+            proposed_action_hidden = self.emitter(emitter_input)
             to_logits = self.emitter_to_binary_logits
 
         else: # else internal rl phase
@@ -454,7 +466,9 @@ class MetaControllerWithBinaryMapper(Module):
                 prev_switching_unit_hidden,
                 z_prev,
                 self.switch_temperature,
-                resolved_hard_switch
+                resolved_hard_switch,
+                default(hard_switch_straight_through, self.hard_switch_straight_through),
+                is_first_step = not exists(cache)
             )
 
             switch_beta = sequential_selection_output.switch_beta
@@ -482,13 +496,22 @@ class MetaControllerWithBinaryMapper(Module):
                     prev_switching_unit_hidden
                 )
 
+                # force beta to 1 on first step (no cache) to match parallel path
+
+                if not exists(cache):
+                    switch_beta = torch.ones_like(switch_beta)
+
             # maybe hard switch, then use associative scan
 
             switch_beta_for_gate = switch_beta
 
             if hard_switch:
                 hard_switch_beta = (switch_beta_for_gate > 0.5).float()
-                switch_beta_for_gate = straight_through(switch_beta_for_gate, hard_switch_beta)
+
+                if default(hard_switch_straight_through, self.hard_switch_straight_through):
+                    switch_beta_for_gate = straight_through(switch_beta_for_gate, hard_switch_beta)
+                else:
+                    switch_beta_for_gate = hard_switch_beta
 
             forget_gate = 1. - switch_beta_for_gate
 

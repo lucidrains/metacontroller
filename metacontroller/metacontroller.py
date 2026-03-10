@@ -45,8 +45,11 @@ GRU = partial(GRU, batch_first = True)
 
 # helper functions
 
-def exists(v):
-    return v is not None
+def exists(val):
+    return val is not None
+
+def compact(iterable):
+    return tuple(filter(exists, iterable))
 
 def identity(t):
     return t
@@ -392,6 +395,7 @@ class MetaController(Module):
         ratio_loss_weight = 1.,
         ratio_loss_chunk_size = None,
         hard_switch = None,
+        hard_switch_straight_through = False,
         kl_loss_weight = 1.,
         kl_loss_warmup_steps = 0,
         apply_kl_loss_weight = True,
@@ -401,6 +405,7 @@ class MetaController(Module):
         super().__init__()
         self.dim_model = dim_model
         self.hard_switch = hard_switch
+        self.hard_switch_straight_through = hard_switch_straight_through
 
         self.kl_loss_weight = kl_loss_weight
         self.kl_loss_warmup_steps = kl_loss_warmup_steps
@@ -441,7 +446,12 @@ class MetaController(Module):
 
         self.to_sequence_summary_embed = Linear(dim_model, dim_sequence_summary_embed)
 
-        self.emitter = GRU(dim_meta + dim_model + dim_sequence_summary_embed, dim_meta * 2)
+        self.emitter = Feedforwards(
+            dim_in = dim_meta + dim_model + dim_sequence_summary_embed,
+            dim = dim_meta * 2,
+            dim_out = dim_meta * 2,
+            depth = 2
+        )
 
         self.emitter_to_action_mean_log_var = Readout(dim_meta * 2, num_continuous = dim_latent)
 
@@ -574,7 +584,8 @@ class MetaController(Module):
     def internal_rl_parameters(self):
         return [
             *self.action_proposer.parameters(),
-            *self.action_proposer_mean_log_var.parameters()
+            *self.action_proposer_mean_log_var.parameters(),
+            *self.summary_gru.parameters()
         ]
 
     def train_internal_rl(self, eval_rest = False):
@@ -629,6 +640,7 @@ class MetaController(Module):
         cache: MetaControllerOutput | None = None,
         discovery_phase = False,
         hard_switch: bool | None = None,
+        hard_switch_straight_through: bool | None = None,
         ablate_switch_beta: Tensor | None = None,
         switch_beta_frequency: int | None = None,
         ablate_offset = 0,
@@ -714,7 +726,7 @@ class MetaController(Module):
                 summarized_sequence_embed
             ), dim = -1)
 
-            proposed_action_hidden, _ = self.emitter(emitter_input)
+            proposed_action_hidden = self.emitter(emitter_input)
 
             readout = self.emitter_to_action_mean_log_var
 
@@ -763,7 +775,9 @@ class MetaController(Module):
                 prev_switching_unit_gru_hidden,
                 z_prev,
                 self.switch_temperature,
-                resolved_hard_switch
+                resolved_hard_switch,
+                default(hard_switch_straight_through, self.hard_switch_straight_through),
+                is_first_step = not exists(cache)
             )
 
             switch_beta = sequential_selection_output.switch_beta
@@ -803,6 +817,11 @@ class MetaController(Module):
                 switch_beta = (switch_beta_logit / self.switch_temperature).sigmoid()
                 switch_beta = rearrange(switch_beta, '... 1 -> ...')
 
+                # force beta to 1 on first step (no cache) to match parallel path
+
+                if not exists(cache):
+                    switch_beta = torch.ones_like(switch_beta)
+
             # maybe hard switch
 
             hard_switch = default(hard_switch, self.hard_switch, not discovery_phase)
@@ -811,7 +830,11 @@ class MetaController(Module):
 
             if hard_switch:
                 hard_switch_beta = (switch_beta_for_gate > 0.5).float()
-                switch_beta_for_gate = straight_through(switch_beta_for_gate, hard_switch_beta)
+
+                if default(hard_switch_straight_through, self.hard_switch_straight_through):
+                    switch_beta_for_gate = straight_through(switch_beta_for_gate, hard_switch_beta)
+                else:
+                    switch_beta_for_gate = hard_switch_beta
 
             # associative scan
 
@@ -909,11 +932,13 @@ class Transformer(Module):
         embed_past_actions = True,
         normalize_state_action_losses = False,
         loss_normalizer_beta = 0.999,
-        lower_transformer_post_norm = False
+        lower_transformer_post_norm = False,
+        discovery_phase_state_clone_loss = False
     ):
         super().__init__()
 
         self.normalize_state_action_losses = normalize_state_action_losses
+        self.discovery_phase_state_clone_loss = discovery_phase_state_clone_loss
         self.bc_state_loss_normalizer = None
         self.bc_action_loss_normalizer = None
         self.discovery_state_loss_normalizer = None
@@ -955,8 +980,6 @@ class Transformer(Module):
 
         self.lower_body = lower_body
         self.upper_body = upper_body
-
-        # polar positional embedding
 
         lower_attn_dim_head = lower_body.attn_dim_head
         lower_heads = lower_body.attn_heads
@@ -1289,30 +1312,22 @@ class Transformer(Module):
 
             losses = BehavioralCloningLosses(state_clone_loss, action_clone_loss)
 
-            if return_action_logits:
-                if return_residual_stream:
-                    if not return_meta_controller_output:
-                        return losses, dist_params, residual_stream
-                    return losses, dist_params, next_meta_hiddens, residual_stream
-                if not return_meta_controller_output:
-                    return losses, dist_params
-                return losses, dist_params, next_meta_hiddens
-            if return_residual_stream:
-                if not return_meta_controller_output:
-                    return losses, residual_stream
+            ret = (
+                losses,
+                dist_params if return_action_logits else None,
+                next_meta_hiddens if return_meta_controller_output else None,
+                residual_stream if return_residual_stream else None
+            )
 
-                return losses, next_meta_hiddens, residual_stream
-
-            if not return_meta_controller_output:
-                return losses
-
-            return losses, next_meta_hiddens
+            ret = compact(ret)
+            return ret[0] if len(ret) == 1 else ret
 
         elif calc_auto_regressive_loss and discovery_phase:
 
-            # state
+            state_clone_loss = self.zero
 
-            state_clone_loss = self.state_readout.calculate_loss(state_dist_params, target_state, mask = state_loss_mask)
+            if self.discovery_phase_state_clone_loss:
+                state_clone_loss = self.state_readout.calculate_loss(state_dist_params, target_state, mask = state_loss_mask)
 
             # action
 
@@ -1321,7 +1336,8 @@ class Transformer(Module):
             # loss normalization
 
             if self.normalize_state_action_losses:
-                state_clone_loss = self.discovery_state_loss_normalizer(state_clone_loss, update_ema = update_loss_ema)
+                if self.discovery_phase_state_clone_loss:
+                    state_clone_loss = self.discovery_state_loss_normalizer(state_clone_loss, update_ema = update_loss_ema)
                 action_recon_loss = self.discovery_action_loss_normalizer(action_recon_loss, update_ema = update_loss_ema)
 
             losses = DiscoveryLosses(state_clone_loss, action_recon_loss, next_meta_hiddens.kl_loss, next_meta_hiddens.ratio_loss)

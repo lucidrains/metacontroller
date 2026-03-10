@@ -306,7 +306,7 @@ def train(
             accelerator.print(f"\n\n[START VALIDATION] SEGMENTED: {segmented_str}\n")
 
         best_reward_seen_so_far = 0.
-        
+
         pbar = tqdm.tqdm(total = num_grpo_batches, mininterval = 10.0, desc = "grpo")
         i = 0
 
@@ -396,7 +396,7 @@ def train(
             advantages = z_score(rewards_tensor)
 
             model.train()
-            
+
             # policy_loss function expects `switch_betas` mask
             loss = policy_loss(
                 model,
@@ -410,14 +410,14 @@ def train(
             )
 
             _, kl_loss = model.get_action_dist_for_internal_rl(
-                group_states, 
-                switch_betas=group_switch_betas, 
+                group_states,
+                switch_betas=group_switch_betas,
                 return_kl_loss=True
             )
-            
+
             switch_mask = (group_switch_betas > 0.5).float()
             kl_loss = (kl_loss * switch_mask).sum() / switch_mask.sum().clamp(min = 1e-5)
-            
+
             total_loss = loss + kl_loss * grpo_beta
 
             accelerator.backward(total_loss)

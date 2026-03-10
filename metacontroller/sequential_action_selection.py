@@ -52,7 +52,9 @@ def jax_sequential_selection_scan(
     gru_hidden,
     current_latent_action,
     switch_temperature,
-    hard_switch
+    hard_switch,
+    hard_switch_straight_through,
+    is_first_step
 ):
     """
     Optimized JAX implementation of sequential latent action selection.
@@ -81,7 +83,7 @@ def jax_sequential_selection_scan(
 
     def scan_fn(carry, x):
         h_prev, z_prev = carry
-        proj_static, sampled_latent = x
+        proj_static, sampled_latent, is_first_step_t = x
 
         # 1. GRU Cell Step
 
@@ -111,10 +113,14 @@ def jax_sequential_selection_scan(
             logit = logit + bias_beta
 
         beta = jax.nn.sigmoid(logit / switch_temperature)
+        beta = jax.lax.select(jnp.broadcast_to(is_first_step_t, beta.shape), jnp.ones_like(beta), beta)
 
         if hard_switch:
-            beta_hard = (beta > 0.5).astype(beta.dtype)
-            beta = beta + jax.lax.stop_gradient(beta_hard - beta)
+            hard_beta = (beta > 0.5).astype(beta.dtype)
+            if hard_switch_straight_through:
+                beta = beta + jax.lax.stop_gradient(hard_beta - beta)
+            else:
+                beta = hard_beta
 
         # 3. Gating (Momentum-like transition)
 
@@ -126,8 +132,15 @@ def jax_sequential_selection_scan(
 
         return (h_next, z_next), (beta, z_next)
 
+    seq_len = projected_static_T.shape[0]
+
+    if is_first_step:
+        is_first_step_T = jnp.arange(seq_len)[:, None, None] == 0
+    else:
+        is_first_step_T = jnp.zeros((seq_len, 1, 1), dtype=bool)
+
     initial_carry = (gru_hidden, current_latent_action)
-    inputs = (projected_static_T, sampled_latent_actions_T)
+    inputs = (projected_static_T, sampled_latent_actions_T, is_first_step_T)
 
     # perform scan
 
@@ -151,7 +164,7 @@ if HAS_JAX:
     from torch.utils.dlpack import from_dlpack as torch_from_dlpack
     from jax.dlpack import from_dlpack as jax_from_dlpack
 
-    @partial(jax.jit, static_argnums = (11, 12))
+    @partial(jax.jit, static_argnums = (11, 12, 13, 14))
     def jax_sequential_selection_scan_jitted(
         weight_ih,
         weight_hh,
@@ -165,12 +178,14 @@ if HAS_JAX:
         gru_hidden,
         current_latent_action,
         switch_temperature,
-        hard_switch
+        hard_switch,
+        hard_switch_straight_through,
+        is_first_step
     ):
         return jax_sequential_selection_scan(
             weight_ih, weight_hh, bias_ih, bias_hh, weight_beta, bias_beta,
             residual_stream, meta_embeddings, sampled_latent_actions, gru_hidden, current_latent_action,
-            switch_temperature, hard_switch
+            switch_temperature, hard_switch, hard_switch_straight_through, is_first_step
         )
 
     def jitted_vjp_logic(
@@ -186,10 +201,12 @@ if HAS_JAX:
         gru_hidden,
         current_latent_action,
         switch_temperature,
-        hard_switch
+        hard_switch,
+        hard_switch_straight_through,
+        is_first_step
     ):
         return vjp(
-            lambda *args: jax_sequential_selection_scan_jitted(*args, switch_temperature, hard_switch),
+            lambda *args: jax_sequential_selection_scan_jitted(*args, switch_temperature, hard_switch, hard_switch_straight_through, is_first_step),
             weight_ih, weight_hh, bias_ih, bias_hh, weight_beta, bias_beta,
             residual_stream, meta_embeddings, sampled_latent_actions, gru_hidden, current_latent_action
         )
@@ -226,14 +243,16 @@ if HAS_JAX:
             gru_hidden,
             current_latent_action,
             switch_temperature,
-            hard_switch
+            hard_switch,
+            hard_switch_straight_through,
+            is_first_step
         ):
             device = residual_stream.device
             ctx.device = device
 
             jax_args = [t2j(t) for t in (weight_ih, weight_hh, bias_ih, bias_hh, weight_beta, bias_beta, residual_stream, meta_embeddings, sampled_latent_actions, gru_hidden, current_latent_action)]
 
-            outputs, ctx.vjp_fn = jitted_vjp_logic(*jax_args, float(switch_temperature), bool(hard_switch))
+            outputs, ctx.vjp_fn = jitted_vjp_logic(*jax_args, float(switch_temperature), bool(hard_switch), bool(hard_switch_straight_through), bool(is_first_step))
 
             ctx.out_shapes = [output.shape for output in outputs]
             ctx.out_dtypes = [output.dtype for output in outputs]
@@ -273,9 +292,11 @@ if HAS_JAX:
         gru_hidden,
         current_latent_action,
         switch_temperature,
-        hard_switch
+        hard_switch,
+        hard_switch_straight_through,
+        is_first_step
     ):
-        return JaxSequentialSelection.apply(weight_ih, weight_hh, bias_ih, bias_hh, weight_beta, bias_beta, residual_stream, meta_embeddings, sampled_latent_actions, gru_hidden, current_latent_action, switch_temperature, hard_switch)
+        return JaxSequentialSelection.apply(weight_ih, weight_hh, bias_ih, bias_hh, weight_beta, bias_beta, residual_stream, meta_embeddings, sampled_latent_actions, gru_hidden, current_latent_action, switch_temperature, hard_switch, hard_switch_straight_through, is_first_step)
 
 # reference PyTorch implementation
 
@@ -288,7 +309,9 @@ def pytorch_sequential_action_selection(
     hidden_init: Tensor | None,
     latent_init: Tensor,
     switch_temperature: float,
-    hard_switch: bool
+    hard_switch: bool,
+    hard_switch_straight_through: bool,
+    is_first_step: bool = True
 ):
     batch, seq_len, _ = residual_stream.shape
     betas, gated = [], []
@@ -314,9 +337,15 @@ def pytorch_sequential_action_selection(
         beta = (beta_logit / switch_temperature).sigmoid()
         beta = rearrange(beta, '1 b 1 -> b 1')
 
+        if t == 0 and is_first_step:
+            beta = torch.ones_like(beta)
+
         if hard_switch:
-            beta_hard = (beta > 0.5).float()
-            beta = beta + (beta_hard - beta).detach()
+            hard_beta = (beta > 0.5).float()
+            if hard_switch_straight_through:
+                beta = beta + (hard_beta - beta).detach()
+            else:
+                beta = hard_beta
 
         # 3. Latent Momentum Gating
 
@@ -346,7 +375,9 @@ def perform_sequential_action_selection(
     hidden_init: Tensor | None,
     latent_init: Tensor,
     switch_temperature: float,
-    hard_switch: bool
+    hard_switch: bool,
+    hard_switch_straight_through: bool = False,
+    is_first_step: bool = True
 ):
     """
     Dispatcher that prioritizes optimized JAX implementation on GPU.
@@ -369,7 +400,7 @@ def perform_sequential_action_selection(
                 weight_ih, weight_hh, bias_ih, bias_hh, weight_beta, bias_beta,
                 residual_stream, meta_embeddings, sampled_latent_actions,
                 gru_hidden, current_latent_action,
-                switch_temperature, hard_switch
+                switch_temperature, hard_switch, hard_switch_straight_through, is_first_step
             )
 
             switch_betas, gated_actions, final_hidden = outputs
@@ -386,4 +417,4 @@ def perform_sequential_action_selection(
             logging.warning(f"JAX fallback triggered: {e}")
             pass
 
-    return pytorch_sequential_action_selection(gru, to_beta, residual_stream, meta_embeddings, sampled_latent_actions, hidden_init, latent_init, switch_temperature, hard_switch)
+    return pytorch_sequential_action_selection(gru, to_beta, residual_stream, meta_embeddings, sampled_latent_actions, hidden_init, latent_init, switch_temperature, hard_switch, hard_switch_straight_through, is_first_step)
