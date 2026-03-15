@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn, cat, tensor, is_tensor, Tensor, arange
 from torch.nn import Module, Linear, Parameter, RMSNorm, LayerNorm
 from torch.nn.functional import cosine_similarity, pad, logsigmoid
@@ -166,6 +167,7 @@ class TransformerWithMetacontroller(Module):
         freeze_entropy_quantiles = False,
         num_latent_pred_steps = 2,
         future_entropy_weights: tuple[float, ...] | None = None,
+        predict_next_switch_embed = False,
         assoc_scan_kwargs: dict = dict()
     ):
         super().__init__()
@@ -245,6 +247,14 @@ class TransformerWithMetacontroller(Module):
             )
 
             self.start_key_token = Parameter(torch.randn(dim_queries_keys) * 1e-2)
+
+        self.predict_next_switch_embed = predict_next_switch_embed
+        self.next_switch_embed_pred_head = None
+        if predict_next_switch_embed:
+            self.next_switch_embed_pred_head = nn.Sequential(
+                RMSNorm(dim),
+                Linear(dim, dim)
+            )
 
         self.num_latent_pred_steps = num_latent_pred_steps
 
@@ -461,7 +471,10 @@ class TransformerWithMetacontroller(Module):
 
             if should_update:
                 with torch.no_grad():
-                    flat_entropy = latent_pred_entropy.detach().reshape(-1)
+                    if exists(mask):
+                        flat_entropy = latent_pred_entropy[mask].detach().reshape(-1)
+                    else:
+                        flat_entropy = latent_pred_entropy.detach().reshape(-1)
 
                     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
                         gathered_entropy = [torch.zeros_like(flat_entropy) for _ in range(torch.distributed.get_world_size())]
@@ -509,7 +522,7 @@ class TransformerWithMetacontroller(Module):
 
         # always switch on the first token
 
-        if not exists(prev_key):
+        if cache_steps == 0:
             switch_probs = pad_left_at_dim(switch_probs[:, 1:], 1, dim = 1)
 
         boundary_mask = switch_probs > 0.5
@@ -577,6 +590,7 @@ class TransformerWithMetacontroller(Module):
 
         # losses
 
+        next_switch_pred_loss = self.zero
         bc_state_loss = bc_action_loss = ratio_loss = None
 
         if return_loss:
@@ -585,6 +599,31 @@ class TransformerWithMetacontroller(Module):
             bc_state_loss = self.state_readout.calculate_loss(state_dist_params, target_state, mask = loss_mask)
             bc_action_loss = self.action_readout.calculate_loss(dist_params, target_actions, mask = loss_mask)
             ratio_loss = calculate_ratio_loss(switch_probs, boundary_mask, self.target_avg_token_length, mask = mask)
+
+            if self.predict_next_switch_embed:
+                batch, seq_len, _ = emitter_out.shape
+
+                flat_mask = rearrange(boundary_mask, 'b n -> (b n)')
+
+                flat_emitter_out = rearrange(emitter_out, 'b n d -> (b n) d')
+                flat_residual = rearrange(residual_stream, 'b n d -> (b n) d')
+
+                switch_preds = self.next_switch_embed_pred_head(flat_emitter_out[flat_mask])
+                switch_targets = flat_residual[flat_mask]
+
+                batch_indices = torch.arange(batch, device = device)
+                batch_indices = repeat(batch_indices, 'b -> (b n)', n = seq_len)
+
+                switch_batch_indices = batch_indices[flat_mask]
+
+                valid_next_mask = switch_batch_indices[:-1] == switch_batch_indices[1:]
+
+                switch_preds = switch_preds[:-1][valid_next_mask]
+                switch_targets = switch_targets[1:][valid_next_mask]
+
+                next_switch_pred_loss = self.zero
+                if switch_preds.numel() > 0:
+                    next_switch_pred_loss = F.l1_loss(switch_preds, switch_targets.detach())
 
             if kl_loss.ndim == 3:
                 kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
@@ -610,7 +649,7 @@ class TransformerWithMetacontroller(Module):
             ret = (dist_params, meta_output)
         else:
             ret = (
-                (bc_state_loss, bc_action_loss, ratio_loss, latent_ar_loss, kl_loss),
+                (bc_state_loss, bc_action_loss, ratio_loss, latent_ar_loss, kl_loss, next_switch_pred_loss),
                 meta_output
             )
 
