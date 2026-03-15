@@ -210,6 +210,7 @@ def train(
     eval_switch_entropy_quantile = 0.85,
     target_avg_token_length = 8.,
     temporal_sequence_embed_prob = 0.25,
+    num_latent_pred_steps = 2,
     residual_stream_dropout = 0.,
     residual_stream_drop_prob = 0.,
     cpu = False,
@@ -279,6 +280,7 @@ def train(
         ),
         switch_entropy_quantiles = switch_entropy_quantiles,
         eval_switch_entropy_quantile = eval_switch_entropy_quantile,
+        num_latent_pred_steps = num_latent_pred_steps,
         residual_stream_dropout = residual_stream_dropout,
         residual_stream_drop_prob = residual_stream_drop_prob,
         kl_loss_weight = kl_loss_weight

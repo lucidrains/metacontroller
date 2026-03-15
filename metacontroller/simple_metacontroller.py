@@ -164,6 +164,8 @@ class TransformerWithMetacontroller(Module):
         kl_loss_weight = 1.,
         kl_loss_threshold = 0.,
         freeze_entropy_quantiles = False,
+        num_latent_pred_steps = 2,
+        future_entropy_weights: tuple[float, ...] | None = None,
         assoc_scan_kwargs: dict = dict()
     ):
         super().__init__()
@@ -244,9 +246,17 @@ class TransformerWithMetacontroller(Module):
 
             self.start_key_token = Parameter(torch.randn(dim_queries_keys) * 1e-2)
 
+        self.num_latent_pred_steps = num_latent_pred_steps
+
+        if not exists(future_entropy_weights):
+            future_entropy_weights = tuple(0.5 ** i for i in range(num_latent_pred_steps))
+
+        assert len(future_entropy_weights) == num_latent_pred_steps, f'expected future_entropy_weights to have length {num_latent_pred_steps}'
+        self.register_buffer('future_entropy_weights', tensor(future_entropy_weights, dtype = torch.float32), persistent = False)
+
         self.latent_readout = Readout(
             dim = dim,
-            num_continuous = dim,
+            num_continuous = dim * num_latent_pred_steps,
             continuous_dist_kwargs = dict(log_var_clamp_range = (-5., 3.))
         )
 
@@ -399,16 +409,36 @@ class TransformerWithMetacontroller(Module):
         residual_stream, next_lower_body_cache = self.lower_body(embed, cache = lower_body_cache, return_hiddens = True)
 
         dist_params = self.latent_readout(residual_stream)
-        latent_pred_entropy = self.latent_readout.entropy(dist_params).sum(dim = -1)
+
+        latent_pred_entropy = self.latent_readout.entropy(dist_params)
+        latent_pred_entropy = rearrange(latent_pred_entropy, 'b n (s d) -> b n s d', s = self.num_latent_pred_steps)
+        latent_pred_entropy = latent_pred_entropy.sum(dim = -1)
+
+        latent_pred_entropy = (latent_pred_entropy * self.future_entropy_weights).sum(dim = -1)
 
         if return_loss:
-            loss_mask = mask[:, 1:] if exists(mask) else None
-            latent_ar_loss = self.latent_readout(
-                residual_stream[:, :-1],
-                targets = residual_stream[:, 1:].detach(),
-                return_loss = True,
-                loss_mask = loss_mask
-            )
+            targets = residual_stream[:, 1:].detach()
+            num_targets = targets.shape[1]
+
+            latent_ar_loss = self.zero
+
+            if num_targets >= self.num_latent_pred_steps:
+                unfolded_targets = targets.unfold(1, self.num_latent_pred_steps, 1)
+                unfolded_targets = rearrange(unfolded_targets, 'b n d s -> b n (s d)')
+
+                loss_inputs = residual_stream[:, :num_targets - self.num_latent_pred_steps + 1]
+
+                loss_mask = None
+                if exists(mask):
+                    unfolded_mask = mask[:, 1:].unfold(1, self.num_latent_pred_steps, 1)
+                    loss_mask = unfolded_mask.all(dim = -1)
+
+                latent_ar_loss = self.latent_readout(
+                    loss_inputs,
+                    targets = unfolded_targets,
+                    return_loss = True,
+                    loss_mask = loss_mask
+                )
 
         # derive switching probabilities from qk cosine similarity or entropy quantile
 
@@ -478,7 +508,7 @@ class TransformerWithMetacontroller(Module):
             switch_probs = cosine_distance(queries, keys_with_prev[:, :-1])
 
         # always switch on the first token
-        
+
         if not exists(prev_key):
             switch_probs = pad_left_at_dim(switch_probs[:, 1:], 1, dim = 1)
 
