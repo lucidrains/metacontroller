@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import gzip
 import random
 from pathlib import Path
@@ -60,6 +59,22 @@ def visualize_segments(
         segments.append(decode_token(token))
 
     return ''.join(segments)
+
+def quantile_str_from_meta_output(meta_output, switch_entropy_quantiles):
+    if not exists(meta_output.quantile_indices) or not exists(switch_entropy_quantiles):
+        return ''
+
+    q_idx = meta_output.quantile_indices[0].item()
+    q_val = switch_entropy_quantiles[q_idx]
+    return f' [quantile: {q_val}]'
+
+def last_step(t):
+    """Extract last step from grpo tensors, handling None and 1d quantile_indices."""
+    if not exists(t):
+        return None
+    if t.ndim == 1:
+        return t
+    return t[:, -1:]
 
 # exclamation rewarding
 
@@ -191,7 +206,8 @@ def train(
     kl_loss_weight = 1.,
     heads = 8,
     attn_dim_head = 64,
-    switch_entropy_quantile = 0.85,
+    switch_entropy_quantiles = (0.5, 0.75, 0.85, 0.9),
+    eval_switch_entropy_quantile = 0.85,
     target_avg_token_length = 8.,
     temporal_sequence_embed_prob = 0.25,
     residual_stream_dropout = 0.,
@@ -207,15 +223,20 @@ def train(
     grpo_learning_rate = 1e-4,
     grpo_reward_var_threshold = 0.0,
     grpo_reward_type = 'exclamation',
+    use_wandb = False,
 ):
     # accelerator
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters = True)
     accelerator = Accelerator(cpu = cpu, kwargs_handlers = [ddp_kwargs])
 
-    if grpo_phase and accelerator.is_main_process:
+    if exists(switch_entropy_quantiles):
+        accelerator.print(f'training with entropy quantiles: {switch_entropy_quantiles}')
+        accelerator.print(f'eval quantile target: {eval_switch_entropy_quantile}')
+
+    if grpo_phase and use_wandb and accelerator.is_main_process:
         import wandb
-        wandb.init(project="metacontroller-simple-enwik8", name="grpo")
+        wandb.init(project = 'metacontroller-simple-enwik8', name = 'grpo')
 
     # ensure checkpoint directory exists
 
@@ -225,7 +246,7 @@ def train(
     data_path = Path(enwik8_path)
 
     if not data_path.exists():
-        accelerator.print(f"enwik8 data not found at {enwik8_path}")
+        accelerator.print(f'enwik8 data not found at {enwik8_path}')
         return
 
     with gzip.open(str(data_path)) as file:
@@ -256,7 +277,8 @@ def train(
             heads = heads,
             attn_dim_head = attn_dim_head
         ),
-        switch_entropy_quantile = switch_entropy_quantile,
+        switch_entropy_quantiles = switch_entropy_quantiles,
+        eval_switch_entropy_quantile = eval_switch_entropy_quantile,
         residual_stream_dropout = residual_stream_dropout,
         residual_stream_drop_prob = residual_stream_drop_prob,
         kl_loss_weight = kl_loss_weight
@@ -277,10 +299,11 @@ def train(
     val_loader = cycle(val_loader)
 
     if grpo_phase:
-        # load pretrained checkpoint from BC + Discovery phase
+        model.freeze_entropy_quantiles = True
+
         pretrained_path = Path(checkpoint_path)
-        assert pretrained_path.exists(), f"pretrained checkpoint not found at {pretrained_path}"
-        accelerator.print(f"loading pretrained checkpoint from {pretrained_path}")
+        assert pretrained_path.exists(), f'pretrained checkpoint not found at {pretrained_path}'
+        accelerator.print(f'loading pretrained checkpoint from {pretrained_path}')
         accelerator.unwrap_model(model).load(str(pretrained_path))
 
         if grpo_reward_type == 'sentiment':
@@ -302,20 +325,22 @@ def train(
                 return_loss = True
             )
 
-            segmented_str = visualize_segments(valid_data[0], meta_output.switch_beta[0], threshold = 0.5)
-            accelerator.print(f"\n\n[START VALIDATION] SEGMENTED: {segmented_str}\n")
+            segmented_str = visualize_segments(valid_data[0], meta_output.switch_beta[0])
+            q_str = quantile_str_from_meta_output(meta_output, switch_entropy_quantiles)
+            accelerator.print(f'\n\n[START VALIDATION] SEGMENTED{q_str}: {segmented_str}\n')
 
         best_reward_seen_so_far = 0.
 
-        pbar = tqdm.tqdm(total = num_grpo_batches, mininterval = 10.0, desc = "grpo")
+        pbar = tqdm.tqdm(total = num_grpo_batches, mininterval = 10.0, desc = 'grpo')
         i = 0
 
         while i < num_grpo_batches:
             model.eval()
 
-            # 1. Sample prompt
+            # sample prompt
+
             data = next(train_loader)
-            prompt = data[0:1, :prime_length] # (1, prime_length)
+            prompt = data[0:1, :prime_length]
 
             prompt = prompt.to(accelerator.device).repeat(grpo_group_size, 1)
 
@@ -337,11 +362,8 @@ def train(
                 next_state = model.action_readout.sample(action_dist[:, -1:], temperature = 1.)
                 state = torch.cat((state, next_state), dim = -1)
 
-                def last(t):
-                    return t[:, -1:]
-
                 first_grpo_data = extract_grpo_data(model, meta_output)
-                first_grpo_data = type(first_grpo_data)(*map(last, first_grpo_data))
+                first_grpo_data = type(first_grpo_data)(*map(last_step, first_grpo_data))
                 grpo_data_list = [first_grpo_data]
 
                 for _ in range(sample_num_times - 1):
@@ -361,7 +383,8 @@ def train(
 
                     cache = next_cache
 
-            # Extract generated text and calculate reward
+            # extract generated text and calculate reward
+
             generated = state[:, prompt_seq_len:]
             texts = [decode_tokens(t.tolist()) for t in generated]
 
@@ -379,17 +402,21 @@ def train(
                 best_reward_seen_so_far = max_reward
                 if accelerator.is_main_process:
                     best_idx = rewards_tensor.argmax().item()
-                    accelerator.print(f"\n*** NEW BEST REWARD: {best_reward_seen_so_far:.3f} ***")
-                    accelerator.print(f"PROMPT: {decode_tokens(prompt[best_idx].tolist())}")
-                    accelerator.print(f"GENERATED: {texts[best_idx]}\n")
+                    accelerator.print(f'\n*** NEW BEST REWARD: {best_reward_seen_so_far:.3f} ***')
+                    accelerator.print(f'PROMPT: {decode_tokens(prompt[best_idx].tolist())}')
+                    accelerator.print(f'GENERATED: {texts[best_idx]}\n')
 
             # grpo tensors
 
-            states, actions, log_probs, switch_betas = zip(*grpo_data_list)
+            states, actions, log_probs, switch_betas, quantile_indices = zip(*grpo_data_list)
             group_states = torch.cat(states, dim = 1)
             group_actions = torch.cat(actions, dim = 1)
             group_log_probs = torch.cat(log_probs, dim = 1)
             group_switch_betas = torch.cat(switch_betas, dim = 1)
+
+            group_quantile_indices = None
+            if exists(quantile_indices[0]):
+                group_quantile_indices = torch.cat(quantile_indices, dim = 1)
 
             # policy loss
 
@@ -397,7 +424,6 @@ def train(
 
             model.train()
 
-            # policy_loss function expects `switch_betas` mask
             loss = policy_loss(
                 model,
                 state = group_states,
@@ -406,13 +432,15 @@ def train(
                 advantages = advantages,
                 switch_betas = group_switch_betas,
                 mask = (group_switch_betas > 0.5),
-                eps_clip = grpo_eps_clip
+                eps_clip = grpo_eps_clip,
+                quantile_indices = group_quantile_indices
             )
 
             _, kl_loss = model.get_action_dist_for_internal_rl(
                 group_states,
-                switch_betas=group_switch_betas,
-                return_kl_loss=True
+                switch_betas = group_switch_betas,
+                quantile_indices = group_quantile_indices,
+                return_kl_loss = True
             )
 
             switch_mask = (group_switch_betas > 0.5).float()
@@ -427,12 +455,10 @@ def train(
 
             loss_val = loss.item()
 
-            # calculate hard switch density for logging
-
             with torch.no_grad():
                 switch_density = (group_switch_betas > 0.5).float().mean().item()
 
-            if accelerator.is_main_process:
+            if accelerator.is_main_process and use_wandb:
                 import wandb
                 if exists(wandb.run):
                     log_dict = dict(
@@ -453,27 +479,28 @@ def train(
                     wandb.log(log_dict)
 
             if divisible_by(i, 10):
-                pbar.set_postfix(loss = f"{loss_val:.3f}", kl = f"{kl_loss.item():.3f}", reward = f"{mean_reward:.3f}")
-                tqdm.tqdm.write(f"{i}: loss: {loss_val:.3f} reward: {mean_reward:.3f} max: {max_reward:.3f}")
+                pbar.set_postfix(loss = f'{loss_val:.3f}', kl = f'{kl_loss.item():.3f}', reward = f'{mean_reward:.3f}')
+                tqdm.tqdm.write(f'{i}: loss: {loss_val:.3f} reward: {mean_reward:.3f} max: {max_reward:.3f}')
 
             # save checkpoint
+
             if divisible_by(i, 1000) and i > 0:
-                accelerator.print(f"saving GRPO checkpoint to {checkpoint_path}")
+                accelerator.print(f'saving GRPO checkpoint to {checkpoint_path}')
                 accelerator.wait_for_everyone()
                 unwrapped_model = accelerator.unwrap_model(model)
-                unwrapped_model.save(str(Path(checkpoint_path).with_stem(f"{Path(checkpoint_path).stem}-grpo")))
+                unwrapped_model.save(str(Path(checkpoint_path).with_stem(f'{Path(checkpoint_path).stem}-grpo')))
 
             i += 1
             pbar.update(1)
 
-        accelerator.print(f"saving final GRPO checkpoint to {checkpoint_path}")
+        accelerator.print(f'saving final GRPO checkpoint to {checkpoint_path}')
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save(str(Path(checkpoint_path).with_stem(f"{Path(checkpoint_path).stem}-grpo")))
+        unwrapped_model.save(str(Path(checkpoint_path).with_stem(f'{Path(checkpoint_path).stem}-grpo')))
         return
 
-    method_desc = f"Entropy ({switch_entropy_quantile*100:.0f}%)" if switch_entropy_quantile is not None else "QK"
-    pbar = tqdm.tqdm(range(num_batches), mininterval = 10.0, desc = f"training jointly | {method_desc}")
+    method_desc = f'Entropy ({len(switch_entropy_quantiles)} thresholds)' if exists(switch_entropy_quantiles) else 'QK'
+    pbar = tqdm.tqdm(range(num_batches), mininterval = 10.0, desc = f'training jointly | {method_desc}')
 
     for i in pbar:
         model.train()
@@ -506,10 +533,7 @@ def train(
             last_bc_action_loss = bc_action_loss.item()
             last_ratio_loss = ratio_loss.item()
             last_latent_ar_loss = latent_ar_loss.item()
-            if isinstance(kl_loss, torch.Tensor):
-                last_kl_loss = kl_loss.item()
-            else:
-                last_kl_loss = kl_loss
+            last_kl_loss = kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
             last_switch_density = (meta_output.switch_beta > 0.5).float().mean().item()
 
             accelerator.backward(loss / grad_accum_every)
@@ -521,9 +545,9 @@ def train(
         # logging
 
         if divisible_by(i, 10):
-            log_str = f"{i}: loss: {last_loss:.3f} bc_action: {last_bc_action_loss:.3f} bc_state: {last_bc_state_loss:.3f} ratio: {last_ratio_loss:.3f} latent_ar: {last_latent_ar_loss:.3f} kl: {last_kl_loss:.3f} density: {last_switch_density:.3f}"
+            log_str = f'{i}: loss: {last_loss:.3f} bc_action: {last_bc_action_loss:.3f} bc_state: {last_bc_state_loss:.3f} ratio: {last_ratio_loss:.3f} latent_ar: {last_latent_ar_loss:.3f} kl: {last_kl_loss:.3f} density: {last_switch_density:.3f}'
             tqdm.tqdm.write(log_str)
-            pbar.set_postfix(bc_action = f"{last_bc_action_loss:.3f}", kl = f"{last_kl_loss:.3f}", density = f"{last_switch_density:.3f}")
+            pbar.set_postfix(bc_action = f'{last_bc_action_loss:.3f}', kl = f'{last_kl_loss:.3f}', density = f'{last_switch_density:.3f}')
 
         if divisible_by(i, validate_every):
             model.eval()
@@ -542,11 +566,11 @@ def train(
                 v_bc_state, v_bc_action, v_ratio, v_latent_ar, v_kl_loss = losses
                 loss_val = (v_bc_state + 0.5) * bc_state_loss_weight + (v_bc_action + 0.5) * bc_action_loss_weight + v_ratio * ratio_loss_weight + v_latent_ar * latent_ar_loss_weight + v_kl_loss * kl_loss_weight
 
-                # base segmentation using standard switch prob
-                segmented_str = visualize_segments(val_state[0], meta_output.switch_beta[0], threshold = 0.5)
-                accelerator.print(f"\n\nSEGMENTED: {segmented_str}\n")
+                segmented_str = visualize_segments(val_state[0], meta_output.switch_beta[0])
+                q_str = quantile_str_from_meta_output(meta_output, switch_entropy_quantiles)
+                accelerator.print(f'\n\nSEGMENTED{q_str}: {segmented_str}\n')
 
-                accelerator.print(f"{i}: validation loss: {loss_val.item():.3f} (bc: {v_bc_action.item():.3f})")
+                accelerator.print(f'{i}: validation loss: {loss_val.item():.3f} (bc: {v_bc_action.item():.3f})')
 
         if divisible_by(i, generate_every):
             model.eval()
@@ -554,25 +578,25 @@ def train(
             inp = inp.to(accelerator.device)
 
             prime = decode_tokens(inp.tolist())
-            accelerator.print(f"\n\nPROMPT: {prime}")
+            accelerator.print(f'\n\nPROMPT: {prime}')
 
             prompt = inp[None, ...]
             sampled, sampled_switch_betas = sample(model, prompt, generate_length)
 
-            sampled_segmented_str = visualize_segments(sampled[0], sampled_switch_betas[0], threshold = 0.5)
-            accelerator.print(f"GENERATED: {sampled_segmented_str}\n")
+            sampled_segmented_str = visualize_segments(sampled[0], sampled_switch_betas[0])
+            accelerator.print(f'GENERATED [quantile: {eval_switch_entropy_quantile}]: {sampled_segmented_str}\n')
 
         # save checkpoint
 
         if divisible_by(i, 1000) and i > 0:
-            accelerator.print(f"saving checkpoint to {checkpoint_path}")
+            accelerator.print(f'saving checkpoint to {checkpoint_path}')
             accelerator.wait_for_everyone()
             unwrapped_model = accelerator.unwrap_model(model)
             unwrapped_model.save(checkpoint_path)
 
     # final save
 
-    accelerator.print(f"saving final checkpoint to {checkpoint_path}")
+    accelerator.print(f'saving final checkpoint to {checkpoint_path}')
     accelerator.wait_for_everyone()
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_model.save(checkpoint_path)

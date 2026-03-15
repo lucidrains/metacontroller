@@ -65,12 +65,14 @@ class MetaControllerOutput(NamedTuple):
     kl_loss: Tensor | float
     kl_loss_weight: float | Tensor
     latent_pred_entropy: Tensor | None
+    quantile_indices: Tensor | None = None
 
 class GRPOOutput(NamedTuple):
     state: Tensor
     action: Tensor
     log_prob: Tensor
     switch_beta: Tensor
+    quantile_indices: Tensor | None = None
 
 class TransformerWithMetacontrollerCache(NamedTuple):
     lower_body: Tensor | None
@@ -78,6 +80,7 @@ class TransformerWithMetacontrollerCache(NamedTuple):
     upper_body: Tensor | None
     prev_key: Tensor | None
     prev_gated_action: Tensor | None
+    quantile_indices: Tensor | None
     cache_steps: int
 
 # grpo helpers
@@ -91,7 +94,7 @@ def extract_grpo_data(model, meta_output):
     action = meta_output.actions
     switch_beta = meta_output.switch_beta
     log_prob = model.log_prob(meta_output.action_dist, action)
-    return GRPOOutput(state, action, log_prob, switch_beta)
+    return GRPOOutput(state, action, log_prob, switch_beta, meta_output.quantile_indices)
 
 @move_inputs_to_module_device
 def policy_loss(
@@ -104,8 +107,9 @@ def policy_loss(
     mask = None,
     episode_lens = None,
     eps_clip: float | tuple[float, float] = 0.2,
+    quantile_indices = None
 ):
-    action_dist = model.get_action_dist_for_internal_rl(state, switch_betas=switch_betas)
+    action_dist = model.get_action_dist_for_internal_rl(state, switch_betas = switch_betas, quantile_indices = quantile_indices)
     new_log_probs = model.log_prob(action_dist, actions)
 
     ratio = (new_log_probs - old_log_probs).exp()
@@ -150,7 +154,8 @@ class TransformerWithMetacontroller(Module):
         temporal_sequence_embedder: dict | None = None,
         dim_sequence_summary_embed: int = 32,
         temporal_sequence_embed_prob: float = 1.,
-        switch_entropy_quantile: float | None = None,
+        switch_entropy_quantiles: tuple[float, ...] | None = None,
+        eval_switch_entropy_quantile: float = 0.5,
         switch_entropy_quantile_lr: float = 0.1,
         dim_queries_keys = 256,
         target_avg_token_length = 8.,
@@ -158,6 +163,7 @@ class TransformerWithMetacontroller(Module):
         residual_stream_drop_prob = 0.,
         kl_loss_weight = 1.,
         kl_loss_threshold = 0.,
+        freeze_entropy_quantiles = False,
         assoc_scan_kwargs: dict = dict()
     ):
         super().__init__()
@@ -165,6 +171,7 @@ class TransformerWithMetacontroller(Module):
         self.dim_code_bits = dim_code_bits
 
         self.kl_loss_weight = kl_loss_weight
+        self.freeze_entropy_quantiles = freeze_entropy_quantiles
 
         # embeddings
 
@@ -209,14 +216,26 @@ class TransformerWithMetacontroller(Module):
 
         self.temporal_sequence_embed_prob = temporal_sequence_embed_prob
 
-        # qk switching unit
+        # entropy quantile switching unit
 
-        self.switch_entropy_quantile = switch_entropy_quantile
         self.switch_entropy_quantile_lr = switch_entropy_quantile_lr
 
-        if exists(self.switch_entropy_quantile):
-            # initialize tracker slightly higher to start capturing bounds immediately
-            self.register_buffer('running_entropy_quantile', tensor(10.))
+        self.switch_entropy_quantiles = None
+        self.num_quantiles = 0
+        self.eval_switch_entropy_quantile_idx = 0
+
+        if exists(switch_entropy_quantiles):
+            if isinstance(switch_entropy_quantiles, (float, int)):
+                switch_entropy_quantiles = (switch_entropy_quantiles,)
+
+            self.switch_entropy_quantiles = tuple(switch_entropy_quantiles)
+            self.num_quantiles = len(self.switch_entropy_quantiles)
+
+            assert eval_switch_entropy_quantile in self.switch_entropy_quantiles, f'eval_switch_entropy_quantile ({eval_switch_entropy_quantile}) must be one of switch_entropy_quantiles {self.switch_entropy_quantiles}'
+            self.eval_switch_entropy_quantile_idx = self.switch_entropy_quantiles.index(eval_switch_entropy_quantile)
+
+            self.register_buffer('running_entropy_quantiles', tensor([10.] * self.num_quantiles))
+            self.quantile_embed = nn.Embedding(self.num_quantiles, dim)
         else:
             self.to_queries_keys = nn.Sequential(
                 RMSNorm(dim),
@@ -237,7 +256,7 @@ class TransformerWithMetacontroller(Module):
 
         # binary mapper
 
-        self.emitter_to_binary_logits = Linear(dim, dim_code_bits, bias=False)
+        self.emitter_to_binary_logits = Linear(dim, dim_code_bits, bias = False)
 
         self.binary_mapper = BinaryMapper(
             bits = dim_code_bits,
@@ -286,21 +305,37 @@ class TransformerWithMetacontroller(Module):
             *self.emitter_to_binary_logits.parameters()
         ]
 
-    def get_action_dist_for_internal_rl(self, residual_stream, switch_betas=None, return_kl_loss=False):
+    def _add_quantile_embed(self, x, quantile_indices):
+        """Add quantile conditioning embedding to input tensor."""
+        if not exists(self.switch_entropy_quantiles) or not exists(quantile_indices):
+            return x
+
+        q_embeds = self.quantile_embed(quantile_indices)
+
+        if q_embeds.ndim == 2 and x.ndim == 3:
+            q_embeds = rearrange(q_embeds, 'b d -> b 1 d')
+
+        return x + q_embeds
+
+    def get_action_dist_for_internal_rl(self, residual_stream, switch_betas = None, quantile_indices = None, return_kl_loss = False):
         emitter_input = residual_stream
 
         if exists(switch_betas):
             switch_indices = (switch_betas > 0.5).long()
             emitter_input = emitter_input + self.switch_embed(switch_indices)
 
+        emitter_input = self._add_quantile_embed(emitter_input, quantile_indices)
+
         emitter_out = self.emitter_decoder(emitter_input)
         binary_logits = self.emitter_to_binary_logits(emitter_out)
+
         if not return_kl_loss:
             return binary_logits
+
         return binary_logits, self.calculate_kl_loss(binary_logits)
 
     def calculate_kl_loss(self, binary_logits):
-        _, kl_loss = self.binary_mapper(binary_logits, reduce_aux_kl_loss=False)
+        _, kl_loss = self.binary_mapper(binary_logits, reduce_aux_kl_loss = False)
         return kl_loss
 
     def log_prob(self, dist_params, actions):
@@ -346,7 +381,7 @@ class TransformerWithMetacontroller(Module):
             if seq_len == actions.shape[1]:
                 actions = actions[:, :-1]
 
-        lower_body_cache, emitter_decoder_cache, upper_body_cache, prev_key, prev_gated_action, cache_steps = default(cache, (None,) * 5 + (0,))
+        lower_body_cache, emitter_decoder_cache, upper_body_cache, prev_key, prev_gated_action, cached_quantile_indices, cache_steps = default(cache, (None,) * 6 + (0,))
 
         # embed and process through lower body
 
@@ -364,26 +399,37 @@ class TransformerWithMetacontroller(Module):
         residual_stream, next_lower_body_cache = self.lower_body(embed, cache = lower_body_cache, return_hiddens = True)
 
         dist_params = self.latent_readout(residual_stream)
-        latent_pred_entropy = self.latent_readout.entropy(dist_params).sum(dim=-1)
+        latent_pred_entropy = self.latent_readout.entropy(dist_params).sum(dim = -1)
 
         if return_loss:
             loss_mask = mask[:, 1:] if exists(mask) else None
             latent_ar_loss = self.latent_readout(
                 residual_stream[:, :-1],
-                targets=residual_stream[:, 1:].detach(),
-                return_loss=True,
-                loss_mask=loss_mask
+                targets = residual_stream[:, 1:].detach(),
+                return_loss = True,
+                loss_mask = loss_mask
             )
 
         # derive switching probabilities from qk cosine similarity or entropy quantile
 
-        if exists(self.switch_entropy_quantile):
-            entropy_threshold = self.running_entropy_quantile.item()
-            switch_probs = (latent_pred_entropy > entropy_threshold).float()
+        quantile_indices = None
 
-            should_update_entropy_quantile = default(update_entropy_quantile, self.training)
+        if exists(self.switch_entropy_quantiles):
+            if exists(cached_quantile_indices):
+                quantile_indices = cached_quantile_indices
+            elif self.training and not self.freeze_entropy_quantiles:
+                quantile_indices = torch.randint(0, self.num_quantiles, (batch,), device = device)
+            else:
+                quantile_indices = torch.full((batch,), self.eval_switch_entropy_quantile_idx, device = device, dtype = torch.long)
 
-            if should_update_entropy_quantile:
+            entropy_thresholds = self.running_entropy_quantiles[quantile_indices]
+            entropy_thresholds = rearrange(entropy_thresholds, 'b -> b 1')
+
+            switch_probs = (latent_pred_entropy > entropy_thresholds).float()
+
+            should_update = default(update_entropy_quantile, self.training and not self.freeze_entropy_quantiles)
+
+            if should_update:
                 with torch.no_grad():
                     flat_entropy = latent_pred_entropy.detach().reshape(-1)
 
@@ -392,11 +438,10 @@ class TransformerWithMetacontroller(Module):
                         torch.distributed.all_gather(gathered_entropy, flat_entropy)
                         flat_entropy = torch.cat(gathered_entropy)
 
-                    # Calculate the explicit quantile for this batch
-                    batch_quantile = torch.quantile(flat_entropy, self.switch_entropy_quantile)
-
-                    # EMA update on the running quantile buffer
-                    self.running_entropy_quantile.lerp_(batch_quantile, self.switch_entropy_quantile_lr)
+                    if flat_entropy.numel() > 0:
+                        q_tensor = tensor(self.switch_entropy_quantiles, device = flat_entropy.device, dtype = flat_entropy.dtype)
+                        batch_quantiles = torch.quantile(flat_entropy, q_tensor)
+                        self.running_entropy_quantiles.lerp_(batch_quantiles, self.switch_entropy_quantile_lr)
 
             next_prev_key = None
         else:
@@ -405,19 +450,19 @@ class TransformerWithMetacontroller(Module):
             should_use_temporal_embed = default(use_temporal_sequence_embed, return_loss)
 
             if should_use_temporal_embed and exists(self.temporal_embedder):
-                temporal_encoded = self.temporal_embedder(residual_stream, mask=mask)
-                temporal_pooled = masked_mean(temporal_encoded, mask, dim=1)
+                temporal_encoded = self.temporal_embedder(residual_stream, mask = mask)
+                temporal_pooled = masked_mean(temporal_encoded, mask, dim = 1)
                 temporal_bottlenecked = self.to_sequence_summary_embed(temporal_pooled)
 
                 if self.training and self.temporal_sequence_embed_prob < 1.:
-                    batch_prob_mask = torch.rand(batch, device=device) < self.temporal_sequence_embed_prob
+                    batch_prob_mask = torch.rand(batch, device = device) < self.temporal_sequence_embed_prob
                     temporal_bottlenecked = torch.where(
                         rearrange(batch_prob_mask, 'b -> b 1'),
                         temporal_bottlenecked,
                         self.zero
                     )
 
-                temporal_repeated = repeat(temporal_bottlenecked, 'b d -> b n d', n=seq_len)
+                temporal_repeated = repeat(temporal_bottlenecked, 'b d -> b n d', n = seq_len)
                 qk_input = qk_input + temporal_repeated
 
             queries, keys = self.to_queries_keys(qk_input).chunk(2, dim = -1)
@@ -432,6 +477,11 @@ class TransformerWithMetacontroller(Module):
 
             switch_probs = cosine_distance(queries, keys_with_prev[:, :-1])
 
+        # always switch on the first token
+        
+        if not exists(prev_key):
+            switch_probs = pad_left_at_dim(switch_probs[:, 1:], 1, dim = 1)
+
         boundary_mask = switch_probs > 0.5
         switch_probs_hard = straight_through(switch_probs, boundary_mask.float())
 
@@ -441,10 +491,12 @@ class TransformerWithMetacontroller(Module):
         switch_embeds = self.switch_embed(switch_indices)
         emitter_input = residual_stream + switch_embeds
 
+        emitter_input = self._add_quantile_embed(emitter_input, quantile_indices)
+
         emitter_out, next_emitter_decoder_cache = self.emitter_decoder(emitter_input, cache = emitter_decoder_cache, return_hiddens = True)
         binary_logits = self.emitter_to_binary_logits(emitter_out)
 
-        sampled_latent_action, kl_loss = self.binary_mapper(binary_logits, reduce_aux_kl_loss=False)
+        sampled_latent_action, kl_loss = self.binary_mapper(binary_logits, reduce_aux_kl_loss = False)
 
         # gated action via associative scan
 
@@ -489,6 +541,7 @@ class TransformerWithMetacontroller(Module):
             upper_body = next_upper_body_cache,
             prev_key = next_prev_key,
             prev_gated_action = next_prev_gated_action,
+            quantile_indices = quantile_indices,
             cache_steps = cache_steps + seq_len
         )
 
@@ -519,7 +572,8 @@ class TransformerWithMetacontroller(Module):
             ratio_loss = ratio_loss,
             kl_loss = kl_loss,
             kl_loss_weight = self.kl_loss_weight,
-            latent_pred_entropy = latent_pred_entropy
+            latent_pred_entropy = latent_pred_entropy,
+            quantile_indices = quantile_indices
         )
 
         if not return_loss:
