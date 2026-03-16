@@ -401,9 +401,11 @@ class MetaController(Module):
         apply_kl_loss_weight = True,
         ratio_loss_final_weight = None,
         ratio_loss_warmdown_steps = 0,
+        latent_action_barrier_scale: float | None = None
     ):
         super().__init__()
         self.dim_model = dim_model
+
         self.hard_switch = hard_switch
         self.hard_switch_straight_through = hard_switch_straight_through
 
@@ -478,6 +480,10 @@ class MetaController(Module):
         self.switch_temperature = switch_temperature
 
         self.switch_gating = AssocScan(**assoc_scan_kwargs)
+
+        # latent action barrier from https://zzk273.github.io/LATENT/
+
+        self.latent_action_barrier_scale = latent_action_barrier_scale
 
         # turn off the ratio loss by setting the weight to 0
 
@@ -745,6 +751,12 @@ class MetaController(Module):
 
         sampled_latent_action = readout.sample(action_dist, temperature = temperature, differentiable = True)
 
+        bounded_latent_action = sampled_latent_action
+
+        if exists(self.latent_action_barrier_scale):
+            scale = self.latent_action_barrier_scale
+            bounded_latent_action = scale * (sampled_latent_action / scale).tanh()
+
         # switching unit timer
 
         batch, seq_len, dim = sampled_latent_action.shape
@@ -771,7 +783,7 @@ class MetaController(Module):
                 self.to_switching_unit_beta,
                 residual_stream,
                 meta_embed_prev,
-                sampled_latent_action,
+                bounded_latent_action,
                 prev_switching_unit_gru_hidden,
                 z_prev,
                 self.switch_temperature,
@@ -840,7 +852,7 @@ class MetaController(Module):
 
             forget_gate = 1. - switch_beta_for_gate
 
-            gated_sampled_latent_action = einx.multiply('b n d, b n', sampled_latent_action, switch_beta_for_gate)
+            gated_sampled_latent_action = einx.multiply('b n d, b n', bounded_latent_action, switch_beta_for_gate)
             gated_action = self.switch_gating(forget_gate, gated_sampled_latent_action, prev = gated_prev_latent)
 
             next_switch_gated_action = gated_action[:, -1:]
