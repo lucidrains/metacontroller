@@ -1,7 +1,7 @@
 from __future__ import annotations
 # /// script
 # dependencies = [
-#   "metacontroller-pytorch>=0.2.18",
+#   "metacontroller-pytorch>=0.2.46",
 #   "transformers",
 #   "accelerate",
 #   "fire",

@@ -333,19 +333,7 @@ class MetaControllerWithBinaryMapper(Module):
         action_dist,
         sampled_latent_action
     ):
-        log_probs = stack((
-            F.logsigmoid(action_dist),
-            F.logsigmoid(-action_dist)
-        ), dim = -1)
-
-        indices = sampled_latent_action.argmax(dim = -1)
-        codes = self.binary_mapper.codes[indices].long()
-
-        codes = rearrange(codes, '... -> ... 1')
-        action_log_probs = log_probs.gather(-1, codes)
-        action_log_probs = rearrange(action_log_probs, '... 1 -> ...')
-
-        return action_log_probs
+        return self.binary_mapper.log_prob(action_dist, one_hot=sampled_latent_action, sum_bits=False)
 
     def forward(
         self,
