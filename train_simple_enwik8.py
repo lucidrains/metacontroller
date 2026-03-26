@@ -530,17 +530,16 @@ def train(
                 return_loss = True
             )
 
-            bc_state_loss, bc_action_loss, ratio_loss, latent_ar_loss, kl_loss, next_switch_pred_loss = losses
-
-            loss = (bc_state_loss + 0.5) * bc_state_loss_weight + (bc_action_loss + 0.5) * bc_action_loss_weight + ratio_loss * ratio_loss_weight + latent_ar_loss * latent_ar_loss_weight + kl_loss * kl_loss_weight + next_switch_pred_loss * next_switch_pred_loss_weight
+            loss = (losses.bc_state_loss + 0.5) * bc_state_loss_weight + (losses.bc_action_loss + 0.5) * bc_action_loss_weight + losses.ratio_loss * ratio_loss_weight + losses.latent_loss * latent_ar_loss_weight + losses.kl_loss * kl_loss_weight + losses.next_switch_pred_loss * next_switch_pred_loss_weight
 
             last_loss = loss.item()
-            last_bc_state_loss = bc_state_loss.item()
-            last_bc_action_loss = bc_action_loss.item()
-            last_ratio_loss = ratio_loss.item()
-            last_latent_ar_loss = latent_ar_loss.item()
-            last_kl_loss = kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
-            last_next_switch_pred_loss = next_switch_pred_loss.item()
+            last_bc_state_loss = losses.bc_state_loss.item()
+            last_bc_action_loss = losses.bc_action_loss.item()
+            last_ratio_loss = losses.ratio_loss.item()
+            last_latent_ar_loss = losses.latent_ar_loss.item()
+            last_sigreg_loss = losses.sigreg_loss.item() if isinstance(losses.sigreg_loss, torch.Tensor) else losses.sigreg_loss
+            last_kl_loss = losses.kl_loss.item() if isinstance(losses.kl_loss, torch.Tensor) else losses.kl_loss
+            last_next_switch_pred_loss = losses.next_switch_pred_loss.item()
             last_switch_density = (meta_output.switch_beta > 0.5).float().mean().item()
 
             accelerator.backward(loss / grad_accum_every)
@@ -552,7 +551,7 @@ def train(
         # logging
 
         if divisible_by(i, 10):
-            log_str = f'{i}: loss: {last_loss:.3f} bc_action: {last_bc_action_loss:.3f} bc_state: {last_bc_state_loss:.3f} ratio: {last_ratio_loss:.3f} latent_ar: {last_latent_ar_loss:.3f} kl: {last_kl_loss:.3f} next_sw: {last_next_switch_pred_loss:.3f} density: {last_switch_density:.3f}'
+            log_str = f'{i}: loss: {last_loss:.3f} bc_action: {last_bc_action_loss:.3f} bc_state: {last_bc_state_loss:.3f} ratio: {last_ratio_loss:.3f} latent_ar: {last_latent_ar_loss:.3f} sigreg: {last_sigreg_loss:.3f} kl: {last_kl_loss:.3f} next_sw: {last_next_switch_pred_loss:.3f} density: {last_switch_density:.3f}'
             tqdm.tqdm.write(log_str)
             pbar.set_postfix(bc_action = f'{last_bc_action_loss:.3f}', kl = f'{last_kl_loss:.3f}', density = f'{last_switch_density:.3f}')
 
@@ -570,14 +569,13 @@ def train(
                     use_temporal_sequence_embed = False
                 )
 
-                v_bc_state, v_bc_action, v_ratio, v_latent_ar, v_kl_loss, v_next_switch = losses
-                loss_val = (v_bc_state + 0.5) * bc_state_loss_weight + (v_bc_action + 0.5) * bc_action_loss_weight + v_ratio * ratio_loss_weight + v_latent_ar * latent_ar_loss_weight + v_kl_loss * kl_loss_weight + v_next_switch * next_switch_pred_loss_weight
+                loss_val = (losses.bc_state_loss + 0.5) * bc_state_loss_weight + (losses.bc_action_loss + 0.5) * bc_action_loss_weight + losses.ratio_loss * ratio_loss_weight + losses.latent_loss * latent_ar_loss_weight + losses.kl_loss * kl_loss_weight + losses.next_switch_pred_loss * next_switch_pred_loss_weight
 
                 segmented_str = visualize_segments(val_state[0], meta_output.switch_beta[0])
                 q_str = quantile_str_from_meta_output(meta_output, switch_entropy_quantiles)
                 accelerator.print(f'\n\nSEGMENTED{q_str}: {segmented_str}\n')
 
-                accelerator.print(f'{i}: validation loss: {loss_val.item():.3f} (bc: {v_bc_action.item():.3f})')
+                accelerator.print(f'{i}: validation loss: {loss_val.item():.3f} (bc: {losses.bc_action_loss.item():.3f})')
 
         if divisible_by(i, generate_every):
             model.eval()

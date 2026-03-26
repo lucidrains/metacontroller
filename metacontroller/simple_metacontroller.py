@@ -57,6 +57,16 @@ def calculate_ratio_loss(
 
 # named tuples
 
+class MetaControllerLosses(NamedTuple):
+    bc_state_loss: Tensor | None
+    bc_action_loss: Tensor | None
+    ratio_loss: Tensor | None
+    latent_loss: Tensor | float
+    latent_ar_loss: Tensor | float
+    sigreg_loss: Tensor | float
+    kl_loss: Tensor | float
+    next_switch_pred_loss: Tensor | float
+
 class MetaControllerOutput(NamedTuple):
     input_residual_stream: Tensor
     action_dist: Tensor
@@ -67,6 +77,7 @@ class MetaControllerOutput(NamedTuple):
     kl_loss_weight: float | Tensor
     latent_pred_entropy: Tensor | None
     quantile_indices: Tensor | None = None
+    sigreg_loss: Tensor | float = 0.
 
 class GRPOOutput(NamedTuple):
     state: Tensor
@@ -168,11 +179,15 @@ class TransformerWithMetacontroller(Module):
         num_latent_pred_steps = 2,
         future_entropy_weights: tuple[float, ...] | None = None,
         predict_next_switch_embed = False,
+        sigreg_lambda = 0.05,
+        sigreg_loss_kwargs: dict | None = None,
         assoc_scan_kwargs: dict = dict()
     ):
         super().__init__()
         self.dim_model = dim
         self.dim_code_bits = dim_code_bits
+        self.sigreg_lambda = sigreg_lambda
+        self.sigreg_loss_kwargs = default(sigreg_loss_kwargs, dict(num_slices = 256))
 
         self.kl_loss_weight = kl_loss_weight
         self.freeze_entropy_quantiles = freeze_entropy_quantiles
@@ -308,6 +323,56 @@ class TransformerWithMetacontroller(Module):
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
+    @staticmethod
+    def sigreg_loss(
+        x,
+        mask = None,
+        num_slices = 1024,
+        domain = (-5, 5),
+        num_knots = 17,
+        reduction = 'mean'
+    ):
+        # Randall Balestriero - https://arxiv.org/abs/2511.08544
+
+        dim, device = x.shape[-1], x.device
+
+        if exists(mask):
+            x = x[mask]
+
+        if x.numel() == 0:
+            return torch.tensor(0., device = device, requires_grad = True)
+
+        # slice sampling
+
+        rand_projs = torch.randn((num_slices, dim), device = device)
+        rand_projs = F.normalize(rand_projs, dim = -1)
+
+        # integration points
+
+        t = torch.linspace(*domain, num_knots, device = device)
+
+        # theoretical CF for N(0, 1) and Gauss. window
+
+        exp_f = (-0.5 * t.square()).exp()
+
+        # empirical CF
+
+        x_t = einx.dot('... d, m d -> (...) m', x, rand_projs)
+
+        x_t = multiply('n m, t -> n m t', x_t, t)
+        ecf = (1j * x_t).exp().mean(dim = 0)
+
+        # weighted L2 distance
+
+        err = ecf.sub(exp_f).abs().square().mul(exp_f)
+
+        loss = torch.trapz(err, t, dim = -1)
+
+        if reduction == 'mean':
+            return loss.mean()
+
+        return loss
+
     # grpo interface
 
     @property
@@ -426,6 +491,8 @@ class TransformerWithMetacontroller(Module):
 
         latent_pred_entropy = (latent_pred_entropy * self.future_entropy_weights).sum(dim = -1)
 
+        sigreg_loss = self.zero
+
         if return_loss:
             targets = residual_stream[:, 1:].detach()
             num_targets = targets.shape[1]
@@ -449,6 +516,9 @@ class TransformerWithMetacontroller(Module):
                     return_loss = True,
                     loss_mask = loss_mask
                 )
+
+                sigreg_loss = self.sigreg_loss(residual_stream, mask = mask, **self.sigreg_loss_kwargs)
+                latent_loss = latent_ar_loss + sigreg_loss * self.sigreg_lambda
 
         # derive switching probabilities from qk cosine similarity or entropy quantile
 
@@ -642,14 +712,26 @@ class TransformerWithMetacontroller(Module):
             kl_loss = kl_loss,
             kl_loss_weight = self.kl_loss_weight,
             latent_pred_entropy = latent_pred_entropy,
-            quantile_indices = quantile_indices
+            quantile_indices = quantile_indices,
+            sigreg_loss = sigreg_loss
         )
 
         if not return_loss:
             ret = (dist_params, meta_output)
         else:
+            losses = MetaControllerLosses(
+                bc_state_loss = bc_state_loss,
+                bc_action_loss = bc_action_loss,
+                ratio_loss = ratio_loss,
+                latent_loss = latent_loss,
+                latent_ar_loss = latent_ar_loss,
+                sigreg_loss = sigreg_loss,
+                kl_loss = kl_loss,
+                next_switch_pred_loss = next_switch_pred_loss
+            )
+
             ret = (
-                (bc_state_loss, bc_action_loss, ratio_loss, latent_ar_loss, kl_loss, next_switch_pred_loss),
+                losses,
                 meta_output
             )
 
