@@ -427,12 +427,7 @@ def train(
     # load checkpoint if it exists or if we are in discovery phase or grpo phase or streaming rl phase
 
     if grpo_phase or evo_phase or streaming_rl_phase:
-        if checkpoint_path.endswith('-discovery.pt'):
-            discovery_checkpoint_path = checkpoint_path
-            backbone_path = str(Path(checkpoint_path).with_stem(Path(checkpoint_path).stem.replace('-discovery', '')))
-        else:
-            discovery_checkpoint_path = str(Path(checkpoint_path).with_stem(f"{Path(checkpoint_path).stem}-discovery"))
-            backbone_path = checkpoint_path
+        discovery_checkpoint_path = str(Path(checkpoint_path).with_stem(f"{Path(checkpoint_path).stem}-discovery"))
 
         load_path = discovery_checkpoint_path
 
@@ -446,9 +441,9 @@ def train(
         # for backbone, if loading from discovery, we might want to also load the backbone that was saved at discovery end
         # (though currently discovery only saves mc, but it's safer to check)
 
-        if Path(backbone_path).exists():
-            accelerator.print(f"loading backbone checkpoint from {backbone_path}")
-            model = Transformer.init_and_load(backbone_path, strict = False)
+        if Path(checkpoint_path).exists():
+            accelerator.print(f"loading backbone checkpoint from {checkpoint_path}")
+            model = Transformer.init_and_load(checkpoint_path, strict = False)
 
     elif discovery_phase or Path(checkpoint_path).exists():
         if Path(checkpoint_path).exists():
