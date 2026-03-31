@@ -66,6 +66,7 @@ class MetaControllerLosses(NamedTuple):
     sigreg_loss: Tensor | float
     kl_loss: Tensor | float
     next_switch_pred_loss: Tensor | float
+    control_penalty_loss: Tensor | float
 
 class MetaControllerOutput(NamedTuple):
     input_residual_stream: Tensor
@@ -78,6 +79,7 @@ class MetaControllerOutput(NamedTuple):
     latent_pred_entropy: Tensor | None
     quantile_indices: Tensor | None = None
     sigreg_loss: Tensor | float = 0.
+    control_penalty_loss: Tensor | float = 0.
 
 class GRPOOutput(NamedTuple):
     state: Tensor
@@ -181,7 +183,8 @@ class TransformerWithMetacontroller(Module):
         predict_next_switch_embed = False,
         sigreg_lambda = 0.05,
         sigreg_loss_kwargs: dict | None = None,
-        assoc_scan_kwargs: dict = dict()
+        assoc_scan_kwargs: dict = dict(),
+        control_penalty_floor = 0.5
     ):
         super().__init__()
         self.dim_model = dim
@@ -190,6 +193,7 @@ class TransformerWithMetacontroller(Module):
         self.sigreg_loss_kwargs = default(sigreg_loss_kwargs, dict(num_slices = 256))
 
         self.kl_loss_weight = kl_loss_weight
+        self.control_penalty_floor = control_penalty_floor
         self.freeze_entropy_quantiles = freeze_entropy_quantiles
 
         # embeddings
@@ -700,8 +704,18 @@ class TransformerWithMetacontroller(Module):
 
             kl_loss = masked_mean(kl_loss, mask)
 
+            control_penalty_loss = self.zero
+            valid_mask = boundary_mask & loss_mask if exists(loss_mask) else boundary_mask
+
+            if valid_mask.any():
+                res_norm = dropped_residual_stream[valid_mask].norm(dim = -1)
+                ctrl_norm = control_signal[valid_mask].norm(dim = -1)
+                ratio = res_norm / ctrl_norm.clamp(min = 1e-5)
+                control_penalty_loss = F.relu(ratio - self.control_penalty_floor).mean()
+
         else:
             kl_loss = self.zero
+            control_penalty_loss = self.zero
 
         meta_output = MetaControllerOutput(
             input_residual_stream = residual_stream,
@@ -713,7 +727,8 @@ class TransformerWithMetacontroller(Module):
             kl_loss_weight = self.kl_loss_weight,
             latent_pred_entropy = latent_pred_entropy,
             quantile_indices = quantile_indices,
-            sigreg_loss = sigreg_loss
+            sigreg_loss = sigreg_loss,
+            control_penalty_loss = control_penalty_loss
         )
 
         if not return_loss:
@@ -727,7 +742,8 @@ class TransformerWithMetacontroller(Module):
                 latent_ar_loss = latent_ar_loss,
                 sigreg_loss = sigreg_loss,
                 kl_loss = kl_loss,
-                next_switch_pred_loss = next_switch_pred_loss
+                next_switch_pred_loss = next_switch_pred_loss,
+                control_penalty_loss = control_penalty_loss
             )
 
             ret = (
