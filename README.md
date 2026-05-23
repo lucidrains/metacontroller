@@ -205,4 +205,13 @@ $ uv run pytest
 }
 ```
 
+```bibtex
+@article{kaddour2026target,
+    title   = {Target Policy Optimization},
+    author  = {Kaddour, Jean},
+    journal = {arXiv preprint arXiv:2604.06159},
+    year    = {2026}
+}
+```
+
 *Life can only be understood backwards; but it must be lived forwards* - Søren Kierkegaard

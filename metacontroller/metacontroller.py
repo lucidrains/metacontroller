@@ -236,6 +236,14 @@ def z_score(t, dim = None, eps = 1e-8):
     kwargs = dict(dim = dim, keepdim = True) if exists(dim) else dict()
     return (t - t.mean(**kwargs)) / (t.std(**kwargs) + eps)
 
+# TPO - Jean Kaddour https://arxiv.org/abs/2604.06159
+
+def tpo_target(log_scores, u, eta = 1.0):
+    return (F.log_softmax(log_scores, dim = -1) + u / eta).softmax(dim = -1)
+
+def tpo_loss(log_p, q):
+    return -einsum(q, log_p, '... k, ... k -> ...').mean()
+
 @move_inputs_to_module_device
 def policy_loss(
     meta_controller,
@@ -248,7 +256,10 @@ def policy_loss(
     eps_clip: float | tuple[float, float] = 0.2,
     switch_beta_frequency: int | None = None,
     return_kl_loss = False,
-    kl_loss_weight = 0.
+    kl_loss_weight = 0.,
+    use_tpo = False,
+    tpo_eta = 1.0,
+    tpo_group_size = None
 ):
     if exists(switch_beta_frequency):
         batch, seq_len = state.shape[:2]
@@ -269,6 +280,48 @@ def policy_loss(
         action_dist = action_dist_out
 
     new_log_probs = meta_controller.log_prob(action_dist, actions)
+
+    # masking
+
+    if mask.ndim == 3:
+        mask = rearrange(mask, 'b n 1 -> b n')
+
+    if exists(episode_lens):
+        episode_mask = lens_to_mask(episode_lens, mask.shape[1])
+        mask = mask & episode_mask
+
+    if use_tpo:
+        episode_lens_float = mask.sum(dim = 1).clamp(min = 1.).float()
+
+        advantages = advantages.flatten()
+
+        group_size = default(tpo_group_size, advantages.shape[0])
+        reshape_fn = lambda t: rearrange(t, '(b k) -> b k', k = group_size)
+
+        u = reshape_fn(advantages)
+
+        # target distribution q is computed from old log probs and detached
+
+        old_log_prob_per_step = old_log_probs.sum(dim = -1) if old_log_probs.ndim == 3 else old_log_probs
+        old_log_scores = (old_log_prob_per_step * mask).sum(dim = 1) / episode_lens_float
+
+        q = tpo_target(reshape_fn(old_log_scores), u, eta = tpo_eta).detach()
+
+        # log_p is computed from the current policy
+
+        new_log_prob_per_step = new_log_probs.sum(dim = -1) if new_log_probs.ndim == 3 else new_log_probs
+        new_log_scores = (new_log_prob_per_step * mask).sum(dim = 1) / episode_lens_float
+
+        log_p = F.log_softmax(reshape_fn(new_log_scores), dim = -1)
+
+        loss_val = tpo_loss(log_p, q)
+
+        # kl penalty not needed
+
+        if not return_kl_loss:
+            return loss_val
+
+        return loss_val, loss_val.new_tensor(0.)
 
     # calculate ratio
 
@@ -292,28 +345,19 @@ def policy_loss(
 
     losses = -torch.min(surr1, surr2)
 
-    # masking
-
-    if mask.ndim == 3:
-        mask = rearrange(mask, 'b n 1 -> b n')
-
-    if exists(episode_lens):
-        episode_mask = lens_to_mask(episode_lens, mask.shape[1])
-        mask = mask & episode_mask
-
     losses = reduce(losses, 'b n d -> b n', 'sum')
 
-    grpo_loss = masked_mean(losses, mask)
+    loss_val = masked_mean(losses, mask)
 
     if not return_kl_loss:
-        return grpo_loss
+        return loss_val
 
     if kl_loss.ndim == 3:
         kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
 
     kl_loss = masked_mean(kl_loss, mask)
 
-    return grpo_loss, kl_loss * kl_loss_weight
+    return loss_val, kl_loss * kl_loss_weight
 
 @move_inputs_to_module_device
 def ratio_loss(

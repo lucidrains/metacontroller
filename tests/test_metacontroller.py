@@ -29,13 +29,15 @@ def exists(v):
 @param('variable_length', (False, True))
 @param('normalize_state_action_losses', (False, True))
 @param('variant', (False, True))
+@param('use_tpo', (False, True))
 def test_metacontroller(
     variant,
     action_discrete,
     embed_past_actions,
     variable_length,
     accept_condition,
-    normalize_state_action_losses
+    normalize_state_action_losses,
+    use_tpo
 ):
     use_binary_mapper_variant = variant
     switching_unit_type = 'gru'
@@ -124,7 +126,7 @@ def test_metacontroller(
 
     replay_buffer = ReplayBuffer(
         test_folder,
-        max_episodes = 3,
+        max_episodes = 8,
         max_timesteps = 256,
         circular = True,
         fields = meta_controller.replay_buffer_field_dict,
@@ -141,7 +143,7 @@ def test_metacontroller(
     one_state = state[:1]
     one_condition = condition[:1] if exists(condition) else None
 
-    for _ in range(3): # group of 3
+    for _ in range(8): # group of 8
 
         cache = None
         past_action_id = None
@@ -178,7 +180,7 @@ def test_metacontroller(
     rewards = cat(all_rewards)
     group_advantages = z_score(rewards)
 
-    assert group_advantages.shape == (3,)
+    assert group_advantages.shape == (8,)
 
     # simulate a policy loss update over the entire group
 
@@ -200,7 +202,7 @@ def test_metacontroller(
             advantages = advantages
         )
 
-    dl = replay_buffer.dataloader(batch_size = 3)
+    dl = replay_buffer.dataloader(batch_size = 8)
 
     batch = next(iter(dl))
 
@@ -210,7 +212,9 @@ def test_metacontroller(
         batch['latent_actions'],
         batch['advantages'],
         batch['switch_betas'] == 1.,
-        episode_lens = batch['_lens']
+        episode_lens = batch['_lens'],
+        use_tpo = use_tpo,
+        tpo_group_size = 8
     )
 
     loss.backward()
