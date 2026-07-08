@@ -104,10 +104,10 @@ class ResidualDynamics(Module):
 
     def forward(
         self,
-        next_token_embeds = None, # (b n d)
-        curr_latent = None        # (b n d)
+        next_token_embeds, # (b n d)
+        curr_latent        # (b n d)
     ):
-        dynamics_input = cat((curr_latent, next_token_embeds), dim = -1) if exists(next_token_embeds) else curr_latent
+        dynamics_input = cat((curr_latent, next_token_embeds), dim = -1)
         return curr_latent + self.net(dynamics_input)
 
 # normalizes any action proposer to a standard interface for MetaController
@@ -1098,9 +1098,11 @@ class Transformer(Module):
         self.has_next_latent_loss = next_latent_loss_weight > 0.
         self.has_action_readout = exists(self.action_readout)
 
+        self.next_latent_prediction_action_embed, _ = EmbedAndReadout(dim, **action_embed_readout)
+
         self.dynamics_model = ResidualDynamics(
             dim = dim,
-            cond_dim = dim if exists(self.action_embed) else 0,
+            cond_dim = dim,
             hidden_dim = dynamics_hidden_dim,
             num_layers = dynamics_num_layers
         )
@@ -1383,30 +1385,19 @@ class Transformer(Module):
 
         if calc_auto_regressive_loss and (behavioral_cloning or discovery_phase):
 
-            action_embeds_for_prediction = self.action_embed(actions) if exists(self.action_embed) else None
-
-            if exists(action_embeds_for_prediction):
-                action_embeds_for_prediction = action_embeds_for_prediction.detach()
-
-            curr_latent, target_latent = attended[:, :-1], attended[:, 1:].detach()
-            mask = action_loss_mask[:, :-1] if exists(action_loss_mask) else None
-
-            if exists(action_embeds_for_prediction):
-                num_actions = action_embeds_for_prediction.shape[1]
-
-                curr_latent, target_latent = curr_latent[:, :num_actions], target_latent[:, :num_actions]
-
-                if exists(mask):
-                    mask = mask[:, :num_actions]
-
-            dynamics_out = self.dynamics_model(
-                next_token_embeds = action_embeds_for_prediction,
-                curr_latent = curr_latent
-            )
-
             next_latent_loss = self.zero
 
             if self.has_next_latent_loss:
+                action_embeds_for_prediction = self.next_latent_prediction_action_embed(actions)
+
+                curr_latent, target_latent = attended[:, :-1], attended[:, 1:].detach()
+                mask = action_loss_mask[:, :-1] if exists(action_loss_mask) else None
+
+                dynamics_out = self.dynamics_model(
+                    next_token_embeds = action_embeds_for_prediction,
+                    curr_latent = curr_latent
+                )
+
                 latent_loss_unreduced = self.next_latent_loss_fn(
                     dynamics_out,
                     target_latent

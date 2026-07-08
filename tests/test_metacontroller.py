@@ -31,6 +31,7 @@ def exists(v):
 @param('variant', (False, True))
 @param('use_tpo', (False, True))
 def test_metacontroller(
+    tmp_path,
     variant,
     action_discrete,
     embed_past_actions,
@@ -122,7 +123,7 @@ def test_metacontroller(
 
     # replay buffer
 
-    test_folder = './test-buffer-for-grpo'
+    test_folder = str(tmp_path / 'test-buffer-for-grpo')
 
     replay_buffer = ReplayBuffer(
         test_folder,
@@ -226,17 +227,16 @@ def test_metacontroller(
 
     # saving and loading
 
-    meta_controller.save('./meta_controller.pt')
+    mc_path = str(tmp_path / 'meta_controller.pt')
+    meta_controller.save(mc_path)
 
     meta_controller_klass = meta_controller.__class__
-    rehydrated_meta_controller = meta_controller_klass.init_and_load('./meta_controller.pt')
+    rehydrated_meta_controller = meta_controller_klass.init_and_load(mc_path)
 
-    model.save('./trained.pt')
+    model_path = str(tmp_path / 'trained.pt')
+    model.save(model_path)
 
-    rehydrated_model = Transformer.init_and_load('./trained.pt', strict = False)
-
-    Path('./meta_controller.pt').unlink()
-    Path('./trained.pt').unlink()
+    rehydrated_model = Transformer.init_and_load(model_path, strict = False)
 
     rmtree(test_folder, ignore_errors = True)
 
@@ -663,3 +663,47 @@ def test_compact_sequence_embedder():
     expected0 = repeat(h[-1], '1 d -> n d', n = seq_len)
 
     assert torch.allclose(out[0], expected0, atol = 1e-6)
+
+def test_disable_next_latent_loss():
+    transformer = Transformer(
+        dim = 256,
+        state_embed_readout = dict(num_continuous = 8),
+        action_embed_readout = dict(num_continuous = 2),
+        next_latent_loss_weight = 0.,
+        lower_body = dict(depth = 2),
+        upper_body = dict(depth = 2)
+    )
+
+    states = torch.randn(2, 5, 8)
+    actions = torch.randn(2, 5, 2)
+
+    state_loss, action_loss = transformer(
+        states,
+        actions = actions,
+        force_behavior_cloning = True
+    )
+
+    assert exists(state_loss)
+    assert exists(action_loss)
+
+def test_enable_next_latent_loss():
+    transformer = Transformer(
+        dim = 256,
+        state_embed_readout = dict(num_continuous = 8),
+        action_embed_readout = dict(num_continuous = 2),
+        next_latent_loss_weight = 1.,
+        lower_body = dict(depth = 2),
+        upper_body = dict(depth = 2)
+    )
+
+    states = torch.randn(2, 5, 8)
+    actions = torch.randn(2, 5, 2)
+
+    state_loss, action_loss = transformer(
+        states,
+        actions = actions,
+        force_behavior_cloning = True
+    )
+
+    assert exists(state_loss)
+    assert exists(action_loss)
