@@ -10,6 +10,11 @@ from metacontroller.simple_metacontroller import (
     z_score
 )
 
+# helpers
+
+def exists(v):
+    return v is not None
+
 # constants
 
 MODEL_KWARGS = dict(
@@ -123,13 +128,14 @@ def test_grpo_parity():
 
                 grpo_data_list.append(extract_grpo_data(model, meta_output))
 
-            states, latent_actions, log_probs, switch_betas = zip(*grpo_data_list)
+            states, latent_actions, log_probs, switch_betas, quantile_indices = zip(*grpo_data_list)
 
             all_episodes.append((
                 cat(states, dim = 1),
                 cat(log_probs, dim = 1),
                 cat(switch_betas, dim = 1),
-                cat(latent_actions, dim = 1)
+                cat(latent_actions, dim = 1),
+                cat(quantile_indices, dim = 1) if exists(quantile_indices[0]) else None
             ))
 
             all_rewards.append(torch.randn(1))
@@ -139,18 +145,19 @@ def test_grpo_parity():
     rewards = cat(all_rewards)
     group_advantages = z_score(rewards)
 
-    list_states, list_log_probs, list_switch_betas, list_latent_actions = zip(*all_episodes)
+    list_states, list_log_probs, list_switch_betas, list_latent_actions, list_quantile_indices = zip(*all_episodes)
 
     group_states = pad_sequence_and_cat(list_states, dim_cat = 0, dim = 1, value = 0.)
     group_log_probs = pad_sequence_and_cat(list_log_probs, dim_cat = 0, dim = 1, value = 0.)
     group_latent_actions = pad_sequence_and_cat(list_latent_actions, dim_cat = 0, dim = 1, value = 0.)
     group_switch_betas = pad_sequence_and_cat(list_switch_betas, dim_cat = 0, dim = 1, value = 0.)
+    group_quantile_indices = pad_sequence_and_cat(list_quantile_indices, dim_cat = 0, dim = 1, value = 0) if exists(list_quantile_indices[0]) else None
 
     group_episode_lens = torch.tensor(all_episode_lens) - 1
 
     # verify parallel log probs match sequential within valid lengths
 
-    parallel_action_dist = model.get_action_dist_for_internal_rl(group_states, switch_betas = group_switch_betas)
+    parallel_action_dist = model.get_action_dist_for_internal_rl(group_states, switch_betas = group_switch_betas, quantile_indices = group_quantile_indices)
     parallel_log_probs = model.log_prob(parallel_action_dist, group_latent_actions)
 
     for i, ep_len in enumerate(group_episode_lens):
@@ -169,34 +176,46 @@ def test_grpo_parity():
         group_latent_actions,
         group_advantages,
         switch_betas = group_switch_betas,
-        episode_lens = group_episode_lens
+        episode_lens = group_episode_lens,
+        quantile_indices = group_quantile_indices
     )
 
     loss.backward()
 
 def test_switch_entropy_quantile():
     model = TransformerWithMetacontroller(
-        **{**MODEL_KWARGS, 'switch_entropy_quantile': 0.9, 'switch_entropy_quantile_lr': 0.1}
+        **dict(
+            MODEL_KWARGS,
+            switch_entropy_quantiles = (0.9,),
+            eval_switch_entropy_quantile = 0.9,
+            switch_entropy_quantile_lr = 0.1
+        )
     )
 
     assert not hasattr(model, 'to_queries_keys')
     assert not hasattr(model, 'start_key_token')
-    assert hasattr(model, 'running_entropy_quantile')
+    assert hasattr(model, 'running_entropy_quantiles')
 
-    batch_size = 2
-    seq_len = 16
+    one_state = torch.randint(0, 256, (1, 16))
+    actions = torch.randint(0, 256, (1, 16))
 
-    state = torch.randint(0, 256, (batch_size, seq_len))
-    actions = torch.randint(0, 256, (batch_size, seq_len))
+    for _ in range(3):
+        model.eval()
+
+        _ = model(
+            state = one_state,
+            actions = actions,
+            return_loss = False
+        )
+
+    assert model.running_entropy_quantiles[0].item() == 10.
 
     model.train()
-    assert model.running_entropy_quantile.item() == 10.
 
-    _, meta_output = model(
-        state = state,
+    _ = model(
+        state = one_state,
         actions = actions,
-        return_loss = True
+        return_loss = False
     )
 
-    # the quantile tracker should update based on initialized values and shift
-    assert model.running_entropy_quantile.item() != 10.
+    assert model.running_entropy_quantiles[0].item() != 10.

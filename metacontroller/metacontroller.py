@@ -26,14 +26,14 @@ from x_transformers.x_transformers import PolarEmbedding, Identity
 
 # sequential selection moved to separate module
 
-from x_mlps_pytorch import Feedforwards
+from x_mlps_pytorch import Feedforwards, create_mlp
 from x_evolution import EvoStrategy
 
 from discrete_continuous_embed_readout import Embed, Readout, EmbedAndReadout
 
 from assoc_scan import AssocScan
 
-from torch_einops_utils import maybe, pad_left_at_dim, pad_at_dim, lens_to_mask, masked_mean, align_dims_left
+from torch_einops_utils import maybe, pad_left_at_dim, pad_right_at_dim, pad_at_dim, lens_to_mask, masked_mean, align_dims_left, exclusive_cumsum, pack_with_inverse
 from torch_einops_utils.device import module_device, move_inputs_to_module_device
 from torch_einops_utils.save_load import save_load
 
@@ -71,7 +71,45 @@ def binary_entropy(p):
 def straight_through(src, tgt):
     return tgt + src - src.detach()
 
-# action proposer wrapper
+def l2norm(t, dim = -1):
+    return F.normalize(t, p = 2, dim = dim)
+
+# next latent prediction - residual dynamics network
+
+class ResidualDynamics(Module):
+    def __init__(
+        self,
+        dim,
+        cond_dim = None,
+        hidden_dim = None,
+        num_layers = 3
+    ):
+        super().__init__()
+        hidden_dim = default(hidden_dim, dim)
+        cond_dim = default(cond_dim, dim)
+
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim + cond_dim),
+            create_mlp(
+                dim = hidden_dim,
+                depth = num_layers,
+                dim_in = dim + cond_dim,
+                dim_out = dim
+            )
+        )
+
+        last_linear = self.net[-1].layers[-1]
+        nn.init.zeros_(last_linear.weight)
+        nn.init.zeros_(last_linear.bias)
+
+    def forward(
+        self,
+        next_token_embeds = None, # (b n d)
+        curr_latent = None        # (b n d)
+    ):
+        dynamics_input = cat((curr_latent, next_token_embeds), dim = -1) if exists(next_token_embeds) else curr_latent
+        return curr_latent + self.net(dynamics_input)
+
 # normalizes any action proposer to a standard interface for MetaController
 
 @save_load()
@@ -984,12 +1022,14 @@ class Transformer(Module):
         upper_body: Decoder | dict,
         meta_controller: MetaController | None = None,
         dim_condition = None,
-        state_loss_detach_target_state = True,
         embed_past_actions = True,
         normalize_state_action_losses = False,
         loss_normalizer_beta = 0.999,
         lower_transformer_post_norm = False,
-        discovery_phase_state_clone_loss = False
+        discovery_phase_state_clone_loss = False,
+        dynamics_hidden_dim = None,
+        dynamics_num_layers = 3,
+        next_latent_loss_weight = 1.0
     ):
         super().__init__()
 
@@ -1050,9 +1090,22 @@ class Transformer(Module):
 
         self.meta_controller = meta_controller
 
-        # detaching the target state for the state loss - for the visual encoder based latent state ar prediction
+        # next latent prediction related - https://arxiv.org/abs/2511.05963
 
-        self.state_loss_detach_target_state = state_loss_detach_target_state
+        self.next_latent_loss_fn = nn.SmoothL1Loss(reduction = 'none')
+        self.next_latent_loss_weight = next_latent_loss_weight
+
+        self.has_next_latent_loss = next_latent_loss_weight > 0.
+        self.has_action_readout = exists(self.action_readout)
+
+        self.dynamics_model = ResidualDynamics(
+            dim = dim,
+            cond_dim = dim if exists(self.action_embed) else 0,
+            hidden_dim = dynamics_hidden_dim,
+            num_layers = dynamics_num_layers
+        )
+
+        # aux default loss
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -1179,7 +1232,7 @@ class Transformer(Module):
         return_raw_action_dist = False,
         return_latents = False,
         return_cache = False,
-        return_state_action_cache = False,
+        return_action_cache = False,
         episode_lens: Tensor | None = None,
         return_meta_controller_output = False,
         return_residual_stream = False,
@@ -1237,11 +1290,6 @@ class Transformer(Module):
 
             assert exists(actions), f'`actions` cannot be empty when doing discovery or behavioral cloning'
 
-            state, target_state = state, state[:, 1:]
-
-            if self.state_loss_detach_target_state:
-                target_state = target_state.detach().clone()
-
             # actions
 
             target_actions = actions
@@ -1251,13 +1299,10 @@ class Transformer(Module):
 
             # masking
 
-            state_loss_mask = None
             action_loss_mask = None
 
             if exists(episode_lens):
                 loss_mask = lens_to_mask(episode_lens, state.shape[1])
-
-                state_loss_mask = loss_mask[:, :-1]
                 action_loss_mask = loss_mask
 
         # transformer lower body
@@ -1332,21 +1377,54 @@ class Transformer(Module):
 
             dist_params = self.action_readout(attended)
 
-        # if behavior or discovery, calculate state prediction
+        # latent for returning
 
-        if behavioral_cloning or discovery_phase:
-            state_dist_params = self.state_readout(attended[:, :-1])
+        latent = attended
+
+        if calc_auto_regressive_loss and (behavioral_cloning or discovery_phase):
+
+            action_embeds_for_prediction = self.action_embed(actions) if exists(self.action_embed) else None
+
+            if exists(action_embeds_for_prediction):
+                action_embeds_for_prediction = action_embeds_for_prediction.detach()
+
+            curr_latent, target_latent = attended[:, :-1], attended[:, 1:].detach()
+            mask = action_loss_mask[:, :-1] if exists(action_loss_mask) else None
+
+            if exists(action_embeds_for_prediction):
+                num_actions = action_embeds_for_prediction.shape[1]
+
+                curr_latent, target_latent = curr_latent[:, :num_actions], target_latent[:, :num_actions]
+
+                if exists(mask):
+                    mask = mask[:, :num_actions]
+
+            dynamics_out = self.dynamics_model(
+                next_token_embeds = action_embeds_for_prediction,
+                curr_latent = curr_latent
+            )
+
+            next_latent_loss = self.zero
+
+            if self.has_next_latent_loss:
+                latent_loss_unreduced = self.next_latent_loss_fn(
+                    dynamics_out,
+                    target_latent
+                )
+
+                next_latent_loss = masked_mean(latent_loss_unreduced, mask)
+
+            total_loss = next_latent_loss * self.next_latent_loss_weight
 
         # caching related
 
         next_cache_steps = cache_steps + seq_len
         return_cache_value = TransformerOutput(residual_stream, Hiddens(next_lower_hiddens, next_meta_hiddens, next_upper_hiddens), next_cache_steps)
 
-        # maybe early return action and state dist with cache, for char lm
-        # cleanup all the returns later
+        # maybe early return action dist with cache
 
-        if return_state_action_cache:
-            return (dist_params, state_dist_params), return_cache_value
+        if return_action_cache:
+            return dist_params, return_cache_value
 
         # maybe return behavior cloning loss
 
@@ -1354,7 +1432,7 @@ class Transformer(Module):
 
             # state
 
-            state_clone_loss = self.state_readout.calculate_loss(state_dist_params, target_state, mask = state_loss_mask)
+            state_clone_loss = self.next_latent_loss_weight * next_latent_loss
 
             # action
 
@@ -1383,7 +1461,7 @@ class Transformer(Module):
             state_clone_loss = self.zero
 
             if self.discovery_phase_state_clone_loss:
-                state_clone_loss = self.state_readout.calculate_loss(state_dist_params, target_state, mask = state_loss_mask)
+                state_clone_loss = self.next_latent_loss_weight * next_latent_loss
 
             # action
 
@@ -1394,6 +1472,7 @@ class Transformer(Module):
             if self.normalize_state_action_losses:
                 if self.discovery_phase_state_clone_loss:
                     state_clone_loss = self.discovery_state_loss_normalizer(state_clone_loss, update_ema = update_loss_ema)
+
                 action_recon_loss = self.discovery_action_loss_normalizer(action_recon_loss, update_ema = update_loss_ema)
 
             losses = DiscoveryLosses(state_clone_loss, action_recon_loss, next_meta_hiddens.kl_loss, next_meta_hiddens.ratio_loss)

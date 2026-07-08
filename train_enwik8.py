@@ -153,11 +153,11 @@ def sample(
     state = prompt
     action = prompt[:, 1:]
 
-    (action_dist, _), cache = model(
+    action_dist, cache = model(
         state = state,
         actions = action,
         return_cache = True,
-        return_state_action_cache = True,
+        return_action_cache = True,
         force_behavior_cloning = force_behavior_cloning,
         meta_controller = meta_controller
     )
@@ -168,11 +168,12 @@ def sample(
     state = torch.cat((state, next_state), dim = -1)
 
     for _ in range(sample_num_times):
-        (action_dist, _), next_cache = model(
+        action_dist, next_cache = model(
             state = state[:, -1:],
             actions = state[:, -1:],
             cache = cache,
-            return_state_action_cache = True,
+            return_cache = True,
+            return_action_cache = True,
             force_behavior_cloning = force_behavior_cloning,
             meta_controller = meta_controller
         )
