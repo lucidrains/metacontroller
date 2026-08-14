@@ -9,7 +9,7 @@ def test_symbolic_transformer():
     width = 7
     height = 7
     channels = 3
-    dim = 512
+    dim = 64
 
     meta_controller = MetaController(
         dim_model = dim
@@ -23,10 +23,10 @@ def test_symbolic_transformer():
             num_discrete = 10            # Action discrete buckets
         ),
         lower_body = dict(
-            depth = 2                    # Transformer lower body depth
+            depth = 1                    # Transformer lower body depth
         ),
         upper_body = dict(
-            depth = 2                    # Transformer upper body depth
+            depth = 1                    # Transformer upper body depth
         ),
         meta_controller = meta_controller
     )

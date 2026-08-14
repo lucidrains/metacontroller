@@ -27,7 +27,7 @@ from torch import nn, Tensor, tensor
 from torch.nn import Module
 from einops import rearrange
 
-from babyai_env import create_env, get_mission_embedding
+from babyai_env import create_env, get_mission_embedding, fix_symbolic_image
 from metacontroller.metacontroller import Transformer, MetaController
 from torch_einops_utils.device import module_device
 
@@ -68,7 +68,12 @@ class BabyAIEnvironment(Module):
         use_resnet = False,
         condition_on_mission_embed = False,
         fitness_fn = default_fitness_fn,
-        accelerator: Accelerator | None = None
+        accelerator: Accelerator | None = None,
+        # the gathered dataset maps empty cells to 1 (uint8 cannot hold -1), while
+        # SymbolicObsWrapper emits -1 - normalize to match BC inputs. this is a
+        # judgement call: if the BC model was trained on raw -1 states, enabling
+        # this shifts the input distribution and could hurt - set to False to compare
+        normalize_symbolic_states = True,
     ):
         super().__init__()
         self.accelerator = accelerator
@@ -80,6 +85,7 @@ class BabyAIEnvironment(Module):
         self.use_resnet = use_resnet
         self.condition_on_mission_embed = condition_on_mission_embed
         self.fitness_fn = fitness_fn
+        self.normalize_symbolic_states = normalize_symbolic_states
 
         # initial env creation for observation space etc. if needed
         self.env = create_env(
@@ -116,6 +122,10 @@ class BabyAIEnvironment(Module):
 
         while step < self.max_steps:
             image = state['image']
+
+            if self.normalize_symbolic_states:
+                image = fix_symbolic_image(image)
+
             image_tensor = torch.from_numpy(image).float().to(device)
 
             if self.use_resnet:

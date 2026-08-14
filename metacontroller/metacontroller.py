@@ -930,6 +930,8 @@ class MetaController(Module):
                 else:
                     switch_beta_for_gate = hard_switch_beta
 
+                switch_beta = switch_beta_for_gate # return the gating beta, consistent with the parallel path
+
             # associative scan
 
             forget_gate = 1. - switch_beta_for_gate

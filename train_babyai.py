@@ -38,7 +38,7 @@ from gymnasium.vector import AsyncVectorEnv
 from babyai_env import (
     create_env,
     get_missions_embeddings,
-    transform_to_symbolic
+    fix_symbolic_image
 )
 
 from memmap_replay_buffer import ReplayBuffer
@@ -110,7 +110,12 @@ def main(
     condition_on_mission_embed = False,
     num_envs = 1,
     env_shared_memory = False,
-    env_context = 'spawn'
+    env_context = 'spawn',
+    # the gathered dataset maps empty cells to 1 (uint8 cannot hold -1), while
+    # SymbolicObsWrapper emits -1 - normalize to match BC inputs. this is a
+    # judgement call: if the BC model was trained on raw -1 states, enabling
+    # this shifts the input distribution and could hurt - set to False to compare
+    normalize_symbolic_states = True,
 ):
 
     def store_checkpoint(step:int):
@@ -161,7 +166,7 @@ def main(
         render_mode = 'rgb_array',
         video_folder = video_folder,
         render_every_eps = render_every_eps,
-        use_symbolic = False
+        use_symbolic = True
     )
 
     env = AsyncVectorEnv([env_make_fn] * num_envs, shared_memory = env_shared_memory, context = env_context)
@@ -245,7 +250,9 @@ def main(
         for _ in range(num_rollout_iterations):
 
             state, _ = env.reset(seed = env_seeds)
-            state['image'] = transform_to_symbolic(state['image'])
+
+            if normalize_symbolic_states:
+                state['image'] = fix_symbolic_image(state['image'])
 
             if condition_on_mission_embed:
                 missions = env.get_attr('mission')
@@ -304,7 +311,9 @@ def main(
                 iteration_latent_actions.append(grpo_data.action)
 
                 next_state, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
-                next_state['image'] = transform_to_symbolic(next_state['image'])
+
+                if normalize_symbolic_states:
+                    next_state['image'] = fix_symbolic_image(next_state['image'])
 
                 reward_tensor = torch.from_numpy(reward).float().to(accelerator.device)
                 iteration_rewards.append(rearrange(reward_tensor, 'b -> b 1'))
@@ -415,7 +424,7 @@ def main(
                         batch['log_probs'],
                         batch['latent_actions'],
                         batch['advantages'],
-                        batch['switch_betas'] == 1.,
+                        batch['switch_betas'] > 0.5,
                         episode_lens = batch['_lens']
                     )
 

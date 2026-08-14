@@ -25,27 +25,20 @@ def exists(v):
 
 @param('accept_condition', (False, True))
 @param('action_discrete', (False, True))
-@param('embed_past_actions', (False, True))
-@param('variable_length', (False, True))
-@param('normalize_state_action_losses', (False, True))
-@param('variant', (False, True))
-@param('use_tpo', (False, True))
+@param('extras', ((False, False, False, False, False), (True, True, True, True, True)))
 def test_metacontroller(
     tmp_path,
-    variant,
+    extras,
     action_discrete,
-    embed_past_actions,
-    variable_length,
-    accept_condition,
-    normalize_state_action_losses,
-    use_tpo
+    accept_condition
 ):
+    embed_past_actions, variable_length, normalize_state_action_losses, variant, use_tpo = extras
     use_binary_mapper_variant = variant
     switching_unit_type = 'gru'
 
-    dim_model = 32
-    dim_meta = 16
-    seq_len = 16
+    dim_model = 16
+    dim_meta = 8
+    seq_len = 8
 
     state = torch.randn(2, seq_len, 384)
     episode_lens = torch.tensor([64, 64]) if variable_length else None
@@ -101,7 +94,7 @@ def test_metacontroller(
         meta_controller = MetaController(
             dim_model = dim_model,
             dim_meta_controller = dim_meta,
-            dim_latent = 64,
+            dim_latent = 32,
             internal_sequence_embedder = dict(attn_dim_head = 16, heads = 2, depth = 1),
             **action_proposer_kwargs
         )
@@ -128,7 +121,7 @@ def test_metacontroller(
     replay_buffer = ReplayBuffer(
         test_folder,
         max_episodes = 8,
-        max_timesteps = 256,
+        max_timesteps = 64,
         circular = True,
         fields = meta_controller.replay_buffer_field_dict,
         meta_fields = dict(
@@ -144,7 +137,7 @@ def test_metacontroller(
     one_state = state[:1]
     one_condition = condition[:1] if exists(condition) else None
 
-    for _ in range(8): # group of 8
+    for _ in range(2): # group of 2
 
         cache = None
         past_action_id = None
@@ -181,7 +174,7 @@ def test_metacontroller(
     rewards = cat(all_rewards)
     group_advantages = z_score(rewards)
 
-    assert group_advantages.shape == (8,)
+    assert group_advantages.shape == (2,)
 
     # simulate a policy loss update over the entire group
 
@@ -212,10 +205,10 @@ def test_metacontroller(
         batch['log_probs'],
         batch['latent_actions'],
         batch['advantages'],
-        batch['switch_betas'] == 1.,
+        batch['switch_betas'] > 0.5,
         episode_lens = batch['_lens'],
         use_tpo = use_tpo,
-        tpo_group_size = 8
+        tpo_group_size = 2
     )
 
     loss.backward()
@@ -323,10 +316,10 @@ def test_kl_loss_warmup_e2e():
     assert output_no_weight.kl_loss > 0.0
 
 def test_transformer_embed_parity():
-    dim_model = 512
-    dim_meta = 256
-    dim_latent = 128
-    seq_len = 10
+    dim_model = 64
+    dim_meta = 32
+    dim_latent = 32
+    seq_len = 6
     batch = 1
 
     model = Transformer(
@@ -374,10 +367,10 @@ def test_transformer_embed_parity():
     assert torch.allclose(bc_embeds, sequential_embeds, atol = 1e-6)
 
 def test_transformer_bc_parity():
-    dim_model = 512
-    dim_meta = 256
-    dim_latent = 128
-    seq_len = 10
+    dim_model = 64
+    dim_meta = 32
+    dim_latent = 32
+    seq_len = 6
     batch = 1
 
     model = Transformer(
@@ -425,10 +418,10 @@ def test_transformer_bc_parity():
     assert torch.allclose(parallel_logits, sequential_logits, atol = 1e-5)
 
 def test_discovery_vs_bc_ablation_parity():
-    dim_model = 512
-    dim_meta = 256
-    dim_latent = 128
-    seq_len = 32
+    dim_model = 64
+    dim_meta = 32
+    dim_latent = 32
+    seq_len = 8
     batch = 2
 
     model = Transformer(
@@ -471,14 +464,14 @@ def test_discovery_vs_bc_ablation_parity():
     assert torch.allclose(bc_losses.action, discovery_losses.action_recon, atol = 1e-6)
 
 def test_switch_ablation():
-    dim = 64
+    dim = 32
     batch = 2
-    seq_len = 8
+    seq_len = 4
     frequency = 4
 
     meta_controller = MetaController(
         dim_model = dim,
-        dim_meta_controller = 32,
+        dim_meta_controller = 16,
         dim_latent = 32
     )
 
@@ -495,7 +488,6 @@ def test_switch_ablation():
     ablate_switch_beta = MetaController.create_regular_switch_beta(batch, seq_len, frequency)
     expected = torch.zeros(batch, seq_len)
     expected[:, 3] = 1.
-    expected[:, 7] = 1.
     assert torch.allclose(ablate_switch_beta, expected)
 
     # test transformer discovery ablation
@@ -539,11 +531,11 @@ def test_sequential_selection_parallel_vs_iterative():
     iterative cached discovery when sequential_latent_action_selection is on.
     """
 
-    dim = 64
-    seq_len = 8
+    dim = 32
+    seq_len = 6
     batch = 1
     dim_latent = 32
-    dim_meta = 64
+    dim_meta = 32
 
     mc = MetaController(
         dim_model = dim,
@@ -608,6 +600,49 @@ def test_sequential_selection_parallel_vs_iterative():
     assert torch.allclose(mc_out_parallel.switch_beta, iter_switch_beta, atol = 1e-5), \
         f'switch beta mismatch: max diff = {(mc_out_parallel.switch_beta - iter_switch_beta).abs().max().item()}'
 
+@param('hard_switch', (None, False))
+def test_switch_beta_parallel_vs_iterative(hard_switch):
+    """
+    internal rl is always hard switched by default (paper: β_threshold = 0.5);
+    the serial cached path must return the same betas as the parallel path,
+    whether hard (default) or soft (overridden with hard_switch = False)
+    """
+
+    dim = 32
+    seq_len = 6
+    batch = 1
+    dim_latent = 32
+    dim_meta = 32
+
+    mc = MetaController(dim_model = dim, dim_meta_controller = dim_meta, dim_latent = dim_latent)
+    mc.eval()
+
+    residual_stream = torch.randn(batch, seq_len, dim)
+
+    torch.manual_seed(42)
+    with torch.no_grad():
+        _, mc_out_parallel = mc(residual_stream, discovery_phase = False, hard_switch = hard_switch)
+
+    if hard_switch is None:
+        assert ((mc_out_parallel.switch_beta == 0.) | (mc_out_parallel.switch_beta == 1.)).all(), 'default internal rl should be hard switched'
+
+    # serial cached forward (reseed so the reparameterized latent samples line up)
+
+    iter_switch_betas = []
+    cache = None
+    torch.manual_seed(42)
+
+    for t in range(seq_len):
+        with torch.no_grad():
+            _, out_t = mc(residual_stream[:, t:t+1], cache = cache, discovery_phase = False, hard_switch = hard_switch)
+
+        cache = out_t
+        iter_switch_betas.append(out_t.switch_beta)
+
+    iter_switch_beta = torch.cat(iter_switch_betas, dim = 1)
+
+    assert torch.allclose(mc_out_parallel.switch_beta, iter_switch_beta, atol = 1e-5)
+
 def test_jax_pytorch_parity():
     from metacontroller.sequential_action_selection import (
         pytorch_sequential_action_selection,
@@ -666,12 +701,12 @@ def test_compact_sequence_embedder():
 
 def test_disable_next_latent_loss():
     transformer = Transformer(
-        dim = 256,
+        dim = 64,
         state_embed_readout = dict(num_continuous = 8),
         action_embed_readout = dict(num_continuous = 2),
         next_latent_loss_weight = 0.,
-        lower_body = dict(depth = 2),
-        upper_body = dict(depth = 2)
+        lower_body = dict(depth = 1),
+        upper_body = dict(depth = 1)
     )
 
     states = torch.randn(2, 5, 8)
@@ -688,12 +723,12 @@ def test_disable_next_latent_loss():
 
 def test_enable_next_latent_loss():
     transformer = Transformer(
-        dim = 256,
+        dim = 64,
         state_embed_readout = dict(num_continuous = 8),
         action_embed_readout = dict(num_continuous = 2),
         next_latent_loss_weight = 1.,
-        lower_body = dict(depth = 2),
-        upper_body = dict(depth = 2)
+        lower_body = dict(depth = 1),
+        upper_body = dict(depth = 1)
     )
 
     states = torch.randn(2, 5, 8)

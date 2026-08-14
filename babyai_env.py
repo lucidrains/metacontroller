@@ -11,6 +11,7 @@ from gymnasium.core import Wrapper
 
 import minigrid
 from minigrid.wrappers import SymbolicObsWrapper, RGBImgPartialObsWrapper
+from minigrid.core.constants import OBJECT_TO_IDX
 
 from sentence_transformers import SentenceTransformer
 
@@ -134,6 +135,15 @@ def transform_to_symbolic(images):
     symbolic[..., 2] = np.where(images[..., 0] == 1, -1, images[..., 0]) # map empty (1) to -1
 
     return symbolic
+
+def fix_symbolic_image(images):
+    # SymbolicObsWrapper uses -1 (255 when overflowed to uint8) for empty cells;
+    # map to "empty" (1) to match the gathered dataset
+
+    images = np.array(images, copy = True)
+    obj_type_channel = images[..., 2]
+    obj_type_channel[(obj_type_channel == -1) | (obj_type_channel > max(OBJECT_TO_IDX.values()))] = OBJECT_TO_IDX['empty']
+    return images
 
 # env creation
 

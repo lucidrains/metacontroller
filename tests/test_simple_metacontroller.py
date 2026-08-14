@@ -18,7 +18,7 @@ def exists(v):
 # constants
 
 MODEL_KWARGS = dict(
-    dim = 128,
+    dim = 64,
     state_embed_readout = dict(num_discrete = 256),
     action_embed_readout = dict(num_discrete = 256),
     dim_code_bits = 8,
@@ -38,7 +38,7 @@ def test_caching_parity():
     model.eval()
 
     batch_size = 2
-    seq_len = 16
+    seq_len = 8
 
     with torch.no_grad():
         x = torch.randint(0, 256, (batch_size, seq_len))
@@ -95,8 +95,8 @@ def test_caching_parity():
         assert torch.allclose(meta_output_parallel.latent_pred_entropy, latent_pred_entropies_seq, atol = 1e-5)
 
 def test_grpo_parity():
-    seq_len = 16
-    num_rollouts = 3
+    seq_len = 8
+    num_rollouts = 2
 
     model = TransformerWithMetacontroller(**MODEL_KWARGS)
 
@@ -196,8 +196,8 @@ def test_switch_entropy_quantile():
     assert not hasattr(model, 'start_key_token')
     assert hasattr(model, 'running_entropy_quantiles')
 
-    one_state = torch.randint(0, 256, (1, 16))
-    actions = torch.randint(0, 256, (1, 16))
+    one_state = torch.randint(0, 256, (1, 8))
+    actions = torch.randint(0, 256, (1, 8))
 
     for _ in range(3):
         model.eval()

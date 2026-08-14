@@ -41,6 +41,7 @@ from accelerate import Accelerator
 from babyai_env import (
     create_env,
     get_missions_embeddings,
+    fix_symbolic_image,
 )
 import gymnasium as gym
 from gymnasium.vector import AsyncVectorEnv
@@ -111,6 +112,7 @@ def visualize_eval_trajectory(
     use_wandb: bool = False,
     accelerator = None,
     condition_on_mission_embed: bool = False,
+    normalize_symbolic_states: bool = True,
     fps: int = 4,
 ):
     device = accelerator.device if exists(accelerator) else 'cpu'
@@ -135,7 +137,12 @@ def visualize_eval_trajectory(
     for step in range(max_timesteps):
         rgb_frame = env.render()  # full RGB view (H, W, 3) uint8
 
-        image_tensor = torch.from_numpy(state['image']).float().unsqueeze(0).to(device)
+        image = state['image']
+
+        if modality == MODALITY_SYMBOLIC and normalize_symbolic_states:
+            image = fix_symbolic_image(image)
+
+        image_tensor = torch.from_numpy(image).float().unsqueeze(0).to(device)
 
         if modality == MODALITY_RESNET_RGB:
             image_tensor = torch.clamp(image_tensor / 255.0, min=0.0, max=1.0)
@@ -307,10 +314,16 @@ def main(
     condition_on_mission_embed = False,
     use_binary_mapper = False,
     env_shared_memory = True,
-    env_context = 'fork'
+    env_context = 'fork',
+    # the gathered dataset maps empty cells to 1 (uint8 cannot hold -1), while
+    # SymbolicObsWrapper emits -1 - normalize to match BC inputs. this is a
+    # judgement call: if the BC model was trained on raw -1 states, enabling
+    # this shifts the input distribution and could hurt - set to False to compare
+    normalize_symbolic_states = True,
 ):
 
-    torch.manual_seed(456)
+    if exists(seed):
+        torch.manual_seed(seed)
 
     if not exists(max_grad_norm): max_grad_norm = float('inf')
 
@@ -437,6 +450,10 @@ def main(
         for step in range(max_timesteps):
             # state['image']: (batch_size, H, W, C)
             image = state['image']
+
+            if modality == MODALITY_SYMBOLIC and normalize_symbolic_states:
+                image = fix_symbolic_image(image)
+
             image_tensor = torch.from_numpy(image).float().to(accelerator.device)
 
             # rgb -> norm and multichannel, ready for resnet
@@ -638,6 +655,7 @@ def main(
                 use_wandb = use_wandb,
                 accelerator = accelerator,
                 condition_on_mission_embed = condition_on_mission_embed,
+                normalize_symbolic_states = normalize_symbolic_states,
             )
 
     env.close()
