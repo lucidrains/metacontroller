@@ -84,6 +84,14 @@ def categorical_entropy_loss(probs, mask = None, sample_entropy_weight = 0.1):
     mean_probs = reduce(active, 'n k -> k', 'mean')
     return -categorical_entropy(mean_probs) + sample_entropy_weight * categorical_entropy(active).mean()
 
+def normalized_categorical_mi(probs):
+    num_classes = probs.shape[-1]
+    if num_classes <= 1 or probs.shape[-2] <= 1:
+        return probs.sum() * 0.
+    marginal = probs.mean(dim = -2)
+    mi = categorical_entropy(marginal) - categorical_entropy(probs).mean(dim = -1)
+    return mi.mean() / float(torch.tensor(num_classes, dtype = probs.dtype, device = probs.device).log())
+
 def sample_straight_through(
     probs,
     hard_prob = 0.5,
@@ -362,8 +370,9 @@ MetaControllerOutput = namedtuple('MetaControllerOutput', (
     'switch_beta',
     'kl_loss',
     'kl_loss_weight',
-    'ratio_loss'
-))
+    'ratio_loss',
+    'gated_actions'
+), defaults = (None,))
 
 GRPOOutput = namedtuple('GRPOOutput', (
     'state',
@@ -636,7 +645,8 @@ def reduce_discovery_samples(
         prev_hiddens = (prev_summarized, prev_proposer_hidden, select(switch_hidden, dim = 1), select(switch_gated)),
         actions = select(sampled_actions),
         switch_beta = select(switch_beta),
-        ratio_loss = ratio_loss
+        ratio_loss = ratio_loss,
+        gated_actions = select(meta_output.gated_actions)
     )
 
     return losses, reduced_meta_output
@@ -1227,7 +1237,7 @@ class MetaController(Module):
             next_switch_gated_action
         )
 
-        return control_signal, MetaControllerOutput(next_hiddens, input_residual_stream, action_dist, sampled_latent_action, switch_beta, kl_loss, kl_loss_weight, aux_ratio_loss)
+        return control_signal, MetaControllerOutput(next_hiddens, input_residual_stream, action_dist, sampled_latent_action, switch_beta, kl_loss, kl_loss_weight, aux_ratio_loss, gated_action)
 
 MetaController.policy_loss = policy_loss
 MetaController.ratio_loss = ratio_loss

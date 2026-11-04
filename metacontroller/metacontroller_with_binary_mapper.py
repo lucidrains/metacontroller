@@ -286,6 +286,24 @@ class MetaControllerWithBinaryMapper(Module):
             *self.switch_gating.parameters()
         ]
 
+    def discovery_parameters_switching_unit(self):
+        return [
+            *self.switching_unit.parameters()
+        ]
+
+    def discovery_parameters_non_switching(self):
+        return [
+            *self.summary_gru.parameters(),
+            *self.model_to_meta.parameters(),
+            *self.internal_sequence_embedder.parameters(),
+            *self.to_sequence_summary_embed.parameters(),
+            *self.emitter.parameters(),
+            *self.emitter_to_binary_logits.parameters(),
+            *self.binary_mapper.parameters(),
+            *self.decoder.parameters(),
+            *self.switch_gating.parameters()
+        ]
+
     def internal_rl_parameters(self):
         return [
             *self.action_proposer.parameters(),
@@ -595,7 +613,7 @@ class MetaControllerWithBinaryMapper(Module):
             next_switch_gated_codes
         )
 
-        return control_signal, MetaControllerOutput(next_hiddens, input_residual_stream, binary_logits, sampled_codes, switch_beta, kl_loss, kl_loss_weight, aux_ratio_loss)
+        return control_signal, MetaControllerOutput(next_hiddens, input_residual_stream, binary_logits, sampled_codes, switch_beta, kl_loss, kl_loss_weight, aux_ratio_loss, gated_codes)
 
 MetaControllerWithBinaryMapper.policy_loss = policy_loss
 MetaControllerWithBinaryMapper.ratio_loss = ratio_loss

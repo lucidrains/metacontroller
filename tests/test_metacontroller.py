@@ -9,6 +9,7 @@ import torch
 from torch import nn, cat
 from metacontroller.metacontroller import Transformer, MetaController, ActionProposerWrapper, policy_loss, z_score, extract_grpo_data
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
+from metacontroller.next_latent_wrapper import NextLatentWrapper
 
 from torch_einops_utils.save_load import save_load
 
@@ -803,3 +804,77 @@ def test_discovery_softmin_samples(variant):
 
     assert any(exists(p.grad) and p.grad.abs().sum() > 0 for p in mc.emitter.parameters())
     assert any(exists(p.grad) and p.grad.abs().sum() > 0 for p in mc.decoder.parameters())
+
+@param('variant', ('continuous', 'discrete', 'binary_mapper'))
+@param('action_discrete', (True, False))
+@param('num_samples', (1, 2))
+def test_next_latent_wrapper(variant, action_discrete, num_samples):
+    dim_model = 16
+    dim_meta = 8
+    seq_len = 6
+    batch = 2
+
+    state = torch.randn(batch, seq_len, 32)
+    episode_lens = torch.tensor([4, 6])
+
+    if action_discrete:
+        actions = torch.randint(0, 4, (batch, seq_len))
+        action_embed_readout = dict(num_discrete = 4)
+    else:
+        actions = torch.randn(batch, seq_len, 4)
+        action_embed_readout = dict(num_continuous = 4)
+
+    if variant == 'binary_mapper':
+        mc = MetaControllerWithBinaryMapper(
+            dim_model = dim_model,
+            dim_meta_controller = dim_meta,
+            dim_code_bits = 2,
+            internal_sequence_embedder = dict(attn_dim_head = 8, heads = 2, depth = 1),
+            action_proposer = dict(depth = 1, attn_dim_head = 8, heads = 2),
+            discovery_num_samples = num_samples
+        )
+    else:
+        mc = MetaController(
+            dim_model = dim_model,
+            dim_meta_controller = dim_meta,
+            dim_latent = 8,
+            latent_readout = variant,
+            internal_sequence_embedder = dict(attn_dim_head = 8, heads = 2, depth = 1),
+            action_proposer = dict(depth = 1, attn_dim_head = 8, heads = 2),
+            discovery_num_samples = num_samples
+        )
+
+    model = Transformer(
+        dim = dim_model,
+        action_embed_readout = action_embed_readout,
+        state_embed_readout = dict(num_continuous = 32),
+        lower_body = dict(depth = 1, attn_dim_head = 8, heads = 2),
+        upper_body = dict(depth = 1, attn_dim_head = 8, heads = 2)
+    )
+
+    wrapper = NextLatentWrapper(
+        model,
+        mc,
+        next_latent_loss_weight = 1.0,
+        kl_loss_weight = 1.0
+    )
+
+    loss, losses, meta_out = wrapper(
+        state,
+        actions,
+        episode_lens = episode_lens,
+        return_loss_breakdown = True,
+        return_meta_controller_output = True
+    )
+
+    assert loss.ndim == 0
+    assert losses.next_latent > 0.
+    assert losses.kl >= 0.
+    assert meta_out.gated_actions.shape[0] == batch
+
+    loss.backward()
+
+    assert any(exists(p.grad) and p.grad.abs().sum() > 0 for p in wrapper.dynamics_model.parameters())
+    assert any(exists(p.grad) and p.grad.abs().sum() > 0 for p in mc.emitter.parameters())
+    assert any(exists(p.grad) and p.grad.abs().sum() > 0 for p in mc.decoder.parameters())
+

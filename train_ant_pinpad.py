@@ -47,14 +47,17 @@ from metacontroller import (
     Transformer,
     MetaController,
     MetaControllerWithBinaryMapper,
+    NextLatentWrapper,
     LatentReadout,
     categorical_entropy
 )
 from metacontroller.metacontroller import (
     exists,
+    log,
     l2norm,
     sample_straight_through,
-    categorical_entropy_loss
+    categorical_entropy_loss,
+    normalized_categorical_mi
 )
 
 # constants
@@ -457,42 +460,136 @@ class CosinePrototypeReadout(LatentReadout):
             shared_prototypes = self.prototypes
         )
 
-# main benchmark
+# regularizing auxiliary losses
 
-def discovery_step_loss(
+def counterfactual_decoder_binding_loss(action_probs):
+    return 1. - normalized_categorical_mi(action_probs)
+
+def composed_action_coupling_loss(code_probs, action_probs, target_actions):
+    composed_probs = einsum(code_probs, action_probs, 'n k, n k a -> n a')
+    return F.nll_loss(log(composed_probs), target_actions)
+
+def extract_prototypes_and_code_probs(mc, meta_out, device, dtype):
+    if hasattr(mc, 'binary_mapper'):
+        prototypes = torch.eye(mc.num_codes, device = device, dtype = dtype)
+        codes = mc.binary_mapper.codes.float()
+        logits = meta_out.action_dist / mc.binary_temperature
+        code_probs = (
+            einsum(F.logsigmoid(logits), codes, '... bits, codes bits -> ... codes') +
+            einsum(F.logsigmoid(-logits), 1. - codes, '... bits, codes bits -> ... codes')
+        ).exp()
+        return prototypes, code_probs
+
+    readout = getattr(mc, 'emitter_to_action_mean_log_var', None)
+
+    if exists(readout) and hasattr(readout, 'prototypes'):
+        return readout.prototypes, meta_out.action_dist.softmax(dim = -1)
+
+    return None, None
+
+def regularizing_auxiliary_losses(
     mc,
     model,
     residual,
     actions,
     mask,
+    meta_out,
+    ablate_switch_beta = None,
+    use_counterfactual_binding_loss: bool = True,
+    use_composed_coupling_loss: bool = True,
+    counterfactual_binding_loss_weight: float = 0.25,
+    composed_coupling_loss_weight: float = 0.65,
+    counterfactual_batch_size: int = 16,
+    dropout: float = 0.25
+):
+    zero = residual.sum() * 0.
+
+    if not (use_counterfactual_binding_loss or use_composed_coupling_loss):
+        return zero
+
+    prototypes, code_probs = extract_prototypes_and_code_probs(mc, meta_out, residual.device, residual.dtype)
+
+    if not exists(prototypes):
+        return zero
+
+    if exists(ablate_switch_beta):
+        sw = ablate_switch_beta[:code_probs.shape[0]]
+        code_probs = mc.switch_gating(1. - sw, code_probs * rearrange(sw, '... -> ... 1'))
+
+    res_cf, act_cf, mask_cf, q_cf = (t[:counterfactual_batch_size] for t in (residual, actions, mask, code_probs))
+
+    if not mask_cf.any():
+        return zero
+
+    valid_res = res_cf[mask_cf]
+    valid_acts = act_cf[mask_cf]
+    valid_q = q_cf[mask_cf]
+
+    w1, w2 = mc.to_hyper_network_weights(mc.decoder(prototypes))
+    hyper_w = einsum(w1, w2, 'k i r, k j r -> k i j')
+
+    res_drop = F.dropout(valid_res, p = dropout, training = dropout > 0.)
+    control = einsum(valid_res, hyper_w, 'n i, k i j -> n k j')
+    steered = rearrange(rearrange(res_drop, 'n d -> n 1 d') + control, 'n k d -> (n k) 1 d')
+
+    logits = rearrange(
+        model.action_readout(model.upper_body(steered)),
+        '(n k) 1 a -> n k a', k = prototypes.shape[0]
+    )
+    action_probs = logits.softmax(dim = -1)
+
+    aux_loss = zero
+
+    if use_counterfactual_binding_loss:
+        aux_loss = aux_loss + counterfactual_binding_loss_weight * counterfactual_decoder_binding_loss(action_probs)
+
+    if use_composed_coupling_loss:
+        aux_loss = aux_loss + composed_coupling_loss_weight * composed_action_coupling_loss(valid_q, action_probs.detach(), valid_acts)
+
+    return aux_loss
+
+# main benchmark
+
+def discovery_step_loss(
+    nlp_wrapper,
+    residual,
+    actions,
+    mask,
     episode_lens,
-    num_samples = 1,
-    dropout = 0.,
+    num_samples: int = 1,
+    dropout: float = 0.,
+    use_counterfactual_binding_loss: bool = True,
+    use_composed_coupling_loss: bool = True,
+    counterfactual_binding_loss_weight: float = 0.25,
+    composed_coupling_loss_weight: float = 0.65,
     **mc_kwargs
 ):
-    control, meta_out = mc(
-        residual,
-        discovery_phase = True,
+    total_loss, meta_out = nlp_wrapper(
+        actions = actions,
+        residual_stream = residual,
         episode_lens = episode_lens,
-        num_samples = num_samples,
+        discovery_num_samples = num_samples,
+        metacontroller_residual_stream_dropout = dropout,
+        return_meta_controller_output = True,
         **mc_kwargs
     )
 
-    residual = F.dropout(residual, p = dropout, training = dropout > 0.)
-
-    def repeat_batch(t):
-        return repeat(t, 'b ... -> (n b) ...', n = num_samples)
-
-    logits = model.action_readout(model.upper_body(repeat_batch(residual) + control))
-    recon_loss = model.action_readout.calculate_loss(
-        logits,
-        repeat_batch(actions),
-        mask = repeat_batch(mask),
-        return_unreduced_loss = num_samples > 1
+    aux_loss = regularizing_auxiliary_losses(
+        nlp_wrapper.meta_controller,
+        nlp_wrapper.model,
+        residual,
+        actions,
+        mask,
+        meta_out,
+        ablate_switch_beta = mc_kwargs.get('ablate_switch_beta'),
+        use_counterfactual_binding_loss = use_counterfactual_binding_loss,
+        use_composed_coupling_loss = use_composed_coupling_loss,
+        counterfactual_binding_loss_weight = counterfactual_binding_loss_weight,
+        composed_coupling_loss_weight = composed_coupling_loss_weight,
+        dropout = dropout
     )
 
-    losses = mc.reduce_discovery_samples(meta_out, recon_loss, episode_lens = episode_lens)
-    return losses.action_recon + losses.kl + losses.ratio
+    return total_loss + aux_loss
 
 def train(
     num_train_eps: int = 2400,
@@ -505,7 +602,14 @@ def train(
     switch_steps: int = 450,
     grpo_iters: int = 35,
     grpo_batch_size: int = 256,
-    discovery_num_samples: int = 4
+    discovery_num_samples: int = 4,
+    use_metacontroller_nlp_loss: bool = True,
+    next_latent_loss_weight: float = 0.1,
+    kl_loss_weight: float = 0.1,
+    use_counterfactual_binding_loss: bool = True,
+    use_composed_coupling_loss: bool = True,
+    counterfactual_binding_loss_weight: float = 0.25,
+    composed_coupling_loss_weight: float = 0.65
 ):
     t0 = time.time()
     torch.manual_seed(42)
@@ -653,7 +757,9 @@ def train(
     # ============================================================================
     # STAGE 3: Unsupervised MetaController Discovery
     # ============================================================================
-    print(f"\n[Stage 3] Unsupervised MetaController Discovery")
+    eff_nlp_w = next_latent_loss_weight if use_metacontroller_nlp_loss else 0.
+    eff_kl_w = kl_loss_weight if use_metacontroller_nlp_loss else 0.
+    print(f"\n[Stage 3] Unsupervised MetaController Discovery (mc_nlp={use_metacontroller_nlp_loss}, L1_bind={use_counterfactual_binding_loss}, L3_composed={use_composed_coupling_loss})")
 
     # 3A: Continuous Gaussian Discovery (`latent_readout = 'continuous'`)
     torch.manual_seed(42)
@@ -663,23 +769,31 @@ def train(
         latent_readout = 'continuous', kl_loss_weight = 0.05, switch_temperature = 0.5,
         discovery_num_samples = discovery_num_samples
     )
-    opt_cont = torch.optim.AdamW(mc_cont.discovery_parameters(), lr = 2e-3, weight_decay = 1e-4)
+    nlp_cont = NextLatentWrapper(model, mc_cont, next_latent_loss_weight = eff_nlp_w, kl_loss_weight = eff_kl_w)
+    opt_cont = torch.optim.AdamW(nlp_cont.discovery_parameters(), lr = 2e-3, weight_decay = 1e-4)
     for _ in range(150):
         idx = torch.randint(0, size(tr_res, '[b] t d'), (64,))
         b_res, b_a, b_m = tr_res[idx], tr_act[idx], tr_mask[idx]
-        loss_v = discovery_step_loss(mc_cont, model, b_res, b_a, b_m, tr_lens[idx], discovery_num_samples)
+        loss_v = discovery_step_loss(
+            nlp_cont, b_res, b_a, b_m, tr_lens[idx], discovery_num_samples,
+            use_counterfactual_binding_loss = use_counterfactual_binding_loss,
+            use_composed_coupling_loss = use_composed_coupling_loss,
+            counterfactual_binding_loss_weight = counterfactual_binding_loss_weight,
+            composed_coupling_loss_weight = composed_coupling_loss_weight
+        )
         opt_cont.zero_grad()
         loss_v.backward()
         opt_cont.step()
 
     mc_cont.eval()
     with torch.no_grad():
-        ctrl_v, m_va_v = mc_cont(va_res, discovery_phase = True, episode_lens = va_lens)
+        _, losses_va_v, m_va_v = nlp_cont(actions = va_act, residual_stream = va_res, episode_lens = va_lens, return_loss_breakdown = True, return_meta_controller_output = True)
+        ctrl_v, _ = mc_cont(va_res, discovery_phase = True, episode_lens = va_lens)
         logits_v = model.action_readout(model.upper_body(va_res + ctrl_v))
         va_acc_v = (logits_v.argmax(-1)[va_mask] == va_act[va_mask]).float().mean().item()
-        va_loss_v = model.action_readout.calculate_loss(logits_v, va_act, mask = va_mask).item()
+        va_loss_v = losses_va_v.action_recon.item()
         _, _, f1_v = compute_switch_f1(m_va_v.switch_beta > 0.5, gt_switch_m, gt_int_m)
-    print(f"  (a) Continuous Gaussian (`latent_readout='continuous'`) : val_loss={va_loss_v:.3f}, val_acc={va_acc_v:.3f} | Switch F1={f1_v:.3f}")
+    print(f"  (a) Continuous Gaussian (`latent_readout='continuous'`) : val_loss={va_loss_v:.3f}, nlp={losses_va_v.next_latent.item():.3f}, kl={losses_va_v.kl.item():.3f}, val_acc={va_acc_v:.3f} | Switch F1={f1_v:.3f}")
 
     # 3B: MetaControllerWithBinaryMapper (Fleuret BinaryMapper, 2 bits -> 4 codes)
     torch.manual_seed(44)
@@ -705,31 +819,39 @@ def train(
         dec_bm.bias[:rank * dim].normal_(0.0, 0.2)
     mc_bm.decoder = nn.Sequential(proto_bm, dec_bm)
 
-    opt_bm = torch.optim.AdamW(mc_bm.discovery_parameters(), lr = 3e-3, weight_decay = 1e-4)
+    nlp_bm = NextLatentWrapper(model, mc_bm, next_latent_loss_weight = eff_nlp_w, kl_loss_weight = eff_kl_w)
+    opt_bm = torch.optim.AdamW(nlp_bm.discovery_parameters(), lr = 3e-3, weight_decay = 1e-4)
     for _ in range(discovery_steps):
         idx = torch.randint(0, size(tr_res, '[b] t d'), (64,))
         b_res, b_a, b_m, b_switch = tr_res[idx], tr_act[idx], tr_mask[idx], tr_switch[idx]
         emb_bm.current_switch = b_switch
         loss = discovery_step_loss(
-            mc_bm, model, b_res, b_a, b_m, tr_lens[idx], discovery_num_samples,
-            dropout = 0.2, ablate_switch_beta = b_switch, hard_switch = True
+            nlp_bm, b_res, b_a, b_m, tr_lens[idx], discovery_num_samples,
+            dropout = 0.2,
+            use_counterfactual_binding_loss = use_counterfactual_binding_loss,
+            use_composed_coupling_loss = use_composed_coupling_loss,
+            counterfactual_binding_loss_weight = counterfactual_binding_loss_weight,
+            composed_coupling_loss_weight = composed_coupling_loss_weight,
+            ablate_switch_beta = b_switch,
+            hard_switch = True
         )
         opt_bm.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(mc_bm.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(nlp_bm.parameters(), 1.0)
         opt_bm.step()
 
     mc_bm.eval()
     with torch.no_grad():
         emb_bm.current_switch = va_switch
-        ctrl_bm, m_va_bm = mc_bm(va_res, discovery_phase = True, ablate_switch_beta = va_switch, hard_switch = True, episode_lens = va_lens)
+        _, losses_va_bm, m_va_bm = nlp_bm(actions = va_act, residual_stream = va_res, ablate_switch_beta = va_switch, hard_switch = True, episode_lens = va_lens, return_loss_breakdown = True, return_meta_controller_output = True)
+        ctrl_bm, _ = mc_bm(va_res, discovery_phase = True, ablate_switch_beta = va_switch, hard_switch = True, episode_lens = va_lens)
         logits_bm = model.action_readout(model.upper_body(va_res + ctrl_bm))
         va_acc_bm = (logits_bm.argmax(-1)[va_mask] == va_act[va_mask]).float().mean().item()
-        va_loss_bm = model.action_readout.calculate_loss(logits_bm, va_act, mask = va_mask).item()
+        va_loss_bm = losses_va_bm.action_recon.item()
         switch_va_m = (va_switch > 0.5) & va_mask
         pred_bm = m_va_bm.actions[switch_va_m].argmax(dim = -1)
         acc_bm_cluster, bm_proto_to_sg = compute_cluster_acc(pred_bm, va_sg[switch_va_m])
-    print(f"  (b) Fleuret BinaryMapper (`MetaControllerWithBinaryMapper`) : val_loss={va_loss_bm:.3f}, val_acc={va_acc_bm:.3f} | 4-Subgoal Cluster Acc={acc_bm_cluster:.3f}")
+    print(f"  (b) Fleuret BinaryMapper (`MetaControllerWithBinaryMapper`) : val_loss={va_loss_bm:.3f}, nlp={losses_va_bm.next_latent.item():.3f}, kl={losses_va_bm.kl.item():.3f}, val_acc={va_acc_bm:.3f} | 4-Subgoal Cluster Acc={acc_bm_cluster:.3f}")
 
     # Helper to train & evaluate built-in 'discrete' and custom `LatentReadout` on Stage 3
     def run_stage3_readout(label, readout_fn):
@@ -756,18 +878,25 @@ def train(
             mc.decoder.bias.zero_()
             mc.decoder.bias[:rank * dim].normal_(0.0, 0.2)
 
-        opt_ed = torch.optim.AdamW(mc.discovery_parameters_non_switching(), lr = 3e-3, weight_decay = 1e-4)
+        nlp_mc = NextLatentWrapper(model, mc, next_latent_loss_weight = eff_nlp_w, kl_loss_weight = eff_kl_w)
+        opt_ed = torch.optim.AdamW(nlp_mc.discovery_parameters_non_switching(), lr = 3e-3, weight_decay = 1e-4)
         for _ in range(discovery_steps):
             idx = torch.randint(0, size(tr_res, '[b] t d'), (64,))
             b_res, b_a, b_m, b_switch = tr_res[idx], tr_act[idx], tr_mask[idx], tr_switch[idx]
             embedder.current_switch = b_switch
             loss = discovery_step_loss(
-                mc, model, b_res, b_a, b_m, tr_lens[idx], discovery_num_samples,
-                dropout = 0.2, ablate_switch_beta = b_switch, hard_switch = True
+                nlp_mc, b_res, b_a, b_m, tr_lens[idx], discovery_num_samples,
+                dropout = 0.2,
+                use_counterfactual_binding_loss = use_counterfactual_binding_loss,
+                use_composed_coupling_loss = use_composed_coupling_loss,
+                counterfactual_binding_loss_weight = counterfactual_binding_loss_weight,
+                composed_coupling_loss_weight = composed_coupling_loss_weight,
+                ablate_switch_beta = b_switch,
+                hard_switch = True
             )
             opt_ed.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(mc.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(nlp_mc.parameters(), 1.0)
             opt_ed.step()
 
         # Train causal switching_unit (summary_gru + model_to_meta + switching_unit)
@@ -796,10 +925,11 @@ def train(
 
         with torch.no_grad():
             embedder.current_switch = va_switch
-            ctrl_va, m_va = mc(va_res, discovery_phase = True, ablate_switch_beta = va_switch, hard_switch = True, episode_lens = va_lens)
+            _, losses_va_e, m_va = nlp_mc(actions = va_act, residual_stream = va_res, ablate_switch_beta = va_switch, hard_switch = True, episode_lens = va_lens, return_loss_breakdown = True, return_meta_controller_output = True)
+            ctrl_va, _ = mc(va_res, discovery_phase = True, ablate_switch_beta = va_switch, hard_switch = True, episode_lens = va_lens)
             logits_va = model.action_readout(model.upper_body(va_res + ctrl_va))
             va_acc_e = (logits_va.argmax(-1)[va_mask] == va_act[va_mask]).float().mean().item()
-            va_loss_e = model.action_readout.calculate_loss(logits_va, va_act, mask = va_mask).item()
+            va_loss_e = losses_va_e.action_recon.item()
 
             _, m_va_switch = mc(va_res, discovery_phase = True, hard_switch = False, episode_lens = va_lens)
             raw_switch = (m_va_switch.switch_beta > 0.5).float()
@@ -813,7 +943,7 @@ def train(
             active_proto = m_va.action_dist[switch_va_m].argmax(dim = -1)
             cluster_acc, proto_to_sg = compute_cluster_acc(active_proto, va_sg[switch_va_m])
 
-        print(f"  {label:55s} : val_loss={va_loss_e:.3f}, val_acc={va_acc_e:.3f} | Switch F1={f1_e:.3f} (Freq={switch_freq_e:.3f} vs GT={gt_switch_freq:.3f}) | 4-Subgoal Cluster Acc={cluster_acc:.3f}")
+        print(f"  {label:55s} : val_loss={va_loss_e:.3f}, nlp={losses_va_e.next_latent.item():.3f}, kl={losses_va_e.kl.item():.3f}, val_acc={va_acc_e:.3f} | Switch F1={f1_e:.3f} (Freq={switch_freq_e:.3f} vs GT={gt_switch_freq:.3f}) | 4-Subgoal Cluster Acc={cluster_acc:.3f}")
         return mc, embedder, pred_switch, proto_to_sg, va_acc_e, f1_e, switch_freq_e, cluster_acc
 
     mc_disc, emb_disc, pred_switch_disc, disc_proto_to_sg, va_acc_d, f1_d, freq_d, cluster_d = run_stage3_readout(
