@@ -1,17 +1,12 @@
 from __future__ import annotations
 
-from metacontroller.metacontroller import ActionProposerWrapper
-from contextlib import nullcontext
-
 from functools import partial
-from collections import namedtuple
 from loguru import logger
 
 import torch
-from torch import nn, cat, tensor, ones, zeros, stack, Tensor
-from torch.nn import Module, Linear, GRU, Parameter
+from torch import cat, tensor, Tensor
+from torch.nn import Module, Linear, GRU
 import torch.nn.functional as F
-from torch.nn.functional import cosine_similarity, sigmoid
 
 # einops
 
@@ -21,18 +16,30 @@ from einops.layers.torch import Rearrange
 
 # external modules
 
-from x_transformers import Decoder, Attention
+from x_transformers import Decoder
 from x_mlps_pytorch import Feedforwards
 
 from assoc_scan import AssocScan
 
-from torch_einops_utils import maybe, pad_at_dim, lens_to_mask, align_dims_left, masked_mean, straight_through
-from torch_einops_utils.shape import shape, size
+from torch_einops_utils import maybe, lens_to_mask, and_masks, masked_mean, straight_through
+from torch_einops_utils.shape import size
 from torch_einops_utils.save_load import save_load
 
 from vector_quantize_pytorch import BinaryMapper
 
-from metacontroller.metacontroller import MetaControllerOutput, policy_loss, ratio_loss, CausalSequenceEmbedder, sample_straight_through, categorical_entropy_loss
+from metacontroller.metacontroller import (
+    exists,
+    default,
+    identity,
+    ActionProposerWrapper,
+    MetaControllerOutput,
+    policy_loss,
+    ratio_loss,
+    reduce_discovery_samples,
+    CausalSequenceEmbedder,
+    sample_straight_through,
+    categorical_entropy_loss
+)
 from metacontroller.sequential_action_selection import perform_sequential_action_selection
 
 # constants
@@ -40,23 +47,6 @@ from metacontroller.sequential_action_selection import perform_sequential_action
 LinearNoBias = partial(Linear, bias = False)
 
 GRU = partial(GRU, batch_first = True)
-
-# helper functions
-
-def exists(val):
-    return val is not None
-
-def compact(iterable):
-    return tuple(filter(exists, iterable))
-
-def default(*args):
-    for arg in args:
-        if exists(arg):
-            return arg
-    return None
-
-def log(t, eps = 1e-20):
-    return t.clamp_min(eps).log()
 
 # meta controller classes
 
@@ -134,6 +124,8 @@ class MetaControllerWithBinaryMapper(Module):
         ratio_loss_chunk_size = None,
         ratio_loss_final_weight = None,
         ratio_loss_warmdown_steps = 0,
+        discovery_num_samples = 1,
+        discovery_softmin_temp = 0.1
     ):
         super().__init__()
         self.dim_model = dim_model
@@ -150,6 +142,9 @@ class MetaControllerWithBinaryMapper(Module):
         self.binary_temperature = binary_temperature
         self.use_marginal_entropy_loss = use_marginal_entropy_loss
         self.sample_entropy_weight = sample_entropy_weight
+
+        self.discovery_num_samples = discovery_num_samples
+        self.discovery_softmin_temp = discovery_softmin_temp
 
         dim_meta = default(dim_meta_controller, dim_model)
 
@@ -278,7 +273,7 @@ class MetaControllerWithBinaryMapper(Module):
         return self.ratio_loss_weight + (self.ratio_loss_final_weight - self.ratio_loss_weight) * warmdown_factor
 
     def discovery_parameters(self):
-        params = [
+        return [
             *self.summary_gru.parameters(),
             *self.model_to_meta.parameters(),
             *self.internal_sequence_embedder.parameters(),
@@ -290,8 +285,6 @@ class MetaControllerWithBinaryMapper(Module):
             *self.decoder.parameters(),
             *self.switch_gating.parameters()
         ]
-
-        return params
 
     def internal_rl_parameters(self):
         return [
@@ -347,7 +340,8 @@ class MetaControllerWithBinaryMapper(Module):
         switch_beta_frequency: int | None = None,
         ablate_offset = 0,
         temperature = 1.,
-        episode_lens: Tensor | None = None
+        episode_lens: Tensor | None = None,
+        num_samples: int | None = None
     ):
         seq_len = size(residual_stream, 'b [n] d')
         device = residual_stream.device
@@ -418,16 +412,24 @@ class MetaControllerWithBinaryMapper(Module):
         binary_logits = to_logits(proposed_action_hidden)
 
         effective_temp = self.binary_temperature * temperature
-        codes_float = self.binary_mapper.codes.float()
-        scaled_logits = binary_logits / effective_temp
+        num_samples = default(num_samples, 1)
+        has_multi_samples = num_samples > 1
+        use_soft_code_probs = has_multi_samples or self.hard_prob < 1.
 
-        soft_G = (
-            einsum(F.logsigmoid(scaled_logits), codes_float, '... bits, codes bits -> ... codes') +
-            einsum(F.logsigmoid(-scaled_logits), 1. - codes_float, '... bits, codes bits -> ... codes')
-        ).exp()
+        if use_soft_code_probs or (discovery_phase and self.use_marginal_entropy_loss):
+            codes_float = self.binary_mapper.codes.float()
+            scaled_logits = binary_logits / effective_temp
 
-        if self.hard_prob < 1.:
-            one_hot = sample_straight_through(soft_G, self.hard_prob, training = self.training)
+            soft_G = (
+                einsum(F.logsigmoid(scaled_logits), codes_float, '... bits, codes bits -> ... codes') +
+                einsum(F.logsigmoid(-scaled_logits), 1. - codes_float, '... bits, codes bits -> ... codes')
+            ).exp()
+
+        if use_soft_code_probs:
+            sample_probs = repeat(soft_G, 'b ... -> n b ...', n = num_samples) if has_multi_samples else soft_G
+            one_hot = sample_straight_through(sample_probs, self.hard_prob, training = self.training)
+            one_hot = rearrange(one_hot, 'n b ... -> (n b) ...') if has_multi_samples else one_hot
+
             kl_loss = self.zero if self.use_marginal_entropy_loss else self.binary_mapper(binary_logits, temperature = effective_temp, reduce_aux_kl_loss = False, calc_aux_loss = discovery_phase)[1]
         else:
             one_hot, kl_loss = self.binary_mapper(
@@ -444,6 +446,17 @@ class MetaControllerWithBinaryMapper(Module):
         # switching unit timer
 
         batch, seq_len, _ = sampled_codes.shape
+        input_residual_stream = residual_stream
+        repeat_batch = partial(repeat, pattern = 'b ... -> (n b) ...', n = num_samples) if has_multi_samples else identity
+
+        if has_multi_samples:
+            repeat_hidden = partial(repeat, pattern = 'l b d -> l (n b) d', n = num_samples)
+
+            residual_stream = repeat_batch(residual_stream)
+            meta_embed_prev = repeat_batch(meta_embed_prev)
+            ablate_switch_beta = maybe(repeat_batch)(ablate_switch_beta)
+            prev_switching_unit_hidden = maybe(repeat_hidden)(prev_switching_unit_hidden)
+            prev_switch_gated_hiddens = maybe(repeat_batch)(prev_switch_gated_hiddens)
 
         if not exists(prev_switch_gated_hiddens):
             prev_switch_gated_hiddens = torch.zeros(batch, 1, self.num_codes, device = device)
@@ -527,26 +540,28 @@ class MetaControllerWithBinaryMapper(Module):
 
         # losses
 
+        kl_loss_weight = self.zero
+
         if discovery_phase:
             kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.
+            switch_beta_for_kl = reduce(switch_beta, '(n b) l -> b l', 'mean', n = num_samples) if has_multi_samples else switch_beta
 
             if self.use_marginal_entropy_loss:
-                switch_mask = switch_beta > 0.5
-                kl_mask = ((mask & switch_mask) if exists(mask) else switch_mask) if self.gate_kl_with_switch_beta else mask
+                switch_mask = switch_beta_for_kl > 0.5
+                kl_mask = and_masks((mask, switch_mask)) if self.gate_kl_with_switch_beta else mask
                 kl_loss = categorical_entropy_loss(soft_G, mask = kl_mask, sample_entropy_weight = self.sample_entropy_weight)
             else:
                 if kl_loss.ndim == 3:
                     kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
 
                 if self.gate_kl_with_switch_beta and kl_loss.ndim == 2:
-                    kl_loss = kl_loss * switch_beta
+                    kl_loss = kl_loss * switch_beta_for_kl
 
                 kl_loss = masked_mean(kl_loss, mask)
 
             kl_loss = kl_loss * kl_loss_weight
         else:
             kl_loss = self.zero
-            kl_loss_weight = self.zero
 
         decoder_out = self.decoder(gated_codes)
 
@@ -562,11 +577,10 @@ class MetaControllerWithBinaryMapper(Module):
         aux_ratio_loss = self.zero
 
         if self.has_ratio_loss:
-
             aux_ratio_loss = self.ratio_loss(
                 self.target_temporal_segment_len,
                 switch_beta,
-                episode_lens = episode_lens,
+                episode_lens = maybe(repeat_batch)(episode_lens),
                 chunk_size = self.ratio_loss_chunk_size
             )
 
@@ -581,7 +595,8 @@ class MetaControllerWithBinaryMapper(Module):
             next_switch_gated_codes
         )
 
-        return control_signal, MetaControllerOutput(next_hiddens, residual_stream, binary_logits, sampled_codes, switch_beta, kl_loss, kl_loss_weight, aux_ratio_loss)
+        return control_signal, MetaControllerOutput(next_hiddens, input_residual_stream, binary_logits, sampled_codes, switch_beta, kl_loss, kl_loss_weight, aux_ratio_loss)
 
 MetaControllerWithBinaryMapper.policy_loss = policy_loss
 MetaControllerWithBinaryMapper.ratio_loss = ratio_loss
+MetaControllerWithBinaryMapper.reduce_discovery_samples = reduce_discovery_samples

@@ -34,7 +34,7 @@ from discrete_continuous_embed_readout import Embed, Readout, EmbedAndReadout
 
 from assoc_scan import AssocScan
 
-from torch_einops_utils import maybe, pad_left_at_dim, pad_right_at_dim, pad_at_dim, lens_to_mask, masked_mean, align_dims_left, exclusive_cumsum, pack_with_inverse, straight_through
+from torch_einops_utils import maybe, pad_left_at_dim, pad_right_at_dim, pad_at_dim, lens_to_mask, and_masks, masked_mean, align_dims_left, exclusive_cumsum, pack_with_inverse, straight_through, z_score
 from torch_einops_utils.shape import shape, size
 from torch_einops_utils.device import module_device, move_inputs_to_module_device
 from torch_einops_utils.save_load import save_load
@@ -64,28 +64,57 @@ def default(*args):
 
 # tensor helpers
 
-def log(t, eps = 1e-8):
-    return (t + eps).log()
+def log(t, eps = 1e-20):
+    return t.clamp_min(eps).log()
+
+def gumbel_noise(t):
+    return -log(-log(torch.rand_like(t)))
 
 def binary_entropy(p):
     return -((p * log(p)) + (1. - p) * log(1. - p))
+
+def categorical_entropy(probs):
+    return -(probs * log(probs)).sum(dim = -1)
 
 def l2norm(t, dim = -1):
     return F.normalize(t, p = 2, dim = dim)
 
 def categorical_entropy_loss(probs, mask = None, sample_entropy_weight = 0.1):
     active = probs[mask] if (exists(mask) and mask.any()) else rearrange(probs, '... k -> (...) k')
-    mean_p = active.mean(dim = 0)
-    return (mean_p * log(mean_p)).sum() - sample_entropy_weight * (active * log(active)).sum(dim = -1).mean()
+    mean_probs = reduce(active, 'n k -> k', 'mean')
+    return -categorical_entropy(mean_probs) + sample_entropy_weight * categorical_entropy(active).mean()
 
-def sample_straight_through(probs, hard_prob = 0.5, training = True):
-    hard_one_hot = F.one_hot(probs.argmax(dim = -1), size(probs, '... [k]')).float()
+def sample_straight_through(
+    probs,
+    hard_prob = 0.5,
+    training = True,
+    gumbel_sample = None
+):
+    has_multi_samples = probs.ndim >= 4
+    gumbel_sample = default(gumbel_sample, has_multi_samples)
+
+    if training and gumbel_sample:
+        gumbel = gumbel_noise(probs)
+
+        if has_multi_samples:
+            gumbel[0] = 0.  # first candidate is greedy
+
+        indices = (log(probs) + gumbel).argmax(dim = -1)
+    else:
+        indices = probs.argmax(dim = -1)
+
+    hard_one_hot = F.one_hot(indices, size(probs, '... [k]')).float()
+
     if not training:
         return hard_one_hot
+
     st_probs = straight_through(probs, hard_one_hot)
+
     if hard_prob >= 1.:
         return st_probs
-    is_hard = torch.zeros_like(probs[..., :1]).bernoulli_(hard_prob).bool()
+
+    mask_shape = probs[:1, ..., :1] if has_multi_samples else probs[..., :1]
+    is_hard = torch.zeros_like(mask_shape).bernoulli_(hard_prob).bool()
     return torch.where(is_hard, st_probs, probs)
 
 # next latent prediction - residual dynamics network
@@ -343,10 +372,6 @@ GRPOOutput = namedtuple('GRPOOutput', (
     'switch_beta'
 ))
 
-def z_score(t, dim = None, eps = 1e-8):
-    kwargs = dict(dim = dim, keepdim = True) if exists(dim) else dict()
-    return (t - t.mean(**kwargs)) / (t.std(**kwargs) + eps)
-
 # TPO - Jean Kaddour https://arxiv.org/abs/2604.06159
 
 def tpo_target(log_scores, u, eta = 1.0):
@@ -477,7 +502,8 @@ def ratio_loss(
     switch_beta,                # float[b n]
     hard_switch_beta = None,    # bool[b n]
     episode_lens = None,        # int[b]
-    chunk_size = None
+    chunk_size = None,
+    return_unreduced = False
 ):
     # Hwang et al. https://arxiv.org/abs/2507.07955 eq (10)
 
@@ -504,6 +530,9 @@ def ratio_loss(
 
     losses = (N / (N - 1.)) * ((N - 1.) * F * G + (1. - F) * (1. - G))
 
+    if return_unreduced:
+        return losses
+
     return losses.mean()
 
 def extract_grpo_data(meta_controller, transformer_output):
@@ -516,6 +545,101 @@ def extract_grpo_data(meta_controller, transformer_output):
     log_prob = meta_controller.log_prob(meta_output.action_dist, action)
 
     return GRPOOutput(state, action, log_prob, switch_beta)
+
+@move_inputs_to_module_device
+def reduce_discovery_samples(
+    meta_controller,
+    meta_output: MetaControllerOutput,
+    action_recon_losses: Tensor,
+    state_pred_losses: Tensor | None = None,
+    episode_lens: Tensor | None = None,
+    softmin_temp: float | None = None,
+    eps: float = 1e-6,
+    return_meta_controller_output: bool = False
+):
+    # Gladstone et al. https://arxiv.org/abs/2607.27372 - best-of-N over discovery samples
+
+    action_dist, sampled_actions, switch_beta = meta_output.action_dist, meta_output.actions, meta_output.switch_beta
+    batch, seq_len = action_dist.shape[:2]
+    num_samples = sampled_actions.shape[0] // batch
+
+    if num_samples == 1:
+        state_loss = state_pred_losses.mean() if exists(state_pred_losses) else meta_controller.zero
+        losses = DiscoveryLosses(state_loss, action_recon_losses.mean(), meta_output.kl_loss, meta_output.ratio_loss)
+        return (losses, meta_output) if return_meta_controller_output else losses
+
+    softmin_temp = default(softmin_temp, meta_controller.discovery_softmin_temp)
+
+    episode_lens = maybe(repeat)(episode_lens, 'b -> (n b)', n = num_samples)
+    mask = maybe(lens_to_mask)(episode_lens, seq_len)
+
+    def to_sample_batch(losses):
+        if not exists(losses):
+            return None
+
+        if losses.ndim == 0:
+            return repeat(losses, ' -> n b', n = num_samples, b = batch)
+
+        if losses.shape == (num_samples, batch):
+            return losses
+
+        if losses.ndim > 2:
+            losses = reduce(losses, 'b t ... -> b t', 'mean')
+
+        if losses.ndim == 2:
+            loss_mask = mask[:, :losses.shape[-1]] if exists(mask) else None
+            losses = masked_mean(losses, loss_mask, dim = -1)
+
+        return rearrange(losses, '(n b) -> n b', n = num_samples)
+
+    action_recon = to_sample_batch(action_recon_losses)
+    state_pred = to_sample_batch(state_pred_losses)
+
+    ratio = None
+
+    if meta_controller.has_ratio_loss:
+        # per-trajectory ratio, unchunked for candidate weighting
+
+        ratio = meta_controller.ratio_loss(
+            meta_controller.target_temporal_segment_len,
+            switch_beta,
+            episode_lens = episode_lens,
+            return_unreduced = True
+        )
+        ratio = rearrange(ratio, '(n b) -> n b', n = num_samples) * meta_controller.current_ratio_loss_weight
+
+    total_loss = action_recon + default(state_pred, meta_controller.zero) + default(ratio, meta_controller.zero)
+
+    weights = F.softmin(total_loss.detach() / max(softmin_temp, eps), dim = 0)
+    weighted_mean = lambda losses: einsum(weights, losses, 'n b, n b -> b').mean()
+
+    action_recon_loss = weighted_mean(action_recon)
+    state_pred_loss = default(maybe(weighted_mean)(state_pred), meta_controller.zero)
+    ratio_loss = default(maybe(weighted_mean)(ratio), meta_output.ratio_loss)
+
+    losses = DiscoveryLosses(state_pred_loss, action_recon_loss, meta_output.kl_loss, ratio_loss)
+
+    if not return_meta_controller_output:
+        return losses
+
+    best_idx = total_loss.detach().argmin(dim = 0) * batch + torch.arange(batch, device = sampled_actions.device)
+
+    def select(t, dim = 0):
+        if not exists(t) or t.shape[dim] != num_samples * batch:
+            return t
+
+        return t.index_select(dim, best_idx)
+
+    prev_summarized, prev_proposer_hidden, switch_hidden, switch_gated = meta_output.prev_hiddens
+
+    reduced_meta_output = meta_output._replace(
+        prev_hiddens = (prev_summarized, prev_proposer_hidden, select(switch_hidden, dim = 1), select(switch_gated)),
+        actions = select(sampled_actions),
+        switch_beta = select(switch_beta),
+        ratio_loss = ratio_loss
+    )
+
+    return losses, reduced_meta_output
 
 @save_load()
 class MetaController(Module):
@@ -561,7 +685,9 @@ class MetaController(Module):
         gate_kl_with_switch_beta = False,
         ratio_loss_final_weight = None,
         ratio_loss_warmdown_steps = 0,
-        latent_action_barrier_scale: float | None = None
+        latent_action_barrier_scale: float | None = None,
+        discovery_num_samples = 1,
+        discovery_softmin_temp = 0.1
     ):
         super().__init__()
         self.dim_model = dim_model
@@ -578,6 +704,9 @@ class MetaController(Module):
 
         self.ratio_loss_final_weight = ratio_loss_final_weight
         self.ratio_loss_warmdown_steps = ratio_loss_warmdown_steps
+
+        self.discovery_num_samples = discovery_num_samples
+        self.discovery_softmin_temp = discovery_softmin_temp
 
         self.compact_sequence_embedding = compact_sequence_embedding
 
@@ -754,8 +883,6 @@ class MetaController(Module):
             *self.switch_gating.parameters()
         ]
 
-        return params
-
     def internal_rl_parameters(self):
         return [
             *self.action_proposer.parameters(),
@@ -825,7 +952,8 @@ class MetaController(Module):
         switch_beta_frequency: int | None = None,
         ablate_offset = 0,
         temperature = 1.,
-        episode_lens: Tensor | None = None
+        episode_lens: Tensor | None = None,
+        num_samples: int | None = None
     ):
         seq_len = size(residual_stream, 'b [n] d')
         device = residual_stream.device
@@ -882,7 +1010,7 @@ class MetaController(Module):
 
                 # channel-mixing projection
                 summarized_sequence_embed = self.to_sequence_summary_embed(summarized_sequence) # B, 32
-                summarized_sequence_embed = summarized_sequence_embed.unsqueeze(1).repeat(1, residual_stream.shape[1], 1) # B, L, 32
+                summarized_sequence_embed = repeat(summarized_sequence_embed, 'b d -> b n d', n = seq_len)
 
             # otherwise treat it as an encoder output sequence (if it's the same)
 
@@ -916,7 +1044,12 @@ class MetaController(Module):
 
         action_dist = readout(proposed_action_hidden)
 
-        sampled_latent_action = readout.sample(action_dist, temperature = temperature, differentiable = True)
+        num_samples = default(num_samples, 1)
+        has_multi_samples = num_samples > 1
+
+        action_dist_for_sample = repeat(action_dist, 'b ... -> n b ...', n = num_samples) if has_multi_samples else action_dist
+        sampled_latent_action = readout.sample(action_dist_for_sample, temperature = temperature, differentiable = True)
+        sampled_latent_action = rearrange(sampled_latent_action, 'n b ... -> (n b) ...') if has_multi_samples else sampled_latent_action
 
         bounded_latent_action = sampled_latent_action
 
@@ -927,6 +1060,17 @@ class MetaController(Module):
         # switching unit timer
 
         batch, seq_len, dim = sampled_latent_action.shape
+        input_residual_stream = residual_stream
+        repeat_batch = partial(repeat, pattern = 'b ... -> (n b) ...', n = num_samples) if has_multi_samples else identity
+
+        if has_multi_samples:
+            repeat_hidden = partial(repeat, pattern = 'l b d -> l (n b) d', n = num_samples)
+
+            residual_stream = repeat_batch(residual_stream)
+            meta_embed_prev = repeat_batch(meta_embed_prev)
+            ablate_switch_beta = maybe(repeat_batch)(ablate_switch_beta)
+            prev_switching_unit_gru_hidden = maybe(repeat_hidden)(prev_switching_unit_gru_hidden)
+            gated_prev_latent = maybe(repeat_batch)(gated_prev_latent)
 
         # initialize prev sampled latent action / gated action to be zeros if not available (for first timestep and for discovery phase)
 
@@ -1028,11 +1172,12 @@ class MetaController(Module):
 
         # need to encourage normal distribution
 
-        kl_loss = self.zero
+        kl_loss = kl_loss_weight = self.zero
 
         if discovery_phase:
-            sw_mask = switch_beta > 0.5
-            kl_mask = ((mask & sw_mask) if exists(mask) else sw_mask) if self.gate_kl_with_switch_beta else mask
+            switch_beta_for_kl = reduce(switch_beta, '(n b) l -> b l', 'mean', n = num_samples) if has_multi_samples else switch_beta
+            sw_mask = switch_beta_for_kl > 0.5
+            kl_mask = and_masks((mask, sw_mask)) if self.gate_kl_with_switch_beta else mask
 
             kl_loss = self.calculate_kl_loss(action_dist, mask = kl_mask)
 
@@ -1040,17 +1185,13 @@ class MetaController(Module):
                 kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
 
             if self.gate_kl_with_switch_beta and kl_loss.ndim == 2:
-                kl_loss = kl_loss * switch_beta
+                kl_loss = kl_loss * switch_beta_for_kl
 
             if kl_loss.ndim >= 2:
                 kl_loss = masked_mean(kl_loss, mask)
 
             kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.
             kl_loss = kl_loss * kl_loss_weight
-
-        else:
-            kl_loss = self.zero
-            kl_loss_weight = self.zero
 
         # decoder
 
@@ -1068,11 +1209,10 @@ class MetaController(Module):
         aux_ratio_loss = self.zero
 
         if self.has_ratio_loss:
-
             aux_ratio_loss = self.ratio_loss(
                 self.target_temporal_segment_len,
                 switch_beta,
-                episode_lens = episode_lens,
+                episode_lens = maybe(repeat_batch)(episode_lens),
                 chunk_size = self.ratio_loss_chunk_size
             )
 
@@ -1087,10 +1227,11 @@ class MetaController(Module):
             next_switch_gated_action
         )
 
-        return control_signal, MetaControllerOutput(next_hiddens, residual_stream, action_dist, sampled_latent_action, switch_beta, kl_loss, kl_loss_weight if discovery_phase else self.zero, aux_ratio_loss)
+        return control_signal, MetaControllerOutput(next_hiddens, input_residual_stream, action_dist, sampled_latent_action, switch_beta, kl_loss, kl_loss_weight, aux_ratio_loss)
 
 MetaController.policy_loss = policy_loss
 MetaController.ratio_loss = ratio_loss
+MetaController.reduce_discovery_samples = reduce_discovery_samples
 
 # main transformer, which is subsumed into the environment after behavioral cloning
 
@@ -1342,7 +1483,9 @@ class Transformer(Module):
         switch_beta_frequency: int | None = None,
         update_loss_ema: bool | None = None,
         hard_switch: bool | None = None,
-        metacontroller_residual_stream_dropout: float = 0.
+        metacontroller_residual_stream_dropout: float = 0.,
+        discovery_num_samples: int | None = None,
+        discovery_softmin_temp: float | None = None
     ):
 
         device = state.device
@@ -1433,6 +1576,13 @@ class Transformer(Module):
 
         # meta controller acts on residual stream here
 
+        resolved_num_samples = 1
+        if discovery_phase and exists(meta_controller) and meta_controller.training:
+            resolved_num_samples = default(discovery_num_samples, getattr(meta_controller, 'discovery_num_samples', 1))
+
+        has_multi_samples = resolved_num_samples > 1
+        repeat_batch = partial(repeat, pattern = 'b ... -> (n b) ...', n = resolved_num_samples) if has_multi_samples else identity
+
         with meta_controller_context():
 
             if exists(meta_controller) and not behavioral_cloning:
@@ -1446,7 +1596,8 @@ class Transformer(Module):
                     ablate_switch_beta = ablate_switch_beta,
                     switch_beta_frequency = switch_beta_frequency,
                     ablate_offset = cache_steps,
-                    hard_switch = hard_switch
+                    hard_switch = hard_switch,
+                    num_samples = resolved_num_samples
                 )
             else:
                 control_signal, next_meta_hiddens = self.zero, None
@@ -1458,7 +1609,10 @@ class Transformer(Module):
                 is_training = meta_controller.training if exists(meta_controller) else self.training
                 residual_stream = F.dropout(residual_stream, p = metacontroller_residual_stream_dropout, training = is_training)
 
-            modified_residual_stream = residual_stream + control_signal
+            residual_stream_for_upper = repeat_batch(residual_stream)
+            condition_for_upper = maybe(repeat_batch)(condition)
+
+            modified_residual_stream = residual_stream_for_upper + control_signal
 
         # modified residual stream sent back to transformer upper body
 
@@ -1466,7 +1620,7 @@ class Transformer(Module):
 
             attended, next_upper_hiddens = self.upper_body(
                 modified_residual_stream,
-                condition = condition,
+                condition = condition_for_upper,
                 cache = upper_transformer_hiddens,
                 return_hiddens = True
             )
@@ -1482,12 +1636,13 @@ class Transformer(Module):
         if calc_auto_regressive_loss and (behavioral_cloning or discovery_phase):
 
             next_latent_loss = self.zero
+            latent_loss_unreduced = None
 
-            if self.has_next_latent_loss:
-                action_embeds_for_prediction = self.next_latent_prediction_action_embed(actions)
+            if self.has_next_latent_loss and (behavioral_cloning or self.discovery_phase_state_clone_loss):
+                action_embeds_for_prediction = repeat_batch(self.next_latent_prediction_action_embed(actions))
 
                 curr_latent, target_latent = attended[:, :-1], attended[:, 1:].detach()
-                mask = action_loss_mask[:, :-1] if exists(action_loss_mask) else None
+                mask = maybe(repeat_batch)(action_loss_mask[:, :-1]) if exists(action_loss_mask) else None
 
                 dynamics_out = self.dynamics_model(
                     next_token_embeds = action_embeds_for_prediction,
@@ -1500,8 +1655,6 @@ class Transformer(Module):
                 )
 
                 next_latent_loss = masked_mean(latent_loss_unreduced, mask)
-
-            total_loss = next_latent_loss * self.next_latent_loss_weight
 
         # caching related
 
@@ -1545,24 +1698,37 @@ class Transformer(Module):
 
         elif calc_auto_regressive_loss and discovery_phase:
 
-            state_clone_loss = self.zero
+            action_recon_loss = self.action_readout.calculate_loss(
+                dist_params,
+                repeat_batch(target_actions),
+                mask = maybe(repeat_batch)(action_loss_mask),
+                return_unreduced_loss = has_multi_samples
+            )
 
-            if self.discovery_phase_state_clone_loss:
-                state_clone_loss = self.next_latent_loss_weight * next_latent_loss
+            state_pred_loss = None
+            if self.discovery_phase_state_clone_loss and exists(latent_loss_unreduced):
+                state_pred_loss = self.next_latent_loss_weight * (latent_loss_unreduced if has_multi_samples else next_latent_loss)
 
-            # action
-
-            action_recon_loss = self.action_readout.calculate_loss(dist_params, target_actions, mask = action_loss_mask)
+            losses, next_meta_hiddens = meta_controller.reduce_discovery_samples(
+                next_meta_hiddens,
+                action_recon_loss,
+                state_pred_losses = state_pred_loss,
+                episode_lens = episode_lens,
+                softmin_temp = discovery_softmin_temp,
+                return_meta_controller_output = True
+            )
 
             # loss normalization
 
             if self.normalize_state_action_losses:
+                state_clone_loss, action_recon_loss, *rest_losses = losses
+
                 if self.discovery_phase_state_clone_loss:
                     state_clone_loss = self.discovery_state_loss_normalizer(state_clone_loss, update_ema = update_loss_ema)
 
                 action_recon_loss = self.discovery_action_loss_normalizer(action_recon_loss, update_ema = update_loss_ema)
 
-            losses = DiscoveryLosses(state_clone_loss, action_recon_loss, next_meta_hiddens.kl_loss, next_meta_hiddens.ratio_loss)
+                losses = DiscoveryLosses(state_clone_loss, action_recon_loss, *rest_losses)
 
             if not return_meta_controller_output:
                 return losses

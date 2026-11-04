@@ -743,3 +743,63 @@ def test_enable_next_latent_loss():
 
     assert exists(state_loss)
     assert exists(action_loss)
+
+@param('variant', ('continuous', 'discrete', 'binary_mapper'))
+def test_discovery_softmin_samples(variant):
+    dim_model = 16
+    dim_meta = 8
+    seq_len = 6
+    batch = 2
+
+    state = torch.randn(batch, seq_len, 32)
+    actions = torch.randint(0, 4, (batch, seq_len))
+    episode_lens = torch.tensor([4, 6])
+
+    if variant == 'binary_mapper':
+        mc = MetaControllerWithBinaryMapper(
+            dim_model = dim_model,
+            dim_meta_controller = dim_meta,
+            dim_code_bits = 3,
+            internal_sequence_embedder = dict(attn_dim_head = 8, heads = 2, depth = 1),
+            action_proposer = dict(depth = 1, attn_dim_head = 8, heads = 2),
+            discovery_num_samples = 4
+        )
+    else:
+        mc = MetaController(
+            dim_model = dim_model,
+            dim_meta_controller = dim_meta,
+            dim_latent = 8,
+            latent_readout = variant,
+            internal_sequence_embedder = dict(attn_dim_head = 8, heads = 2, depth = 1),
+            action_proposer = dict(depth = 1, attn_dim_head = 8, heads = 2),
+            discovery_num_samples = 4
+        )
+
+    model = Transformer(
+        dim = dim_model,
+        action_embed_readout = dict(num_discrete = 4),
+        state_embed_readout = dict(num_continuous = 32),
+        lower_body = dict(depth = 1, attn_dim_head = 8, heads = 2),
+        upper_body = dict(depth = 1, attn_dim_head = 8, heads = 2),
+        meta_controller = mc,
+        next_latent_loss_weight = 0.1,
+        discovery_phase_state_clone_loss = True
+    )
+
+    model.train_discovery(eval_rest = True)
+
+    losses, meta_out = model(
+        state,
+        actions,
+        discovery_phase = True,
+        episode_lens = episode_lens,
+        return_meta_controller_output = True
+    )
+
+    assert meta_out.actions.shape[0] == batch
+    assert meta_out.switch_beta.shape == (batch, seq_len)
+
+    (losses.state_pred + losses.action_recon + losses.kl + losses.ratio).backward()
+
+    assert any(exists(p.grad) and p.grad.abs().sum() > 0 for p in mc.emitter.parameters())
+    assert any(exists(p.grad) and p.grad.abs().sum() > 0 for p in mc.decoder.parameters())

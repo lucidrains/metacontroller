@@ -37,7 +37,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import einsum, rearrange
+from einops import einsum, rearrange, repeat
 from scipy.optimize import linear_sum_assignment
 
 from torch_einops_utils import lens_to_mask, z_score
@@ -48,11 +48,13 @@ from metacontroller import (
     MetaController,
     MetaControllerWithBinaryMapper,
     LatentReadout,
+    categorical_entropy
 )
 from metacontroller.metacontroller import (
+    exists,
     l2norm,
     sample_straight_through,
-    categorical_entropy_loss,
+    categorical_entropy_loss
 )
 
 # constants
@@ -297,8 +299,12 @@ def make_dataset(tasks, n_eps, seed):
         if not ok or env.reward < 1.0:
             continue
         max_t = max(max_t, len(o_ep))
-        obs_l.append(o_ep); act_l.append(a_ep); sg_l.append(g_ep)
-        switch_l.append(switch_ep); pos_l.append(p_ep); len_l.append(len(o_ep))
+        obs_l.append(o_ep)
+        act_l.append(a_ep)
+        sg_l.append(g_ep)
+        switch_l.append(switch_ep)
+        pos_l.append(p_ep)
+        len_l.append(len(o_ep))
 
     N = len(obs_l)
     obs_t = torch.zeros(N, max_t, OBS_DIM)
@@ -317,7 +323,7 @@ def make_dataset(tasks, n_eps, seed):
 
 def compute_unsupervised_switches(logits, acts, thresh = 0.15):
     probs = F.softmax(logits, dim = -1)
-    ent = -(probs * (probs + 1e-8).log()).sum(dim = -1)
+    ent = categorical_entropy(probs)
     dent = torch.zeros_like(ent)
     dent[:, 1:] = ent[:, 1:] - ent[:, :-1]
     p_prev = torch.zeros_like(ent)
@@ -328,31 +334,60 @@ def compute_unsupervised_switches(logits, acts, thresh = 0.15):
         switch[:, t] = switch[:, t] * (1.0 - switch[:, t - 1])
     return switch
 
+def compute_switch_f1(pred_switch, gt_switch_m, gt_int_m):
+    tp = (pred_switch & gt_switch_m).float().sum().item()
+    fp = (pred_switch & gt_int_m).float().sum().item()
+    fn = ((~pred_switch) & gt_switch_m).float().sum().item()
+    prec = tp / max(tp + fp, 1.0)
+    rec = tp / max(tp + fn, 1.0)
+    f1 = 2 * prec * rec / max(prec + rec, 1e-8)
+    return prec, rec, f1
+
+def compute_cluster_acc(pred_ids, gt_ids, num_classes = C):
+    conf = torch.zeros(num_classes, num_classes)
+    for p_id in range(num_classes):
+        for g_id in range(num_classes):
+            conf[p_id, g_id] = ((pred_ids == p_id) & (gt_ids == g_id)).float().sum()
+    row_ind, col_ind = linear_sum_assignment(-conf.numpy())
+    acc = conf[row_ind, col_ind].sum().item() / conf.sum().clamp(min = 1.0).item()
+    proto_to_sg = {int(r): int(c) for r, c in zip(row_ind, col_ind)}
+    return acc, proto_to_sg
+
 # custom sequence embedder, emitter, and alternative LatentReadout example
 
 class SegmentTerminalEmbedder(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(dim * 2, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.net = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim)
+        )
         self.current_switch = None
 
     def forward(self, x, mask = None, episode_lens = None, **kwargs):
         B, T, D = shape(x, 'b t d')
         out = torch.zeros(B, T, D * 2, device = x.device, dtype = x.dtype)
         switch = self.current_switch
+
         for b in range(B):
-            L = int(episode_lens[b]) if episode_lens is not None else T
+            L = int(episode_lens[b]) if exists(episode_lens) else T
             switch_idx = [t for t in range(L) if switch[b, t] > 0.5] + [L]
             for i in range(len(switch_idx) - 1):
                 t0, t1 = switch_idx[i], switch_idx[i + 1]
                 out[b, t0:t1] = torch.cat([x[b, t0:t1].mean(dim = 0), x[b, min(t1, L - 1)]], dim = -1)
+
         return self.net(out)
 
 class SummaryOnlyEmitter(nn.Module):
     def __init__(self, dim, dim_summary):
         super().__init__()
         self.dim_skip = dim * 2
-        self.mlp = nn.Sequential(nn.Linear(dim_summary, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim * 2))
+        self.mlp = nn.Sequential(
+            nn.Linear(dim_summary, dim * 2),
+            nn.GELU(),
+            nn.Linear(dim * 2, dim * 2)
+        )
 
     def forward(self, x):
         return self.mlp(x[..., self.dim_skip:])
@@ -366,7 +401,16 @@ class CosinePrototypeReadout(LatentReadout):
     """
     dim_log_prob = 1
 
-    def __init__(self, dim, dim_latent, num_discrete = 4, hard_prob = 0.5, scale = 4.5, sample_entropy_weight = 0.1, shared_prototypes = None):
+    def __init__(
+        self,
+        dim,
+        dim_latent,
+        num_discrete = 4,
+        hard_prob = 0.5,
+        scale = 4.5,
+        sample_entropy_weight = 0.1,
+        shared_prototypes = None
+    ):
         super().__init__()
         self.dim_latent = dim_latent
         self.num_discrete = num_discrete
@@ -374,7 +418,8 @@ class CosinePrototypeReadout(LatentReadout):
         self.scale = scale
         self.sample_entropy_weight = sample_entropy_weight
         self.proj = nn.Linear(dim, dim_latent, bias = False)
-        if shared_prototypes is not None:
+
+        if exists(shared_prototypes):
             self._prototypes = None
             self._shared = (shared_prototypes,)
         else:
@@ -384,7 +429,7 @@ class CosinePrototypeReadout(LatentReadout):
 
     @property
     def prototypes(self):
-        return self._shared[0] if self._shared is not None else self._prototypes
+        return self._shared[0] if exists(self._shared) else self._prototypes
 
     def forward(self, x):
         return einsum(l2norm(self.proj(x)), l2norm(self.prototypes), '... d, k d -> ... k') * self.scale
@@ -403,12 +448,51 @@ class CosinePrototypeReadout(LatentReadout):
 
     def clone_for_proposer(self, dim_proposer):
         return CosinePrototypeReadout(
-            dim_proposer, self.dim_latent, self.num_discrete,
-            self.hard_prob, self.scale, self.sample_entropy_weight,
+            dim_proposer,
+            self.dim_latent,
+            self.num_discrete,
+            self.hard_prob,
+            self.scale,
+            self.sample_entropy_weight,
             shared_prototypes = self.prototypes
         )
 
 # main benchmark
+
+def discovery_step_loss(
+    mc,
+    model,
+    residual,
+    actions,
+    mask,
+    episode_lens,
+    num_samples = 1,
+    dropout = 0.,
+    **mc_kwargs
+):
+    control, meta_out = mc(
+        residual,
+        discovery_phase = True,
+        episode_lens = episode_lens,
+        num_samples = num_samples,
+        **mc_kwargs
+    )
+
+    residual = F.dropout(residual, p = dropout, training = dropout > 0.)
+
+    def repeat_batch(t):
+        return repeat(t, 'b ... -> (n b) ...', n = num_samples)
+
+    logits = model.action_readout(model.upper_body(repeat_batch(residual) + control))
+    recon_loss = model.action_readout.calculate_loss(
+        logits,
+        repeat_batch(actions),
+        mask = repeat_batch(mask),
+        return_unreduced_loss = num_samples > 1
+    )
+
+    losses = mc.reduce_discovery_samples(meta_out, recon_loss, episode_lens = episode_lens)
+    return losses.action_recon + losses.kl + losses.ratio
 
 def train(
     num_train_eps: int = 2400,
@@ -420,7 +504,8 @@ def train(
     discovery_steps: int = 350,
     switch_steps: int = 450,
     grpo_iters: int = 35,
-    grpo_batch_size: int = 256
+    grpo_batch_size: int = 256,
+    discovery_num_samples: int = 4
 ):
     t0 = time.time()
     torch.manual_seed(42)
@@ -455,7 +540,9 @@ def train(
     for _ in range(bc_steps):
         idx = torch.randint(0, size(tr_obs, '[b] t d'), (64,))
         state_loss, act_loss = model(tr_obs[idx], tr_act[idx], episode_lens = tr_lens[idx], force_behavior_cloning = True)
-        opt_bc.zero_grad(); (state_loss + act_loss).backward(); opt_bc.step()
+        opt_bc.zero_grad()
+        (state_loss + act_loss).backward()
+        opt_bc.step()
 
     model.eval()
     for p in model.parameters():
@@ -493,18 +580,16 @@ def train(
     X_va, y_va, p_va = va_res[va_sg >= 0], va_sg[va_sg >= 0], va_pos[va_sg >= 0]
     for _ in range(200):
         loss_p = F.cross_entropy(probe(X_tr), y_tr)
-        opt_p.zero_grad(); loss_p.backward(); opt_p.step()
+        opt_p.zero_grad()
+        loss_p.backward()
+        opt_p.step()
 
     with torch.no_grad():
         preds_va = probe(X_va).argmax(-1)
         probe_acc = (preds_va == y_va).float().mean().item()
         by_pos = " ".join(f"step_{k}:{(preds_va[p_va == k] == y_va[p_va == k]).float().mean().item():.2f}" for k in range(5))
         va_unsup_switch = compute_unsupervised_switches(val_logits, va_act, thresh = 0.15)
-        tp = ((va_unsup_switch > 0.5) & gt_switch_m).float().sum().item()
-        fp = ((va_unsup_switch > 0.5) & gt_int_m).float().sum().item()
-        fn = ((va_unsup_switch <= 0.5) & gt_switch_m).float().sum().item()
-        switch_p, switch_r = tp / max(tp + fp, 1.0), tp / max(tp + fn, 1.0)
-        switch_f1 = 2 * switch_p * switch_r / max(switch_p + switch_r, 1e-8)
+        switch_p, switch_r, switch_f1 = compute_switch_f1(va_unsup_switch > 0.5, gt_switch_m, gt_int_m)
 
     print(f"\n[Stage 1] Autoregressive Behavioral Cloning & Emergent Subgoal Representations ({time.time()-t0:.1f}s)")
     print(f"  Base BC Model        : val_loss={val_bc_loss.item():.3f}, val_acc={val_acc:.3f}")
@@ -534,7 +619,9 @@ def train(
         res, sg = tr_res[idx], tr_sg[idx]
         att = model.upper_body(F.dropout(res, p = 0.25, training = True) + ctrl_mod(res, sg))
         loss_c = model.action_readout.calculate_loss(model.action_readout(att), tr_act[idx], mask = tr_mask[idx])
-        opt_c.zero_grad(); loss_c.backward(); opt_c.step()
+        opt_c.zero_grad()
+        loss_c.backward()
+        opt_c.step()
 
     ctrl_mod.eval()
     with torch.no_grad():
@@ -551,7 +638,7 @@ def train(
                     break
                 o = benv.obs_tensor().unsqueeze(1)
                 s_emb = model.state_embed(o)
-                a_emb = model.action_embed(past_act) if (past_act is not None and not reset_kv) else 0.0
+                a_emb = model.action_embed(past_act) if (exists(past_act) and not reset_kv) else 0.0
                 res_t, lower_h = model.lower_body(s_emb + a_emb, cache = (None if reset_kv else lower_h), return_hiddens = True)
                 active_sg = torch.from_numpy(benv.tasks[np.arange(160), np.minimum(benv.idx, 3)]).unsqueeze(1)
                 att_t, upper_h = model.upper_body(res_t + ctrl_mod(res_t, active_sg), cache = (None if reset_kv else upper_h), return_hiddens = True)
@@ -574,14 +661,16 @@ def train(
         dim_model = dim, dim_meta_controller = dim, dim_latent = dim_latent,
         hypernetwork_low_rank = rank, dim_sequence_summary_embed = 32,
         latent_readout = 'continuous', kl_loss_weight = 0.05, switch_temperature = 0.5,
+        discovery_num_samples = discovery_num_samples
     )
     opt_cont = torch.optim.AdamW(mc_cont.discovery_parameters(), lr = 2e-3, weight_decay = 1e-4)
     for _ in range(150):
         idx = torch.randint(0, size(tr_res, '[b] t d'), (64,))
         b_res, b_a, b_m = tr_res[idx], tr_act[idx], tr_mask[idx]
-        ctrl, m_out = mc_cont(b_res, discovery_phase = True, episode_lens = tr_lens[idx])
-        loss_v = model.action_readout.calculate_loss(model.action_readout(model.upper_body(b_res + ctrl)), b_a, mask = b_m) + m_out.kl_loss
-        opt_cont.zero_grad(); loss_v.backward(); opt_cont.step()
+        loss_v = discovery_step_loss(mc_cont, model, b_res, b_a, b_m, tr_lens[idx], discovery_num_samples)
+        opt_cont.zero_grad()
+        loss_v.backward()
+        opt_cont.step()
 
     mc_cont.eval()
     with torch.no_grad():
@@ -589,12 +678,8 @@ def train(
         logits_v = model.action_readout(model.upper_body(va_res + ctrl_v))
         va_acc_v = (logits_v.argmax(-1)[va_mask] == va_act[va_mask]).float().mean().item()
         va_loss_v = model.action_readout.calculate_loss(logits_v, va_act, mask = va_mask).item()
-        pred_switch_v = (m_va_v.switch_beta > 0.5) & va_valid_t1
-        tp_v = (pred_switch_v & gt_switch_m).float().sum().item()
-        fp_v = (pred_switch_v & gt_int_m).float().sum().item()
-        fn_v = ((~pred_switch_v) & gt_switch_m).float().sum().item()
-        f1_v = 2 * tp_v / max(2 * tp_v + fp_v + fn_v, 1e-8)
-    print(f"  (a) Continuous Gaussian (`latent_readout='continuous'`) : val_loss={va_loss_v:.3f}, val_acc={va_acc_v:.3f} | Switch F1={f1_v:.3f} | Cluster Acc=0.250")
+        _, _, f1_v = compute_switch_f1(m_va_v.switch_beta > 0.5, gt_switch_m, gt_int_m)
+    print(f"  (a) Continuous Gaussian (`latent_readout='continuous'`) : val_loss={va_loss_v:.3f}, val_acc={va_acc_v:.3f} | Switch F1={f1_v:.3f}")
 
     # 3B: MetaControllerWithBinaryMapper (Fleuret BinaryMapper, 2 bits -> 4 codes)
     torch.manual_seed(44)
@@ -605,6 +690,7 @@ def train(
         internal_sequence_embedder = emb_bm, kl_loss_weight = 0.5, switch_temperature = 0.1,
         hard_prob = 0.5, binary_temperature = 0.2, use_marginal_entropy_loss = True,
         sample_entropy_weight = 0.1, gate_kl_with_switch_beta = True,
+        discovery_num_samples = discovery_num_samples
     )
     mc_bm.binary_mapper.deterministic_on_eval = True
     mc_bm.emitter = SummaryOnlyEmitter(dim, dim)
@@ -624,10 +710,12 @@ def train(
         idx = torch.randint(0, size(tr_res, '[b] t d'), (64,))
         b_res, b_a, b_m, b_switch = tr_res[idx], tr_act[idx], tr_mask[idx], tr_switch[idx]
         emb_bm.current_switch = b_switch
-        ctrl, m_out = mc_bm(b_res, discovery_phase = True, ablate_switch_beta = b_switch, hard_switch = True, episode_lens = tr_lens[idx])
-        u = model.upper_body(F.dropout(b_res, p = 0.2, training = True) + ctrl)
-        loss = model.action_readout.calculate_loss(model.action_readout(u), b_a, mask = b_m) + m_out.kl_loss
-        opt_bm.zero_grad(); loss.backward()
+        loss = discovery_step_loss(
+            mc_bm, model, b_res, b_a, b_m, tr_lens[idx], discovery_num_samples,
+            dropout = 0.2, ablate_switch_beta = b_switch, hard_switch = True
+        )
+        opt_bm.zero_grad()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(mc_bm.parameters(), 1.0)
         opt_bm.step()
 
@@ -640,13 +728,7 @@ def train(
         va_loss_bm = model.action_readout.calculate_loss(logits_bm, va_act, mask = va_mask).item()
         switch_va_m = (va_switch > 0.5) & va_mask
         pred_bm = m_va_bm.actions[switch_va_m].argmax(dim = -1)
-        conf_bm = torch.zeros(C, C)
-        for p_id in range(C):
-            for g_id in range(C):
-                conf_bm[p_id, g_id] = ((pred_bm == p_id) & (va_sg[switch_va_m] == g_id)).float().sum()
-        r_bm, c_bm = linear_sum_assignment(-conf_bm.numpy())
-        acc_bm_cluster = conf_bm[r_bm, c_bm].sum().item() / conf_bm.sum().item()
-        bm_proto_to_sg = {int(r): int(c) for r, c in zip(r_bm, c_bm)}
+        acc_bm_cluster, bm_proto_to_sg = compute_cluster_acc(pred_bm, va_sg[switch_va_m])
     print(f"  (b) Fleuret BinaryMapper (`MetaControllerWithBinaryMapper`) : val_loss={va_loss_bm:.3f}, val_acc={va_acc_bm:.3f} | 4-Subgoal Cluster Acc={acc_bm_cluster:.3f}")
 
     # Helper to train & evaluate built-in 'discrete' and custom `LatentReadout` on Stage 3
@@ -665,6 +747,7 @@ def train(
             kl_loss_weight = 0.5,
             switch_temperature = 0.1,
             gate_kl_with_switch_beta = True,
+            discovery_num_samples = discovery_num_samples
         )
         mc.emitter = SummaryOnlyEmitter(dim, dim)
         mc.decoder = nn.Linear(dim_latent, 2 * rank * dim)
@@ -678,11 +761,12 @@ def train(
             idx = torch.randint(0, size(tr_res, '[b] t d'), (64,))
             b_res, b_a, b_m, b_switch = tr_res[idx], tr_act[idx], tr_mask[idx], tr_switch[idx]
             embedder.current_switch = b_switch
-            ctrl, m_out = mc(b_res, discovery_phase = True, ablate_switch_beta = b_switch, hard_switch = True, episode_lens = tr_lens[idx])
-            u = model.upper_body(F.dropout(b_res, p = 0.2, training = True) + ctrl)
-            recon_loss = model.action_readout.calculate_loss(model.action_readout(u), b_a, mask = b_m)
-            loss = recon_loss + m_out.kl_loss
-            opt_ed.zero_grad(); loss.backward()
+            loss = discovery_step_loss(
+                mc, model, b_res, b_a, b_m, tr_lens[idx], discovery_num_samples,
+                dropout = 0.2, ablate_switch_beta = b_switch, hard_switch = True
+            )
+            opt_ed.zero_grad()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(mc.parameters(), 1.0)
             opt_ed.step()
 
@@ -700,7 +784,9 @@ def train(
             switch_b = m_switch.switch_beta.clamp(1e-5, 1.0 - 1e-5)
             w = torch.where(b_tswitch > 0.5, pos_w * 0.55, 1.0) * b_m.float()
             loss_switch = F.binary_cross_entropy(switch_b, b_tswitch, weight = w)
-            opt_switch.zero_grad(); loss_switch.backward(); opt_switch.step()
+            opt_switch.zero_grad()
+            loss_switch.backward()
+            opt_switch.step()
             with torch.no_grad():
                 mc.switching_unit.weight_ih_l0[:, -dim_latent:].zero_()
 
@@ -721,22 +807,11 @@ def train(
             for t in range(1, size(raw_switch, 'b [t]')):
                 raw_switch[:, t] = raw_switch[:, t] * (1.0 - raw_switch[:, t - 1])
             pred_switch = (raw_switch > 0.5) & va_mask
-            pred_switch_t1 = pred_switch & va_valid_t1
-            tp_e = (pred_switch_t1 & gt_switch_m).float().sum().item()
-            fp_e = (pred_switch_t1 & gt_int_m).float().sum().item()
-            fn_e = ((~pred_switch_t1) & gt_switch_m).float().sum().item()
-            prec_e, rec_e = tp_e / max(tp_e + fp_e, 1.0), tp_e / max(tp_e + fn_e, 1.0)
-            f1_e = 2 * prec_e * rec_e / max(prec_e + rec_e, 1e-8)
+            _, _, f1_e = compute_switch_f1(pred_switch & va_valid_t1, gt_switch_m, gt_int_m)
             switch_freq_e = pred_switch[va_mask].float().mean().item()
 
             active_proto = m_va.action_dist[switch_va_m].argmax(dim = -1)
-            conf_mat = torch.zeros(C, C)
-            for p_id in range(C):
-                for g_id in range(C):
-                    conf_mat[p_id, g_id] = ((active_proto == p_id) & (va_sg[switch_va_m] == g_id)).float().sum()
-            row_ind, col_ind = linear_sum_assignment(-conf_mat.numpy())
-            cluster_acc = conf_mat[row_ind, col_ind].sum().item() / conf_mat.sum().item()
-            proto_to_sg = {int(r): int(c) for r, c in zip(row_ind, col_ind)}
+            cluster_acc, proto_to_sg = compute_cluster_acc(active_proto, va_sg[switch_va_m])
 
         print(f"  {label:55s} : val_loss={va_loss_e:.3f}, val_acc={va_acc_e:.3f} | Switch F1={f1_e:.3f} (Freq={switch_freq_e:.3f} vs GT={gt_switch_freq:.3f}) | 4-Subgoal Cluster Acc={cluster_acc:.3f}")
         return mc, embedder, pred_switch, proto_to_sg, va_acc_e, f1_e, switch_freq_e, cluster_acc
@@ -812,7 +887,7 @@ def train(
             o = benv.obs_tensor().unsqueeze(1)
             with torch.no_grad():
                 s_emb = model.state_embed(o)
-                a_emb = model.action_embed(past_act) if past_act is not None else 0.0
+                a_emb = model.action_embed(past_act) if exists(past_act) else 0.0
                 res_t, lower_h = model.lower_body(s_emb + a_emb, cache = lower_h, return_hiddens = True)
                 att_t, upper_h = model.upper_body(res_t, cache = upper_h, return_hiddens = True)
             dist = torch.distributions.Categorical(logits = raw_head(att_t[:, 0]))
@@ -826,7 +901,9 @@ def train(
         raw_sr_final = rewards.mean().item()
         if rewards.std() > 1e-5:
             loss_raw = -(ep_lp * z_score(rewards)).mean()
-            opt_raw.zero_grad(); loss_raw.backward(); opt_raw.step()
+            opt_raw.zero_grad()
+            loss_raw.backward()
+            opt_raw.step()
         if it in (1, 15, grpo_iters):
             print(f"  Raw-Action GRPO  iter {it:2d} | Sparse POST_TASK SR={rewards.mean().item():.3f} | subgoals={benv.idx.mean():.2f}/4")
 
@@ -885,7 +962,9 @@ def train(
         grpo_switch_freq_final = grpo_switch_freq
         if rewards.std() > 1e-5:
             loss_int = -(ep_lp * z_score(rewards)).mean()
-            opt_int.zero_grad(); loss_int.backward(); opt_int.step()
+            opt_int.zero_grad()
+            loss_int.backward()
+            opt_int.step()
         if it in (1, 15, grpo_iters):
             print(f"  Internal RL GRPO iter {it:2d} | Sparse POST_TASK SR={rewards.mean().item():.3f} | subgoals={benv.idx.mean():.2f}/4 | switch_freq={grpo_switch_freq:.3f} ({switches_per_ep:.2f} switches/ep)")
 
@@ -905,10 +984,10 @@ def train(
     print("\n" + "=" * 92)
     print(f"FINAL SUMMARY TABLE (Total Runtime: {time.time()-t0:.1f}s)")
     print("=" * 92)
-    print(f"1. Stage 1 Base Model & Linear Probe : val_acc={val_acc:.3f}, subgoal_probe_acc={probe_acc:.3f} ({by_pos}) -> SUCCESS")
-    print(f"2. Stage 2 Hypernetwork Controllers  : val_acc={acc_s2:.3f}, POST_TASK SR={res_s2[False][0]:.3f}, KV-reset SR={res_s2[True][0]:.3f} -> SUCCESS")
-    print(f"3. Stage 3 Unsupervised Discovery    : Switch F1={f1_d:.3f} (Freq={freq_d:.3f} vs GT={gt_switch_freq:.3f}) | Continuous Acc=0.250 | BinaryMapper Acc={acc_bm_cluster:.3f} | Discrete Acc={cluster_d:.3f} | CosinePrototype Acc={cluster_w:.3f} -> SUCCESS")
-    print(f"4. Stage 4 Unseen POST_TASK RL (GRPO): Raw-Action RL SR={raw_sr_init:.3f}->{raw_sr_final:.3f} vs. Internal RL SR={int_sr_init:.3f}->{int_sr_final:.3f} (GRPO Switch Freq={grpo_switch_freq_final:.3f}, Plan={learned_seq}) -> SUCCESS")
+    print(f"1. Stage 1 Base Model & Linear Probe : val_acc={val_acc:.3f}, subgoal_probe_acc={probe_acc:.3f} ({by_pos})")
+    print(f"2. Stage 2 Hypernetwork Controllers  : val_acc={acc_s2:.3f}, POST_TASK SR={res_s2[False][0]:.3f}, KV-reset SR={res_s2[True][0]:.3f}")
+    print(f"3. Stage 3 Unsupervised Discovery    : Switch F1={f1_d:.3f} (Freq={freq_d:.3f} vs GT={gt_switch_freq:.3f}) | Continuous F1={f1_v:.3f} | BinaryMapper Acc={acc_bm_cluster:.3f} | Discrete Acc={cluster_d:.3f} | CosinePrototype Acc={cluster_w:.3f}")
+    print(f"4. Stage 4 Unseen POST_TASK RL (GRPO): Raw-Action RL SR={raw_sr_init:.3f}->{raw_sr_final:.3f} vs. Internal RL SR={int_sr_init:.3f}->{int_sr_final:.3f} (GRPO Switch Freq={grpo_switch_freq_final:.3f}, Plan={learned_seq})")
     print("=" * 92)
 
 if __name__ == '__main__':
