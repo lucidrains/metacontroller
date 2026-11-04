@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Literal
 from contextlib import nullcontext
 
 from functools import partial
@@ -21,7 +22,7 @@ from einops.layers.torch import Rearrange
 
 # external modules
 
-from x_transformers import Encoder, Decoder
+from x_transformers import Decoder
 from x_transformers.x_transformers import PolarEmbedding, Identity
 
 # sequential selection moved to separate module
@@ -33,7 +34,8 @@ from discrete_continuous_embed_readout import Embed, Readout, EmbedAndReadout
 
 from assoc_scan import AssocScan
 
-from torch_einops_utils import maybe, pad_left_at_dim, pad_right_at_dim, pad_at_dim, lens_to_mask, masked_mean, align_dims_left, exclusive_cumsum, pack_with_inverse
+from torch_einops_utils import maybe, pad_left_at_dim, pad_right_at_dim, pad_at_dim, lens_to_mask, masked_mean, align_dims_left, exclusive_cumsum, pack_with_inverse, straight_through
+from torch_einops_utils.shape import shape, size
 from torch_einops_utils.device import module_device, move_inputs_to_module_device
 from torch_einops_utils.save_load import save_load
 
@@ -68,11 +70,23 @@ def log(t, eps = 1e-8):
 def binary_entropy(p):
     return -((p * log(p)) + (1. - p) * log(1. - p))
 
-def straight_through(src, tgt):
-    return tgt + src - src.detach()
-
 def l2norm(t, dim = -1):
     return F.normalize(t, p = 2, dim = dim)
+
+def categorical_entropy_loss(probs, mask = None, sample_entropy_weight = 0.1):
+    active = probs[mask] if (exists(mask) and mask.any()) else rearrange(probs, '... k -> (...) k')
+    mean_p = active.mean(dim = 0)
+    return (mean_p * log(mean_p)).sum() - sample_entropy_weight * (active * log(active)).sum(dim = -1).mean()
+
+def sample_straight_through(probs, hard_prob = 0.5, training = True):
+    hard_one_hot = F.one_hot(probs.argmax(dim = -1), size(probs, '... [k]')).float()
+    if not training:
+        return hard_one_hot
+    st_probs = straight_through(probs, hard_one_hot)
+    if hard_prob >= 1.:
+        return st_probs
+    is_hard = torch.zeros_like(probs[..., :1]).bernoulli_(hard_prob).bool()
+    return torch.where(is_hard, st_probs, probs)
 
 # next latent prediction - residual dynamics network
 
@@ -207,7 +221,7 @@ class LossNormalizer(Module):
 # meta controller classes
 
 @save_load()
-class BidirectionalSequenceEmbedder(Module):
+class CausalSequenceEmbedder(Module):
     def __init__(
         self,
         dim,
@@ -216,30 +230,6 @@ class BidirectionalSequenceEmbedder(Module):
     ):
         super().__init__()
         self.pool = pool
-        self.encoder = Encoder(dim = dim, **kwargs)
-
-    def forward(
-        self,
-        x,
-        mask = None,
-        **kwargs
-    ):
-        encoded = self.encoder(x, mask = mask)
-
-        if not self.pool:
-            return encoded
-
-        mean_pooled = masked_mean(encoded, mask, dim = 1)
-        return repeat(mean_pooled, 'b d -> b n d', n = x.shape[1])
-
-@save_load()
-class CausalSequenceEmbedder(Module):
-    def __init__(
-        self,
-        dim,
-        **kwargs
-    ):
-        super().__init__()
         self.decoder = Decoder(dim = dim, **kwargs)
 
     def forward(
@@ -248,7 +238,90 @@ class CausalSequenceEmbedder(Module):
         mask = None,
         **kwargs
     ):
-        return self.decoder(x, mask = mask)
+        encoded = self.decoder(x, mask = mask)
+
+        if not self.pool:
+            return encoded
+
+        mean_pooled = masked_mean(encoded, mask, dim = 1)
+        return repeat(mean_pooled, 'b d -> b n d', n = size(x, 'b [n] d'))
+
+class LatentReadout(Module):
+    def forward(self, x: Tensor) -> Tensor:
+        raise NotImplementedError
+
+    def sample(self, dist: Tensor, temperature: float = 1., differentiable: bool = True) -> Tensor:
+        raise NotImplementedError
+
+    def calculate_kl_loss(self, dist: Tensor, mask: Tensor | None = None) -> Tensor:
+        raise NotImplementedError
+
+    def log_prob(self, dist: Tensor, sampled_latent_action: Tensor) -> Tensor:
+        raise NotImplementedError
+
+    def clone_for_proposer(self, dim_proposer: int) -> LatentReadout:
+        raise NotImplementedError
+
+@save_load()
+class DiscreteLatentReadout(LatentReadout):
+    dim_log_prob = 1
+
+    def __init__(
+        self,
+        dim,
+        dim_latent,
+        num_discrete = 4,
+        hard_prob = 0.5,
+        temperature = 0.2,
+        sample_entropy_weight = 0.1,
+        shared_prototypes: Parameter | None = None
+    ):
+        super().__init__()
+        self.dim_latent = dim_latent
+        self.num_discrete = num_discrete
+        self.hard_prob = hard_prob
+        self.temperature = temperature
+        self.sample_entropy_weight = sample_entropy_weight
+        self.to_logits = Linear(dim, num_discrete)
+
+        if exists(shared_prototypes):
+            self._prototypes = None
+            self._shared_prototypes = (shared_prototypes,)
+        else:
+            self._prototypes = Parameter(torch.empty(num_discrete, dim_latent))
+            nn.init.orthogonal_(self._prototypes, gain = (dim_latent ** 0.5) * 0.5)
+            self._shared_prototypes = None
+
+    @property
+    def prototypes(self) -> Parameter:
+        return self._shared_prototypes[0] if exists(self._shared_prototypes) else self._prototypes
+
+    def forward(self, x):
+        return self.to_logits(x)
+
+    def sample(self, logits, temperature = 1., differentiable = True):
+        probs = (logits / (self.temperature * temperature)).softmax(dim = -1)
+        chosen = sample_straight_through(probs, self.hard_prob, training = self.training and differentiable)
+        return einsum(chosen, self.prototypes, '... k, k d -> ... d')
+
+    def calculate_kl_loss(self, logits, mask = None):
+        probs = (logits / self.temperature).softmax(dim = -1)
+        return categorical_entropy_loss(probs, mask = mask, sample_entropy_weight = self.sample_entropy_weight)
+
+    def log_prob(self, logits, sampled_latent_action):
+        idx = torch.cdist(sampled_latent_action, self.prototypes).argmin(dim = -1)
+        return F.log_softmax(logits / self.temperature, dim = -1).gather(-1, rearrange(idx, '... -> ... 1'))
+
+    def clone_for_proposer(self, dim_proposer: int) -> DiscreteLatentReadout:
+        return DiscreteLatentReadout(
+            dim_proposer,
+            dim_latent = self.dim_latent,
+            num_discrete = self.num_discrete,
+            hard_prob = self.hard_prob,
+            temperature = self.temperature,
+            sample_entropy_weight = self.sample_entropy_weight,
+            shared_prototypes = self.prototypes
+        )
 
 # meta controller
 
@@ -463,9 +536,13 @@ class MetaController(Module):
             polar_pos_emb = True
         ),
         compact_sequence_embedding = False,
-        bidirectional = True,
         pool_embedded_sequence = True,
-        dim_sequence_summary_embed = 32, # the summary embedding from the bidirectional network needs to be bottlenecked
+        dim_sequence_summary_embed = 32, # the summary embedding from the sequence embedder needs to be bottlenecked
+        latent_readout: Literal['continuous', 'discrete'] | Module | tuple[Module, Module] = 'continuous',
+        num_discrete_latents = 4,
+        discrete_hard_prob = 0.5,
+        discrete_temperature = 0.2,
+        discrete_sample_entropy_weight = 0.1,
         action_proposer: Module | dict = dict(
             depth = 2,
             attn_dim_head = 32,
@@ -481,6 +558,7 @@ class MetaController(Module):
         kl_loss_weight = 1.,
         kl_loss_warmup_steps = 0,
         apply_kl_loss_weight = True,
+        gate_kl_with_switch_beta = False,
         ratio_loss_final_weight = None,
         ratio_loss_warmdown_steps = 0,
         latent_action_barrier_scale: float | None = None
@@ -496,6 +574,7 @@ class MetaController(Module):
         self.register_buffer('kl_loss_step_count', tensor(0.))
 
         self.apply_kl_loss_weight = apply_kl_loss_weight
+        self.gate_kl_with_switch_beta = gate_kl_with_switch_beta
 
         self.ratio_loss_final_weight = ratio_loss_final_weight
         self.ratio_loss_warmdown_steps = ratio_loss_warmdown_steps
@@ -510,23 +589,12 @@ class MetaController(Module):
 
         self.model_to_meta = Linear(dim_model, dim_meta)
 
-        # there are two phases, the first (discovery ssl phase) uses acausal with some ssm i don't really believe in - let's just use bidirectional attention as placeholder
-
-        # use transformer encoder and map the input to a self-attnded sequence
-
-        if not self.compact_sequence_embedding and isinstance(internal_sequence_embedder, dict):
-            embedder_klass = BidirectionalSequenceEmbedder if bidirectional else CausalSequenceEmbedder
-
-            if bidirectional:
-                internal_sequence_embedder['pool'] = pool_embedded_sequence
-
-            internal_sequence_embedder = embedder_klass(dim = dim_model, **internal_sequence_embedder)
-            self.internal_sequence_embedder = internal_sequence_embedder
-
-        # compact sequence embedder -> use GRU last hidden state
-
-        else:
+        if self.compact_sequence_embedding:
             self.internal_sequence_embedder = GRU(dim_model, dim_model)
+        elif isinstance(internal_sequence_embedder, dict):
+            self.internal_sequence_embedder = CausalSequenceEmbedder(dim = dim_model, pool = pool_embedded_sequence, **internal_sequence_embedder)
+        else:
+            self.internal_sequence_embedder = internal_sequence_embedder
 
         self.to_sequence_summary_embed = Linear(dim_model, dim_sequence_summary_embed)
 
@@ -536,8 +604,6 @@ class MetaController(Module):
             dim_out = dim_meta * 2,
             depth = 2
         )
-
-        self.emitter_to_action_mean_log_var = Readout(dim_meta * 2, num_continuous = dim_latent)
 
         if isinstance(action_proposer, dict):
             # default to Decoder, wrapped for standard interface
@@ -549,7 +615,27 @@ class MetaController(Module):
             )
 
         self.action_proposer = action_proposer
-        self.action_proposer_mean_log_var = Readout(dim_model, num_continuous = dim_latent)
+
+        if latent_readout == 'continuous':
+            self.emitter_to_action_mean_log_var = Readout(dim_meta * 2, num_continuous = dim_latent)
+            self.action_proposer_mean_log_var = Readout(dim_model, num_continuous = dim_latent)
+        elif latent_readout == 'discrete':
+            self.emitter_to_action_mean_log_var = DiscreteLatentReadout(
+                dim_meta * 2,
+                dim_latent = dim_latent,
+                num_discrete = num_discrete_latents,
+                hard_prob = discrete_hard_prob,
+                temperature = discrete_temperature,
+                sample_entropy_weight = discrete_sample_entropy_weight
+            )
+            self.action_proposer_mean_log_var = self.emitter_to_action_mean_log_var.clone_for_proposer(dim_model)
+        elif isinstance(latent_readout, tuple):
+            self.emitter_to_action_mean_log_var, self.action_proposer_mean_log_var = latent_readout
+        elif isinstance(latent_readout, Module):
+            self.emitter_to_action_mean_log_var = latent_readout
+            self.action_proposer_mean_log_var = latent_readout.clone_for_proposer(dim_model) if hasattr(latent_readout, 'clone_for_proposer') else Readout(dim_model, num_continuous = dim_latent)
+        else:
+            raise ValueError(f'invalid latent_readout: {latent_readout}')
 
         # switching unit
 
@@ -580,7 +666,7 @@ class MetaController(Module):
 
         # decoder
 
-        assert hypernetwork_low_rank < dim_latent
+        assert hypernetwork_low_rank <= dim_model
 
         dim_decoder_hidden = int(dim_latent * decoder_expansion_factor)
 
@@ -603,9 +689,10 @@ class MetaController(Module):
 
     @property
     def replay_buffer_field_dict(self):
+        dim_log_prob = getattr(self.action_proposer_mean_log_var, 'dim_log_prob', self.dim_latent)
         return dict(
             states = ('float', self.dim_model),
-            log_probs = ('float', self.dim_latent),
+            log_probs = ('float', dim_log_prob),
             switch_betas = 'float',
             latent_actions = ('float', self.dim_latent)
         )
@@ -672,11 +759,12 @@ class MetaController(Module):
     def internal_rl_parameters(self):
         return [
             *self.action_proposer.parameters(),
-            *self.action_proposer_mean_log_var.parameters(),
-            *self.summary_gru.parameters()
+            *self.action_proposer_mean_log_var.parameters()
         ]
 
     def train_internal_rl(self, eval_rest = False):
+        if eval_rest:
+            self.eval()
 
         if isinstance(self.action_proposer, ActionProposerWrapper):
             self.action_proposer.module.train()
@@ -702,8 +790,12 @@ class MetaController(Module):
 
     def calculate_kl_loss(
         self,
-        action_dist
+        action_dist,
+        mask = None
     ):
+        if hasattr(self.emitter_to_action_mean_log_var, 'calculate_kl_loss'):
+            return self.emitter_to_action_mean_log_var.calculate_kl_loss(action_dist, mask = mask)
+
         mean, log_var = action_dist.unbind(dim = -1)
 
         kl_loss = (0.5 * (
@@ -735,7 +827,7 @@ class MetaController(Module):
         temperature = 1.,
         episode_lens: Tensor | None = None
     ):
-        seq_len = residual_stream.shape[1]
+        seq_len = size(residual_stream, 'b [n] d')
         device = residual_stream.device
 
         # destruct prev cache
@@ -773,7 +865,7 @@ class MetaController(Module):
         if discovery_phase:
 
             if exists(prev_action_proposer_hidden):
-                logger.warning('meta controller cache being passed back in for discovery phase, which does not make sense given bidirectional encoder')
+                logger.warning('meta controller cache being passed back in for discovery phase, which does not make sense during discovery')
 
             mask = maybe(lens_to_mask)(episode_lens, meta_embed.shape[1])
 
@@ -784,15 +876,8 @@ class MetaController(Module):
             # s(e_1:T) is a single compact embedding
 
             if self.compact_sequence_embedding:
-
-                # pack_padded_sequence requires lengths on CPU (PyTorch contract)
-                lengths_cpu = episode_lens.cpu().long()
-                packed_residual_streams = nn.utils.rnn.pack_padded_sequence(
-                    residual_stream, lengths_cpu, batch_first=True, enforce_sorted=False
-                )
-
-                # f_emb
-                _, summarized_sequence = self.internal_sequence_embedder(packed_residual_streams) # B, L, D -> layer, B, D
+                seq_input = nn.utils.rnn.pack_padded_sequence(residual_stream, episode_lens.cpu().long(), batch_first = True, enforce_sorted = False) if exists(episode_lens) else residual_stream
+                _, summarized_sequence = self.internal_sequence_embedder(seq_input)
                 summarized_sequence = summarized_sequence[-1] # B, D
 
                 # channel-mixing projection
@@ -946,10 +1031,19 @@ class MetaController(Module):
         kl_loss = self.zero
 
         if discovery_phase:
-            kl_loss = self.calculate_kl_loss(action_dist)
+            sw_mask = switch_beta > 0.5
+            kl_mask = ((mask & sw_mask) if exists(mask) else sw_mask) if self.gate_kl_with_switch_beta else mask
 
-            kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
-            kl_loss = masked_mean(kl_loss, mask)
+            kl_loss = self.calculate_kl_loss(action_dist, mask = kl_mask)
+
+            if kl_loss.ndim == 3:
+                kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
+
+            if self.gate_kl_with_switch_beta and kl_loss.ndim == 2:
+                kl_loss = kl_loss * switch_beta
+
+            if kl_loss.ndim >= 2:
+                kl_loss = masked_mean(kl_loss, mask)
 
             kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.
             kl_loss = kl_loss * kl_loss_weight
@@ -967,7 +1061,7 @@ class MetaController(Module):
 
         # generating the residual stream controlling signal
 
-        control_signal = einsum(residual_stream, hypernetwork_weight, '... d1, ... d1 d2 -> ... d1')
+        control_signal = einsum(residual_stream, hypernetwork_weight, '... d1, ... d1 d2 -> ... d2')
 
         # maybe ratio loss
 

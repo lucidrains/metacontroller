@@ -21,17 +21,18 @@ from einops.layers.torch import Rearrange
 
 # external modules
 
-from x_transformers import Encoder, Decoder, Attention
+from x_transformers import Decoder, Attention
 from x_mlps_pytorch import Feedforwards
 
 from assoc_scan import AssocScan
 
-from torch_einops_utils import maybe, pad_at_dim, lens_to_mask, align_dims_left, masked_mean
+from torch_einops_utils import maybe, pad_at_dim, lens_to_mask, align_dims_left, masked_mean, straight_through
+from torch_einops_utils.shape import shape, size
 from torch_einops_utils.save_load import save_load
 
 from vector_quantize_pytorch import BinaryMapper
 
-from metacontroller.metacontroller import MetaControllerOutput, policy_loss, ratio_loss, BidirectionalSequenceEmbedder, CausalSequenceEmbedder
+from metacontroller.metacontroller import MetaControllerOutput, policy_loss, ratio_loss, CausalSequenceEmbedder, sample_straight_through, categorical_entropy_loss
 from metacontroller.sequential_action_selection import perform_sequential_action_selection
 
 # constants
@@ -53,9 +54,6 @@ def default(*args):
         if exists(arg):
             return arg
     return None
-
-def straight_through(src, tgt):
-    return tgt + src - src.detach()
 
 def log(t, eps = 1e-20):
     return t.clamp_min(eps).log()
@@ -111,7 +109,6 @@ class MetaControllerWithBinaryMapper(Module):
             depth = 2,
             polar_pos_emb = True
         ),
-        bidirectional = True,
         action_proposer: Module | dict = dict(
             depth = 2,
             attn_dim_head = 32,
@@ -129,6 +126,11 @@ class MetaControllerWithBinaryMapper(Module):
         kl_loss_weight = 1.,
         kl_loss_warmup_steps = 0,
         apply_kl_loss_weight = True,
+        gate_kl_with_switch_beta = False,
+        hard_prob = 1.,
+        binary_temperature = 1.,
+        use_marginal_entropy_loss = False,
+        sample_entropy_weight = 0.1,
         ratio_loss_chunk_size = None,
         ratio_loss_final_weight = None,
         ratio_loss_warmdown_steps = 0,
@@ -143,6 +145,11 @@ class MetaControllerWithBinaryMapper(Module):
         self.register_buffer('kl_loss_step_count', tensor(0.))
 
         self.apply_kl_loss_weight = apply_kl_loss_weight
+        self.gate_kl_with_switch_beta = gate_kl_with_switch_beta
+        self.hard_prob = hard_prob
+        self.binary_temperature = binary_temperature
+        self.use_marginal_entropy_loss = use_marginal_entropy_loss
+        self.sample_entropy_weight = sample_entropy_weight
 
         dim_meta = default(dim_meta_controller, dim_model)
 
@@ -151,12 +158,7 @@ class MetaControllerWithBinaryMapper(Module):
         self.model_to_meta = Linear(dim_model, dim_meta)
 
         if isinstance(internal_sequence_embedder, dict):
-            embedder_klass = BidirectionalSequenceEmbedder if bidirectional else CausalSequenceEmbedder
-
-            if bidirectional:
-                internal_sequence_embedder['pool'] = pool_embedded_sequence
-
-            internal_sequence_embedder = embedder_klass(dim = dim_model, **internal_sequence_embedder)
+            internal_sequence_embedder = CausalSequenceEmbedder(dim = dim_model, pool = pool_embedded_sequence, **internal_sequence_embedder)
 
         self.internal_sequence_embedder = internal_sequence_embedder
 
@@ -220,7 +222,7 @@ class MetaControllerWithBinaryMapper(Module):
 
         # decoder
 
-        assert hypernetwork_low_rank < self.num_codes
+        assert hypernetwork_low_rank <= dim_model
 
         dim_decoder_hidden = int(self.num_codes * decoder_expansion_factor)
 
@@ -294,8 +296,7 @@ class MetaControllerWithBinaryMapper(Module):
     def internal_rl_parameters(self):
         return [
             *self.action_proposer.parameters(),
-            *self.proposer_to_binary_logits.parameters(),
-            *self.summary_gru.parameters()
+            *self.proposer_to_binary_logits.parameters()
         ]
 
     def train_internal_rl(self, eval_rest = False):
@@ -348,7 +349,7 @@ class MetaControllerWithBinaryMapper(Module):
         temperature = 1.,
         episode_lens: Tensor | None = None
     ):
-        seq_len = residual_stream.shape[1]
+        seq_len = size(residual_stream, 'b [n] d')
         device = residual_stream.device
 
         # destruct prev cache
@@ -382,7 +383,7 @@ class MetaControllerWithBinaryMapper(Module):
         if discovery_phase:
 
             if exists(prev_action_proposer_hidden):
-                logger.warning('meta controller cache being passed back in for discovery phase, which does not make sense given bidirectional encoder')
+                logger.warning('meta controller cache being passed back in for discovery phase, which does not make sense during discovery')
 
             mask = maybe(lens_to_mask)(episode_lens, meta_embed.shape[1])
 
@@ -416,11 +417,25 @@ class MetaControllerWithBinaryMapper(Module):
 
         binary_logits = to_logits(proposed_action_hidden)
 
-        one_hot, kl_loss = self.binary_mapper(
-            binary_logits,
-            temperature = temperature,
-            reduce_aux_kl_loss = False
-        )
+        effective_temp = self.binary_temperature * temperature
+        codes_float = self.binary_mapper.codes.float()
+        scaled_logits = binary_logits / effective_temp
+
+        soft_G = (
+            einsum(F.logsigmoid(scaled_logits), codes_float, '... bits, codes bits -> ... codes') +
+            einsum(F.logsigmoid(-scaled_logits), 1. - codes_float, '... bits, codes bits -> ... codes')
+        ).exp()
+
+        if self.hard_prob < 1.:
+            one_hot = sample_straight_through(soft_G, self.hard_prob, training = self.training)
+            kl_loss = self.zero if self.use_marginal_entropy_loss else self.binary_mapper(binary_logits, temperature = effective_temp, reduce_aux_kl_loss = False, calc_aux_loss = discovery_phase)[1]
+        else:
+            one_hot, kl_loss = self.binary_mapper(
+                binary_logits,
+                temperature = effective_temp,
+                reduce_aux_kl_loss = False,
+                calc_aux_loss = discovery_phase and not self.use_marginal_entropy_loss
+            )
 
         # bottled action is now the one-hot sparse codes (with straight-through)
 
@@ -515,10 +530,19 @@ class MetaControllerWithBinaryMapper(Module):
         if discovery_phase:
             kl_loss_weight = self.current_kl_loss_weight if self.apply_kl_loss_weight else 1.
 
-            if kl_loss.ndim == 3:
-                kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
+            if self.use_marginal_entropy_loss:
+                switch_mask = switch_beta > 0.5
+                kl_mask = ((mask & switch_mask) if exists(mask) else switch_mask) if self.gate_kl_with_switch_beta else mask
+                kl_loss = categorical_entropy_loss(soft_G, mask = kl_mask, sample_entropy_weight = self.sample_entropy_weight)
+            else:
+                if kl_loss.ndim == 3:
+                    kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
 
-            kl_loss = masked_mean(kl_loss, mask)
+                if self.gate_kl_with_switch_beta and kl_loss.ndim == 2:
+                    kl_loss = kl_loss * switch_beta
+
+                kl_loss = masked_mean(kl_loss, mask)
+
             kl_loss = kl_loss * kl_loss_weight
         else:
             kl_loss = self.zero
@@ -531,7 +555,7 @@ class MetaControllerWithBinaryMapper(Module):
 
         # generating the residual stream controlling signal
 
-        control_signal = einsum(residual_stream, hypernetwork_weight, '... d1, ... d1 d2 -> ... d1')
+        control_signal = einsum(residual_stream, hypernetwork_weight, '... d1, ... d1 d2 -> ... d2')
 
         # maybe ratio loss
 

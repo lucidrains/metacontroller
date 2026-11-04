@@ -25,7 +25,7 @@ def exists(v):
 
 @param('accept_condition', (False, True))
 @param('action_discrete', (False, True))
-@param('extras', ((False, False, False, False, False), (True, True, True, True, True)))
+@param('extras', ((False, False, False, 'continuous', False), (True, True, True, 'binary_mapper', True), (False, False, False, 'discrete', False)))
 def test_metacontroller(
     tmp_path,
     extras,
@@ -33,7 +33,7 @@ def test_metacontroller(
     accept_condition
 ):
     embed_past_actions, variable_length, normalize_state_action_losses, variant, use_tpo = extras
-    use_binary_mapper_variant = variant
+    use_binary_mapper_variant = variant == 'binary_mapper'
     switching_unit_type = 'gru'
 
     dim_model = 16
@@ -95,6 +95,7 @@ def test_metacontroller(
             dim_model = dim_model,
             dim_meta_controller = dim_meta,
             dim_latent = 32,
+            latent_readout = variant,
             internal_sequence_embedder = dict(attn_dim_head = 16, heads = 2, depth = 1),
             **action_proposer_kwargs
         )

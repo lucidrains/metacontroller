@@ -277,7 +277,7 @@ if HAS_JAX:
             jax_input_grads = ctx.vjp_fn(jax_grads)
             torch_grads = tuple(j2t(grad, device) for grad in jax_input_grads)
 
-            return torch_grads + (None, None)
+            return torch_grads + (None, None, None, None)
 
     def torch_jax_sequential_selection(
         weight_ih,

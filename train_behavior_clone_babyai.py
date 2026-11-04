@@ -299,8 +299,7 @@ def train(
             kl_loss_warmup_steps = discovery_kl_loss_warmup_steps,
             apply_kl_loss_weight = True,
             compact_sequence_embedding = compact_sequence_embedding,
-            pool_embedded_sequence = False,
-            bidirectional = True
+            pool_embedded_sequence = False
         )
     else:
         meta_controller = MetaControllerWithBinaryMapper(
