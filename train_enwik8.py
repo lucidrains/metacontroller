@@ -38,7 +38,7 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 from einops import rearrange
 
-from metacontroller import MetaController, Transformer, binary_entropy
+from metacontroller import MetaController, Transformer, binary_entropy, boundary_entropy_loss
 from metacontroller.metacontroller import extract_grpo_data, z_score
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
 
@@ -222,18 +222,18 @@ def train(
     batch_size = 4,
     grad_accum_every = 4,
     learning_rate = 1e-4,
-    discovery_learning_rate = 1e-4,
+    discovery_learning_rate = 3e-4,
     bc_state_loss_weight = 1.,
     bc_action_loss_weight = 1.,
     discovery_state_loss_weight = 1.,
     discovery_action_loss_weight = 1.,
-    discovery_kl_loss_weight = 0.2,
+    discovery_kl_loss_weight = 0.1,
     discovery_kl_loss_warmup_steps = 0,
-    discovery_entropy_loss_weight = 0.75,
-    discovery_entropy_loss_threshold = 0.4,
+    discovery_entropy_loss_weight = 1.5,
+    discovery_entropy_loss_threshold = 0.14,
     discovery_negative_entropy_loss_weight = 0.75,
-    ratio_loss_weight = 4.0,
-    ratio_loss_final_weight = 0.5,
+    ratio_loss_weight = 2.5,
+    ratio_loss_final_weight = 2.5,
     validate_every = 100,
     generate_every = 250,
     prime_length = 16,
@@ -250,7 +250,7 @@ def train(
     use_binary_mapper = True,
     dim_code_bits = 8,
     kl_loss_threshold = 0.1,
-    switch_temperature = 0.1,
+    switch_temperature = 0.25,
     discovery_phase = False,
     discovery_hard_switch = False,
     metacontroller_residual_stream_dropout_prob = 0.,
@@ -260,10 +260,12 @@ def train(
     grpo_phase = False,
     num_grpo_batches = 1000,
     grpo_group_size = 32,
-    grpo_learning_rate = 1e-4,
+    grpo_learning_rate = 5e-4,
+    use_gspo = True,
+    grpo_kl_loss_weight = 0.05,
     grpo_reward_var_threshold = 0.0,
     grpo_hard_switch = True,
-    grpo_reward_type = 'exclamation',
+    grpo_reward_type = 'sentiment',
     evo_phase = False,
     num_evo_generations = 50,
     evo_population_size = 32,
@@ -382,12 +384,13 @@ def train(
             dim_model = dim,
             dim_meta_controller = dim_meta_controller,
             dim_latent = dim_latent,
+            switch_temperature = switch_temperature,
             hypernetwork_low_rank = hypernetwork_low_rank,
             kl_loss_weight = discovery_kl_loss_weight,
             kl_loss_warmup_steps = discovery_kl_loss_warmup_steps,
             target_temporal_segment_len = target_temporal_segment_len,
             ratio_loss_weight = ratio_loss_weight,
-            ratio_loss_chunk_size = 4 * target_temporal_segment_len,
+            ratio_loss_chunk_size = target_temporal_segment_len,
             ratio_loss_final_weight = ratio_loss_final_weight,
             ratio_loss_warmdown_steps = num_discovery_batches,
             hard_switch = discovery_hard_switch
@@ -405,7 +408,7 @@ def train(
             kl_loss_warmup_steps = discovery_kl_loss_warmup_steps,
             target_temporal_segment_len = target_temporal_segment_len,
             ratio_loss_weight = ratio_loss_weight,
-            ratio_loss_chunk_size = 4 * target_temporal_segment_len,
+            ratio_loss_chunk_size = target_temporal_segment_len,
             ratio_loss_final_weight = ratio_loss_final_weight,
             ratio_loss_warmdown_steps = num_discovery_batches,
             hard_switch = discovery_hard_switch
@@ -610,11 +613,7 @@ def train(
                 next_state = model.action_readout.sample(action_dist[:, -1:], temperature = 1.)
                 state = torch.cat((state, next_state), dim = -1)
 
-                def last(t):
-                    return t[:, -1:]
-
                 first_grpo_data = extract_grpo_data(meta_controller, cache)
-                first_grpo_data = type(first_grpo_data)(*map(last, first_grpo_data))
                 grpo_data_list = [first_grpo_data]
 
                 for _ in range(sample_num_times - 1):
@@ -657,7 +656,10 @@ def train(
             group_log_probs = torch.cat(log_probs, dim = 1) # (G, T, D_latent)
             group_switch_betas = torch.cat(switch_betas, dim = 1) # (G, T)
 
+            gen_start_idx = prompt_seq_len - 1
+
             if streaming_rl_phase:
+                group_states, group_actions, group_switch_betas = map(lambda t: t[:, gen_start_idx:], (group_states, group_actions, group_switch_betas))
                 num_samples, num_steps, _ = group_states.shape
 
                 for s in range(num_samples):
@@ -686,14 +688,20 @@ def train(
                 # GRPO Phase
                 advantages = z_score(rewards_tensor)
 
-                # Policy loss
-                loss = meta_controller.policy_loss(
+                gen_switch_mask = group_switch_betas > 0.5
+                gen_switch_mask[:, :gen_start_idx] = False
+
+                pol_loss, kl_loss = meta_controller.policy_loss(
                     state = group_states,
                     old_log_probs = group_log_probs,
                     actions = group_actions,
                     advantages = advantages,
-                    mask = (group_switch_betas > 0.5)
+                    mask = gen_switch_mask,
+                    return_kl_loss = True,
+                    kl_loss_weight = grpo_kl_loss_weight,
+                    use_gspo = use_gspo
                 )
+                loss = pol_loss + kl_loss
 
                 accelerator.backward(loss)
                 accelerator.clip_grad_norm_(meta_controller.internal_rl_parameters(), 0.5)
@@ -705,7 +713,7 @@ def train(
             # calculate hard switch density for logging
 
             with torch.no_grad():
-                switch_density = (group_switch_betas > 0.5).float().mean().item()
+                switch_density = (group_switch_betas[:, gen_start_idx:] > 0.5).float().mean().item()
 
             if accelerator.is_main_process:
                 import wandb
@@ -863,22 +871,16 @@ def train(
                 discovery_losses, meta_output = outputs
                 obs_loss, action_recon_loss, kl_loss, ratio_loss = discovery_losses
 
-                entropy_loss = binary_entropy(meta_output.switch_beta).mean()
-                entropy_loss = (entropy_loss - discovery_entropy_loss_threshold).relu()
-
-                # dynamic entropy weight
-                # if density is 0, apply negative entropy weight to push switch betas towards 0.5
-
-                switch_density = (meta_output.switch_beta > 0.5).float().mean()
-
-                entropy_weight = discovery_entropy_loss_weight
-                if switch_density == 0:
-                    entropy_weight = -discovery_negative_entropy_loss_weight
+                entropy_loss = boundary_entropy_loss(
+                    meta_output.switch_beta,
+                    segment_len = target_temporal_segment_len,
+                    mi_threshold = discovery_entropy_loss_threshold
+                )
 
                 loss = (action_recon_loss + 0.5) * discovery_action_loss_weight + \
                        (obs_loss + 0.5) * discovery_state_loss_weight + \
                        kl_loss + \
-                       entropy_loss * entropy_weight + \
+                       entropy_loss * discovery_entropy_loss_weight + \
                        ratio_loss
 
                 last_state_loss = obs_loss.item()

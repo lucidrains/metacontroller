@@ -7,7 +7,7 @@ from functools import partial
 
 import torch
 from torch import nn, cat
-from metacontroller.metacontroller import Transformer, MetaController, ActionProposerWrapper, policy_loss, z_score, extract_grpo_data
+from metacontroller.metacontroller import Transformer, MetaController, ActionProposerWrapper, policy_loss, z_score, extract_grpo_data, boundary_entropy_loss
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
 from metacontroller.next_latent_wrapper import NextLatentWrapper
 
@@ -23,6 +23,18 @@ def exists(v):
     return v is not None
 
 # test
+
+def test_boundary_entropy_loss():
+    segment_len = 8
+    switch_beta = torch.rand(2, 65).clamp(0.1, 0.4).requires_grad_(True)
+
+    loss = boundary_entropy_loss(switch_beta, segment_len = segment_len)
+    assert loss.ndim == 0 and loss.item() > 0.
+    loss.backward()
+
+    assert switch_beta.grad[:, 0].abs().max() == 0.
+    chunk_grads = rearrange(switch_beta.grad[:, 1:], 'b (k n) -> (b k) n', n = segment_len)
+    assert chunk_grads.sum(dim = -1).abs().max() < 1e-6
 
 @param('accept_condition', (False, True))
 @param('action_discrete', (False, True))
@@ -877,4 +889,65 @@ def test_next_latent_wrapper(variant, action_discrete, num_samples):
     assert any(exists(p.grad) and p.grad.abs().sum() > 0 for p in wrapper.dynamics_model.parameters())
     assert any(exists(p.grad) and p.grad.abs().sum() > 0 for p in mc.emitter.parameters())
     assert any(exists(p.grad) and p.grad.abs().sum() > 0 for p in mc.decoder.parameters())
+
+@param('variant', ('continuous', 'discrete', 'binary_mapper'))
+@param('return_kl_loss', (False, True))
+def test_policy_loss_gspo(variant, return_kl_loss):
+    dim_model = 16
+    dim_meta = 8
+    seq_len = 8
+    batch = 4
+
+    if variant == 'binary_mapper':
+        mc = MetaControllerWithBinaryMapper(
+            dim_model = dim_model,
+            dim_meta_controller = dim_meta,
+            dim_code_bits = 4,
+            internal_sequence_embedder = dict(attn_dim_head = 8, heads = 2, depth = 1),
+            action_proposer = dict(depth = 1, attn_dim_head = 8, heads = 2)
+        )
+    else:
+        mc = MetaController(
+            dim_model = dim_model,
+            dim_meta_controller = dim_meta,
+            dim_latent = 8,
+            latent_readout = variant,
+            internal_sequence_embedder = dict(attn_dim_head = 8, heads = 2, depth = 1),
+            action_proposer = dict(depth = 1, attn_dim_head = 8, heads = 2)
+        )
+
+    state = torch.randn(batch, seq_len, dim_model)
+    with torch.no_grad():
+        _, meta_out = mc(state, discovery_phase = False)
+        old_dist = mc.get_action_dist_for_internal_rl(state)
+        old_log_probs = mc.log_prob(old_dist, meta_out.actions)
+
+    advantages = z_score(torch.randn(batch))
+    mask = meta_out.switch_beta > 0.5
+    episode_lens = torch.tensor([6, 8, 5, 8])
+
+    out = mc.policy_loss(
+        state,
+        old_log_probs,
+        meta_out.actions,
+        advantages,
+        mask = mask,
+        episode_lens = episode_lens,
+        return_kl_loss = return_kl_loss,
+        kl_loss_weight = 0.05,
+        use_gspo = True
+    )
+
+    if return_kl_loss:
+        loss, kl_loss = out
+        assert kl_loss.ndim == 0
+        total = loss + kl_loss
+    else:
+        loss = out
+        total = loss
+
+    assert loss.ndim == 0
+    total.backward()
+    assert any(exists(p.grad) and p.grad.abs().sum() > 0 for p in mc.internal_rl_parameters())
+
 

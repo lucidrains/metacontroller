@@ -73,6 +73,38 @@ def gumbel_noise(t):
 def binary_entropy(p):
     return -((p * log(p)) + (1. - p) * log(1. - p))
 
+def boundary_entropy_loss(
+    switch_beta: Tensor,
+    segment_len: int,
+    mi_threshold: float = 0.14,
+    exclude_first: bool = True,
+    min_std: float = 1e-2
+) -> Tensor:
+    if exclude_first:
+        switch_beta = switch_beta[:, 1:]
+
+    seq_len = switch_beta.shape[-1]
+    num_segments = seq_len // segment_len
+
+    if num_segments == 0:
+        return switch_beta.sum() * 0.
+
+    truncated_len = num_segments * segment_len
+    chunked_switch_beta = rearrange(switch_beta[:, :truncated_len], 'b (k n) -> (b k) n', n = segment_len)
+
+    # zero-sum gradient projection per segment so boundary sharpening is orthogonal to ratio_loss
+
+    chunk_mean = reduce(chunked_switch_beta, 'bk n -> bk 1', 'mean')
+    centered_switch_beta = chunked_switch_beta - (chunk_mean - chunk_mean.detach())
+
+    within_chunk_std = (chunked_switch_beta - chunk_mean).std(dim = -1).mean().detach().clamp(min = min_std)
+
+    marginal_entropy = binary_entropy(centered_switch_beta.mean(dim = -1))
+    conditional_entropy = binary_entropy(centered_switch_beta).mean(dim = -1)
+    within_chunk_mi = marginal_entropy - conditional_entropy
+
+    return (mi_threshold - within_chunk_mi).relu().mean() / within_chunk_std
+
 def categorical_entropy(probs):
     return -(probs * log(probs)).sum(dim = -1)
 
@@ -404,7 +436,8 @@ def policy_loss(
     kl_loss_weight = 0.,
     use_tpo = False,
     tpo_eta = 1.0,
-    tpo_group_size = None
+    tpo_group_size = None,
+    use_gspo = False
 ):
     if exists(switch_beta_frequency):
         batch, seq_len = state.shape[:2]
@@ -470,11 +503,22 @@ def policy_loss(
 
     # calculate ratio
 
-    ratio = (new_log_probs - old_log_probs).exp()
+    log_diff = new_log_probs - old_log_probs
 
-    # align ratio and advantages
+    if use_gspo:
+        action_dim = size(log_diff, 'b n [d]') if log_diff.ndim == 3 else 1
 
-    ratio, advantages = align_dims_left((ratio, advantages))
+        if log_diff.ndim == 3:
+            log_diff = reduce(log_diff, 'b n d -> b n', 'mean')
+
+        ratio = masked_mean(log_diff, mask, dim = -1).exp()
+        advantages = rearrange(advantages, '... -> (...)')
+    else:
+        ratio = log_diff.exp()
+
+        # align ratio and advantages
+
+        ratio, advantages = align_dims_left((ratio, advantages))
 
     # ppo surrogate loss
 
@@ -490,9 +534,11 @@ def policy_loss(
 
     losses = -torch.min(surr1, surr2)
 
-    losses = reduce(losses, 'b n d -> b n', 'sum')
-
-    loss_val = masked_mean(losses, mask)
+    if use_gspo:
+        loss_val = masked_mean(losses * action_dim, mask.any(dim = -1))
+    else:
+        losses = reduce(losses, 'b n d -> b n', 'sum')
+        loss_val = masked_mean(losses, mask)
 
     if not return_kl_loss:
         return loss_val
@@ -500,7 +546,8 @@ def policy_loss(
     if kl_loss.ndim == 3:
         kl_loss = reduce(kl_loss, 'b n d -> b n', 'sum')
 
-    kl_loss = masked_mean(kl_loss, mask)
+    if kl_loss.ndim >= 2:
+        kl_loss = masked_mean(kl_loss, mask)
 
     return loss_val, kl_loss * kl_loss_weight
 

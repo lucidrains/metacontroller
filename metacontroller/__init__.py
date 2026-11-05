@@ -5,6 +5,7 @@ from metacontroller.metacontroller import (
     LatentReadout,
     DiscreteLatentReadout,
     binary_entropy,
+    boundary_entropy_loss,
     categorical_entropy,
     normalized_categorical_mi,
     reduce_discovery_samples
